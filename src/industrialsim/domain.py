@@ -9,6 +9,9 @@ class ProductionUnitState(StrEnum):
     CREATED = "created"
     RELEASED = "released"
     IN_STATION = "in_station"
+    IN_BUFFER = "in_buffer"
+    IN_TRANSPORT = "in_transport"
+    BLOCKED = "blocked"
     TERMINAL = "terminal"
 
 
@@ -83,11 +86,17 @@ class Operation:
 class Station:
     id: str
     operations: dict[str, Operation]
+    output_capacity: int = 0
     is_busy: bool = False
+    is_blocked: bool = False
     current_unit_id: str | None = None
+    blocked_unit_id: str | None = None
+    output_buffer: list[str] = field(default_factory=list)
     total_busy_time_ns: int = 0
+    total_blocked_time_ns: int = 0
     operations_completed: int = 0
     busy_start_ns: int | None = None
+    blocked_start_ns: int | None = None
 
     def start_operation(self, unit_id: str, op_id: str, start_time_ns: int) -> None:
         self.is_busy = True
@@ -102,9 +111,52 @@ class Station:
             self.busy_start_ns = None
         self.operations_completed += 1
 
+    def start_blocking(self, unit_id: str, blocked_time_ns: int) -> None:
+        self.is_blocked = True
+        self.blocked_unit_id = unit_id
+        self.blocked_start_ns = blocked_time_ns
+
+    def end_blocking(self, unblocked_time_ns: int) -> None:
+        if self.is_blocked:
+            if self.blocked_start_ns is not None:
+                self.total_blocked_time_ns += unblocked_time_ns - self.blocked_start_ns
+                self.blocked_start_ns = None
+            self.is_blocked = False
+            self.blocked_unit_id = None
+
     def to_summary_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "operations_completed": self.operations_completed,
             "total_busy_time_ns": self.total_busy_time_ns,
+            "total_blocked_time_ns": self.total_blocked_time_ns,
+        }
+
+
+@dataclass
+class Buffer:
+    id: str
+    capacity: int
+    occupants: list[str] = field(default_factory=list)
+    peak_occupancy: int = 0
+
+    def can_accept(self) -> bool:
+        return len(self.occupants) < self.capacity
+
+    def add_unit(self, unit_id: str) -> None:
+        if len(self.occupants) >= self.capacity:
+            raise RuntimeError(f"Buffer '{self.id}' capacity ({self.capacity}) exceeded!")
+        self.occupants.append(unit_id)
+        if len(self.occupants) > self.peak_occupancy:
+            self.peak_occupancy = len(self.occupants)
+
+    def remove_unit(self, unit_id: str) -> None:
+        if unit_id in self.occupants:
+            self.occupants.remove(unit_id)
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capacity": self.capacity,
+            "peak_occupancy": self.peak_occupancy,
         }

@@ -92,3 +92,23 @@ def test_cli_run_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     data = json.loads(captured.out)
     assert data["status"] == "error"
     assert "error" in data
+
+
+def test_cli_material_flow_run_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from test_material_flow_simulation import BLOCKING_SCENARIO_YAML
+
+    cfg_file = tmp_path / "mf_scenario.yaml"
+    cfg_file.write_text(BLOCKING_SCENARIO_YAML, encoding="utf-8")
+
+    exit_code = main(["run", str(cfg_file)])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "completed"
+    assert len(data["production_units"]) == 3
+    assert len(data["buffers"]) == 1
+    assert data["buffers"][0]["id"] == "buf-1"
+    st1 = next(s for s in data["stations"] if s["id"] == "st-1")
+    assert st1["total_blocked_time_ns"] == 6_000_000_000
+
