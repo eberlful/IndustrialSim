@@ -177,3 +177,131 @@ def test_station_output_capacity_relieves_station() -> None:
     u3 = next(u for u in summary.production_units if u.id == "unit-3")
     assert u3.state == "terminal"
 
+
+def test_station_multiple_operations_executed_in_order() -> None:
+    multi_op_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+material_flow:
+  nodes:
+    - id: "src-1"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "st-multi"
+      kind: "station"
+      operations:
+        - id: "op-step-1"
+          duration: "3s"
+        - id: "op-step-2"
+          duration: "4s"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "snk-1"
+      kind: "sink"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+  routes:
+    - id: "r1"
+      source_node_id: "src-1"
+      source_port_id: "p-out"
+      target_node_id: "st-multi"
+      target_port_id: "p-in"
+    - id: "r2"
+      source_node_id: "st-multi"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+
+production_units:
+  - id: "unit-alpha"
+    variant: "sedan"
+    release_time: "0s"
+"""
+    summary = run_episode(multi_op_yaml)
+    assert summary.status == "completed"
+    # op-step-1 (3s) + op-step-2 (4s) = 7s total
+    assert summary.simulated_time_ns == 7_000_000_000
+
+    u = summary.production_units[0]
+    assert u.state == "terminal"
+    # Verify operations were executed
+    ops_in_history = [h.get("operation_id") for h in u.history if h.get("operation_id")]
+    assert ops_in_history == ["op-step-1", "op-step-2"]
+
+
+def test_material_flow_multiple_sources() -> None:
+    multi_source_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+material_flow:
+  nodes:
+    - id: "src-A"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "src-B"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "snk-1"
+      kind: "sink"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+  routes:
+    - id: "r-A"
+      source_node_id: "src-A"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+    - id: "r-B"
+      source_node_id: "src-B"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+
+production_units:
+  - id: "unit-from-A"
+    variant: "sedan"
+    source_id: "src-A"
+    release_time: "0s"
+  - id: "unit-from-B"
+    variant: "suv"
+    source_id: "src-B"
+    release_time: "0s"
+"""
+    summary = run_episode(multi_source_yaml)
+    assert summary.status == "completed"
+    assert len(summary.production_units) == 2
+    u_a = next(u for u in summary.production_units if u.id == "unit-from-A")
+    u_b = next(u for u in summary.production_units if u.id == "unit-from-B")
+    assert u_a.history[0]["location"] == "src-A"
+    assert u_b.history[0]["location"] == "src-B"
+
+

@@ -193,50 +193,35 @@ class MaterialFlowGraph:
             return errors
 
         # Reachability validation
-        # 1. Forward reachability from each source to at least one sink
         forward_adj: dict[str, list[str]] = {nid: [] for nid in self.nodes}
+        backward_adj: dict[str, list[str]] = {nid: [] for nid in self.nodes}
         for route in self.routes.values():
             forward_adj[route.source_node_id].append(route.target_node_id)
+            backward_adj[route.target_node_id].append(route.source_node_id)
 
-        for src in sources:
+        def _reaches_target_kind(start_id: str, target_kind: NodeKind, adj: dict[str, list[str]]) -> bool:
             visited: set[str] = set()
-            queue = deque([src.id])
-            reached_sink = False
+            queue = deque([start_id])
             while queue:
                 curr = queue.popleft()
                 if curr in visited:
                     continue
                 visited.add(curr)
-                if self.nodes[curr].kind == NodeKind.SINK:
-                    reached_sink = True
-                    break
-                for nxt in forward_adj.get(curr, []):
+                if self.nodes[curr].kind == target_kind:
+                    return True
+                for nxt in adj.get(curr, []):
                     if nxt not in visited:
                         queue.append(nxt)
-            if not reached_sink:
+            return False
+
+        # 1. Forward reachability from each source to at least one sink
+        for src in sources:
+            if not _reaches_target_kind(src.id, NodeKind.SINK, forward_adj):
                 errors.append(f"Source '{src.id}' cannot reach any sink node")
 
         # 2. Backward reachability: every sink must be reachable from at least one source
-        backward_adj: dict[str, list[str]] = {nid: [] for nid in self.nodes}
-        for route in self.routes.values():
-            backward_adj[route.target_node_id].append(route.source_node_id)
-
         for snk in sinks:
-            visited = set()
-            queue = deque([snk.id])
-            reached_source = False
-            while queue:
-                curr = queue.popleft()
-                if curr in visited:
-                    continue
-                visited.add(curr)
-                if self.nodes[curr].kind == NodeKind.SOURCE:
-                    reached_source = True
-                    break
-                for prev in backward_adj.get(curr, []):
-                    if prev not in visited:
-                        queue.append(prev)
-            if not reached_source:
+            if not _reaches_target_kind(snk.id, NodeKind.SOURCE, backward_adj):
                 errors.append(f"Required sink '{snk.id}' is unreachable from any source")
 
         return errors

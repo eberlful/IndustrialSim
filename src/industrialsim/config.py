@@ -249,6 +249,7 @@ class MaterialFlowConfig(StrictBaseModel):
 class ProductionUnitConfig(StrictBaseModel):
     id: str
     variant: str
+    source_id: str | None = None
     release_time: int | str = 0
     release_time_ns: int = 0
 
