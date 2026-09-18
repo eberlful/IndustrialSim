@@ -38,6 +38,7 @@ class ProductionUnitSummary:
     variant: str
     quality_state: str
     state: str
+    location: str
     history: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class ProductionUnitSummary:
             "variant": self.variant,
             "quality_state": self.quality_state,
             "state": self.state,
+            "location": self.location,
             "history": self.history,
         }
 
@@ -67,6 +69,7 @@ class StationSummary:
 @dataclass(frozen=True)
 class EpisodeSummary:
     status: str
+    seed: int
     simulated_time_ns: int
     events_processed: int
     production_units: list[ProductionUnitSummary]
@@ -76,6 +79,7 @@ class EpisodeSummary:
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "seed": self.seed,
             "simulated_time_ns": self.simulated_time_ns,
             "events_processed": self.events_processed,
             "production_units": [u.to_dict() for u in self.production_units],
@@ -125,6 +129,7 @@ def validate_config(source: str | Path | dict[str, Any]) -> ValidationResult:
 
 def _compute_result_hash(
     status: str,
+    seed: int,
     simulated_time_ns: int,
     events_processed: int,
     units: list[ProductionUnitSummary],
@@ -132,6 +137,7 @@ def _compute_result_hash(
 ) -> str:
     data = {
         "status": status,
+        "seed": seed,
         "simulated_time_ns": simulated_time_ns,
         "events_processed": events_processed,
         "production_units": [u.to_dict() for u in units],
@@ -173,9 +179,12 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         station_id = event.payload["station_id"]
         operation_id = event.payload["operation_id"]
         unit = units[unit_id]
-        unit.record_transition(time_ns=k.current_time_ns, state=ProductionUnitState.RELEASED)
+        unit.record_transition(
+            time_ns=k.current_time_ns,
+            state=ProductionUnitState.RELEASED,
+            location=station_id,
+        )
 
-        # In this minimal slice, immediately schedule START_OPERATION
         k.schedule(
             time_ns=k.current_time_ns,
             priority=EventPriority.NEW_WORK,
@@ -195,6 +204,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         unit.record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_STATION,
+            location=station_id,
             station_id=station_id,
             operation_id=operation_id,
         )
@@ -210,16 +220,9 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         unit_id = event.payload["unit_id"]
         station_id = event.payload["station_id"]
         operation_id = event.payload["operation_id"]
-        unit = units[unit_id]
         station = stations[station_id]
 
         station.complete_operation(op_id=operation_id, completion_time_ns=k.current_time_ns)
-        unit.record_transition(
-            time_ns=k.current_time_ns,
-            state="operation_completed",
-            station_id=station_id,
-            operation_id=operation_id,
-        )
 
         k.schedule(
             time_ns=k.current_time_ns,
@@ -231,7 +234,11 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
     def handle_terminate_unit(k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         unit = units[unit_id]
-        unit.record_transition(time_ns=k.current_time_ns, state=ProductionUnitState.TERMINAL)
+        unit.record_transition(
+            time_ns=k.current_time_ns,
+            state=ProductionUnitState.TERMINAL,
+            location="terminal",
+        )
 
     kernel.register_handler("RELEASE_UNIT", handle_release)
     kernel.register_handler("START_OPERATION", handle_start_operation)
@@ -265,7 +272,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         stop_condition=is_terminal_condition_met,
     )
 
-    all_terminal = all(u.state == ProductionUnitState.TERMINAL for u in units.values())
+    all_terminal = is_terminal_condition_met(kernel)
     status = "completed" if all_terminal else "incomplete"
 
     unit_summaries = [
@@ -273,7 +280,8 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             id=u.id,
             variant=u.variant,
             quality_state=u.quality_state,
-            state=u.state,
+            state=str(u.state),
+            location=u.location,
             history=[h.to_dict() for h in u.history],
         )
         for u in units.values()
@@ -290,6 +298,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
 
     result_hash = _compute_result_hash(
         status=status,
+        seed=cfg.seed,
         simulated_time_ns=kernel.current_time_ns,
         events_processed=kernel.events_processed,
         units=unit_summaries,
@@ -298,6 +307,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
 
     return EpisodeSummary(
         status=status,
+        seed=cfg.seed,
         simulated_time_ns=kernel.current_time_ns,
         events_processed=kernel.events_processed,
         production_units=unit_summaries,

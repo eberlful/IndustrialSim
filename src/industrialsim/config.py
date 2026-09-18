@@ -56,6 +56,14 @@ class StationConfig(StrictBaseModel):
     id: str
     operations: list[OperationConfig] = Field(min_length=1)
 
+    @field_validator("operations")
+    @classmethod
+    def validate_unique_operations(cls, v: list[OperationConfig]) -> list[OperationConfig]:
+        op_ids = [op.id for op in v]
+        if len(op_ids) != len(set(op_ids)):
+            raise ValueError(f"Duplicate operation IDs found: {op_ids}")
+        return v
+
 
 class ProductionUnitConfig(StrictBaseModel):
     id: str
@@ -102,3 +110,16 @@ class SimulationConfig(StrictBaseModel):
     episode: EpisodeConfig
     production_units: list[ProductionUnitConfig] = Field(min_length=1)
     stations: list[StationConfig] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_ids(self) -> SimulationConfig:
+        unit_ids = [u.id for u in self.production_units]
+        if len(unit_ids) != len(set(unit_ids)):
+            raise ValueError(f"Duplicate production unit IDs found: {unit_ids}")
+
+        station_ids = [s.id for s in self.stations]
+        if len(station_ids) != len(set(station_ids)):
+            raise ValueError(f"Duplicate station IDs found: {station_ids}")
+
+        return self
+

@@ -15,14 +15,16 @@ class ProductionUnitState(StrEnum):
 @dataclass(frozen=True)
 class HistoryRecord:
     time_ns: int
-    state: str
+    state: ProductionUnitState
+    location: str
     station_id: str | None = None
     operation_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "time_ns": self.time_ns,
-            "state": self.state,
+            "state": str(self.state),
+            "location": self.location,
         }
         if self.station_id is not None:
             result["station_id"] = self.station_id
@@ -36,21 +38,25 @@ class ProductionUnit:
     id: str
     variant: str
     quality_state: str = "nominal"
-    state: str = ProductionUnitState.CREATED
+    state: ProductionUnitState = ProductionUnitState.CREATED
+    location: str = "unreleased"
     history: list[HistoryRecord] = field(default_factory=list)
 
     def record_transition(
         self,
         time_ns: int,
-        state: str,
+        state: ProductionUnitState,
+        location: str,
         station_id: str | None = None,
         operation_id: str | None = None,
     ) -> None:
         self.state = state
+        self.location = location
         self.history.append(
             HistoryRecord(
                 time_ns=time_ns,
                 state=state,
+                location=location,
                 station_id=station_id,
                 operation_id=operation_id,
             )
@@ -61,7 +67,8 @@ class ProductionUnit:
             "id": self.id,
             "variant": self.variant,
             "quality_state": self.quality_state,
-            "state": self.state,
+            "state": str(self.state),
+            "location": self.location,
             "history": [h.to_dict() for h in self.history],
         }
 

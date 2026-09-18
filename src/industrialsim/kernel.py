@@ -124,3 +124,41 @@ class EventKernel:
             if stop_condition is not None and stop_condition(self):
                 break
         return count
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "current_time_ns": self._current_time_ns,
+            "sequence_counter": self._sequence_counter,
+            "events_processed": self._events_processed,
+            "queue": [
+                {
+                    "time_ns": item[3].time_ns,
+                    "priority": item[3].priority,
+                    "sequence": item[3].sequence,
+                    "event_type": item[3].event_type,
+                    "payload_version": item[3].payload_version,
+                    "payload": item[3].payload,
+                }
+                for item in self._queue
+            ],
+        }
+
+    def restore(self, state: dict[str, Any]) -> None:
+        self._current_time_ns = state["current_time_ns"]
+        self._sequence_counter = state["sequence_counter"]
+        self._events_processed = state["events_processed"]
+        self._queue = []
+        for item in state["queue"]:
+            event = ScheduledEvent(
+                time_ns=item["time_ns"],
+                priority=item["priority"],
+                sequence=item["sequence"],
+                event_type=item["event_type"],
+                payload_version=item.get("payload_version", 1),
+                payload=item.get("payload", {}),
+            )
+            heapq.heappush(
+                self._queue,
+                (event.time_ns, event.priority, event.sequence, event),
+            )
+

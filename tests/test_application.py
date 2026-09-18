@@ -150,3 +150,66 @@ def test_run_invalid_config_raises_error() -> None:
     with pytest.raises(ValueError, match="Invalid configuration"):
         run_episode(YAML_WITH_UNKNOWN_FIELD)
 
+
+def test_seed_affects_result_hash() -> None:
+    yaml1 = MINIMAL_VALID_YAML.replace("seed: 42", "seed: 42")
+    yaml2 = MINIMAL_VALID_YAML.replace("seed: 42", "seed: 99")
+
+    summary1 = run_episode(yaml1)
+    summary2 = run_episode(yaml2)
+
+    assert summary1.seed == 42
+    assert summary2.seed == 99
+    assert summary1.result_hash != summary2.result_hash
+
+
+def test_validate_rejects_duplicate_unit_ids() -> None:
+    duplicate_units_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+production_units:
+  - id: "unit-dup"
+    variant: "sedan"
+  - id: "unit-dup"
+    variant: "suv"
+stations:
+  - id: "station-001"
+    operations:
+      - id: "op-assembly"
+        duration: "10s"
+"""
+    result = validate_config(duplicate_units_yaml)
+    assert result.is_valid is False
+    assert any("duplicate production unit" in err.lower() for err in result.errors)
+
+
+def test_validate_rejects_duplicate_station_ids() -> None:
+    duplicate_stations_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+production_units:
+  - id: "unit-001"
+    variant: "sedan"
+stations:
+  - id: "station-dup"
+    operations:
+      - id: "op-assembly"
+        duration: "10s"
+  - id: "station-dup"
+    operations:
+      - id: "op-assembly-2"
+        duration: "10s"
+"""
+    result = validate_config(duplicate_stations_yaml)
+    assert result.is_valid is False
+    assert any("duplicate station" in err.lower() for err in result.errors)
+
+

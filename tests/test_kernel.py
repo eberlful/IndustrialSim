@@ -106,3 +106,30 @@ def test_property_monotonic_time_and_stable_tie_breaking(
         t2, p2, s2 = processed_tuples[i + 1]
         assert (t1, p1, s1) < (t2, p2, s2)
 
+
+def test_kernel_snapshot_and_restore() -> None:
+    kernel = EventKernel(initial_time_ns=100)
+    kernel.schedule(time_ns=200, priority=EventPriority.NEW_WORK, event_type="work", payload={"id": 1})
+    kernel.schedule(time_ns=300, priority=EventPriority.COMPLETION, event_type="comp", payload={"id": 2})
+
+    snap = kernel.snapshot()
+    assert snap["current_time_ns"] == 100
+    assert len(snap["queue"]) == 2
+
+    new_kernel = EventKernel()
+    new_kernel.restore(snap)
+
+    assert new_kernel.current_time_ns == 100
+    assert new_kernel.queue_size == 2
+
+    evt1 = new_kernel.step()
+    assert evt1 is not None
+    assert evt1.time_ns == 200
+    assert evt1.payload["id"] == 1
+
+    evt2 = new_kernel.step()
+    assert evt2 is not None
+    assert evt2.time_ns == 300
+    assert evt2.payload["id"] == 2
+
+
