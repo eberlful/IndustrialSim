@@ -1,0 +1,18 @@
+schema_version: "1.0"
+seed: 42
+
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+production_units:
+  - id: "unit-001"
+    variant: "sedan"
+    release_time: "0s"
+
+stations:
+  - id: "station-001"
+    operations:
+      - id: "op-assembly"
+        duration: "10s"
