@@ -98,8 +98,8 @@ class Station:
     busy_start_ns: int | None = None
     blocked_start_ns: int | None = None
 
-    def can_accept(self) -> bool:
-        return (not self.is_busy) and (not self.is_blocked)
+    def can_accept(self, reserved: int = 0) -> bool:
+        return (not self.is_busy) and (not self.is_blocked) and reserved == 0
 
     def has_output_space(self) -> bool:
         return len(self.output_buffer) < self.output_capacity
@@ -155,8 +155,8 @@ class Buffer:
     occupants: list[str] = field(default_factory=list)
     peak_occupancy: int = 0
 
-    def can_accept(self) -> bool:
-        return len(self.occupants) < self.capacity
+    def can_accept(self, reserved: int = 0) -> bool:
+        return (len(self.occupants) + reserved) < self.capacity
 
     def add_unit(self, unit_id: str) -> None:
         if len(self.occupants) >= self.capacity:

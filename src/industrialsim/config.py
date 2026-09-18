@@ -326,16 +326,18 @@ class SimulationConfig(StrictBaseModel):
         if self.material_flow is not None:
             source_nodes = [node for node in self.material_flow.nodes if node.kind == "source"]
             source_ids = {node.id for node in source_nodes}
-            for u in self.production_units:
-                if u.source_id is not None:
-                    if u.source_id not in source_ids:
+            if not source_ids:
+                raise ValueError("Material flow topology must define at least one source node")
+            for unit_cfg in self.production_units:
+                if unit_cfg.source_id is not None:
+                    if unit_cfg.source_id not in source_ids:
                         raise ValueError(
-                            f"Production unit '{u.id}' references unknown source '{u.source_id}'"
+                            f"Production unit '{unit_cfg.id}' references unknown source '{unit_cfg.source_id}'"
                         )
                 else:
                     if len(source_ids) > 1:
                         raise ValueError(
-                            f"Production unit '{u.id}' must specify 'source_id' when material flow contains multiple sources: {sorted(source_ids)}"
+                            f"Production unit '{unit_cfg.id}' must specify 'source_id' when material flow contains multiple sources: {sorted(source_ids)}"
                         )
 
         return self

@@ -289,15 +289,16 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
     in_flight_to: dict[str, int] = {node.id: 0 for node in mf.nodes}
     source_pending_units: dict[str, list[str]] = {nid: [] for nid in sources}
 
+    accept_checkers = {
+        "sink": lambda nid: True,
+        "buffer": lambda nid: buffers[nid].can_accept(reserved=in_flight_to[nid]),
+        "station": lambda nid: stations[nid].can_accept(reserved=in_flight_to[nid]),
+        "source": lambda nid: False,
+    }
+
     def can_accept(node_id: str) -> bool:
-        kind = nodes_by_id[node_id].kind
-        if kind == "sink":
-            return True
-        if kind == "buffer":
-            return (len(buffers[node_id].occupants) + in_flight_to[node_id]) < buffers[node_id].capacity
-        if kind == "station":
-            return stations[node_id].can_accept() and in_flight_to[node_id] == 0
-        return False
+        checker = accept_checkers.get(nodes_by_id[node_id].kind)
+        return checker(node_id) if checker else False
 
     def get_available_route(from_node_id: str) -> RouteConfig | None:
         routes = routes_from.get(from_node_id, [])
@@ -351,20 +352,23 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
 
     def pull_from_buffer(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
         buf = buffers[upstream_id]
-        if buf.has_occupants() and can_accept(route.target_node_id):
+        pulled = False
+        while buf.has_occupants() and can_accept(route.target_node_id):
             out_uid = buf.pop_unit()
             assert out_uid is not None
             dispatch_unit_to_target(k, out_uid, route)
+            pulled = True
+        if pulled:
             try_pull_upstream(k, upstream_id, visited)
-            return True
-        return False
+        return pulled
 
     def pull_from_source(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        if source_pending_units[upstream_id] and can_accept(route.target_node_id):
+        pulled = False
+        while source_pending_units[upstream_id] and can_accept(route.target_node_id):
             out_uid = source_pending_units[upstream_id].pop(0)
             dispatch_unit_to_target(k, out_uid, route)
-            return True
-        return False
+            pulled = True
+        return pulled
 
     pull_suppliers = {
         "station": pull_from_station,
@@ -521,7 +525,10 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
     for u_cfg in cfg.production_units:
         release_ns = max(cfg.episode.start_time_ns, u_cfg.release_time_ns)
         source_id = u_cfg.source_id or sole_source_id
-        assert source_id is not None and source_id in sources
+        if source_id is None or source_id not in sources:
+            raise ValueError(
+                f"Production unit '{u_cfg.id}' cannot be released: no valid source node found in material flow"
+            )
         kernel.schedule(
             time_ns=release_ns,
             priority=EventPriority.NEW_WORK,

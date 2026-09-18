@@ -199,3 +199,40 @@ production_units:
     assert result.is_valid is False
     assert any("must specify 'source_id' when material flow contains multiple sources" in err for err in result.errors)
 
+
+def test_validate_rejects_material_flow_without_sources() -> None:
+    zero_source_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+material_flow:
+  nodes:
+    - id: "st-1"
+      kind: "station"
+      operations:
+        - id: "op-1"
+          duration: "10s"
+      input_ports: [{id: "in", port_type: "p", direction: "input"}]
+      output_ports: [{id: "out", port_type: "p", direction: "output"}]
+    - id: "snk-1"
+      kind: "sink"
+      input_ports: [{id: "in", port_type: "p", direction: "input"}]
+  routes:
+    - id: "r1"
+      source_node_id: "st-1"
+      source_port_id: "out"
+      target_node_id: "snk-1"
+      target_port_id: "in"
+production_units:
+  - id: "u-1"
+    variant: "sedan"
+    release_time: "0s"
+"""
+    result = validate_config(zero_source_yaml)
+    assert result.is_valid is False
+    assert any("must define at least one source node" in err.lower() or "source" in err.lower() for err in result.errors)
+
+
