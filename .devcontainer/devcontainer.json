@@ -1,0 +1,13 @@
+{
+  "name": "IndustrialSim",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "lts"
+    }
+  },
+  "remoteUser": "vscode"
+}
