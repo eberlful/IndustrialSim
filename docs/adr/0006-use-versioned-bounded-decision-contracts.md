@@ -1,0 +1,3 @@
+# Use versioned bounded decision contracts
+
+Each Decision Request type defines a versioned JSON-compatible observation and action schema rather than exposing the complete internal simulation state. The same Pydantic contract is used by in-process and future remote Decision Providers and carries episode, branch, batch, provider, model, and prompt provenance. Observations combine relevant local detail, neighborhood context, aggregate Plant metrics, and bounded history, while proposed actions are validated and rejected with explicit reasons; this trades some schema maintenance for stable agent integrations and control over information boundaries.

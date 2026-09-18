@@ -1,0 +1,3 @@
+# Use versioned portable checkpoints
+
+Checkpoints use a serializable format containing the complete continuation state plus schema, kernel, configuration, model, and plugin compatibility metadata. V1 optimizes in-memory branching but also supports durable replay files; each Counterfactual Branch remains single-threaded and multiple branches may run in isolated worker processes from serialized checkpoint data. Incompatible snapshots are rejected unless an explicit tested migration exists, accepting schema-migration responsibility so experiments remain reproducible across processes and over time.
