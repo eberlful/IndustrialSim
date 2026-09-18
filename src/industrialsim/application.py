@@ -224,14 +224,21 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                 return (not st.is_busy) and (not st.is_blocked) and (len(waiting_at_node[node_id]) == 0)
             return False
 
+        def get_available_route(from_node_id: str) -> Any | None:
+            routes = routes_from.get(from_node_id, [])
+            for r in routes:
+                if can_accept(r.target_node_id):
+                    return r
+            return routes[0] if routes else None
+
         def dispatch_unit_to_target(k: EventKernel, unit_id: str, route: Any) -> None:
             target_id = route.target_node_id
+            units[unit_id].record_transition(
+                k.current_time_ns,
+                ProductionUnitState.IN_TRANSPORT,
+                location=route.id,
+            )
             if route.transit_time_ns > 0:
-                units[unit_id].record_transition(
-                    k.current_time_ns,
-                    ProductionUnitState.IN_TRANSPORT,
-                    location=route.id,
-                )
                 k.schedule(
                     time_ns=k.current_time_ns + route.transit_time_ns,
                     priority=EventPriority.COMPLETION,
@@ -246,7 +253,13 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                     payload={"unit_id": unit_id, "node_id": target_id},
                 )
 
-        def try_pull_upstream(k: EventKernel, node_id: str) -> None:
+        def try_pull_upstream(k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
+            if visited is None:
+                visited = set()
+            if node_id in visited:
+                return
+            visited.add(node_id)
+
             # Check all routes leading to node_id
             for route in routes_to.get(node_id, []):
                 upstream_id = route.source_node_id
@@ -255,7 +268,6 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                     if st.output_buffer and can_accept(node_id):
                         out_uid = st.output_buffer.pop(0)
                         dispatch_unit_to_target(k, out_uid, route)
-                        # If station was blocked waiting for output buffer space
                         if st.is_blocked:
                             blocked_uid = st.blocked_unit_id
                             assert blocked_uid is not None
@@ -264,24 +276,24 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                             units[blocked_uid].record_transition(
                                 k.current_time_ns,
                                 ProductionUnitState.IN_STATION,
-                                location=f"{upstream_id}:output",
+                                location=upstream_id,
                                 station_id=upstream_id,
                             )
                             try_start_next_operation(k, upstream_id)
-                            try_pull_upstream(k, upstream_id)
+                            try_pull_upstream(k, upstream_id, visited)
                     elif st.is_blocked and can_accept(node_id):
                         blocked_uid = st.blocked_unit_id
                         assert blocked_uid is not None
                         st.end_blocking(k.current_time_ns)
                         dispatch_unit_to_target(k, blocked_uid, route)
                         try_start_next_operation(k, upstream_id)
-                        try_pull_upstream(k, upstream_id)
+                        try_pull_upstream(k, upstream_id, visited)
                 elif upstream_id in buffers:
                     buf = buffers[upstream_id]
                     if buf.occupants and can_accept(node_id):
                         out_uid = buf.occupants.pop(0)
                         dispatch_unit_to_target(k, out_uid, route)
-                        try_pull_upstream(k, upstream_id)
+                        try_pull_upstream(k, upstream_id, visited)
                 elif upstream_id in nodes_by_id and nodes_by_id[upstream_id].kind == "source":
                     if waiting_at_node[upstream_id] and can_accept(node_id):
                         out_uid = waiting_at_node[upstream_id].pop(0)
@@ -317,9 +329,9 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                 location=source_id,
             )
 
-            routes = routes_from.get(source_id, [])
-            if routes and can_accept(routes[0].target_node_id):
-                dispatch_unit_to_target(k, unit_id, routes[0])
+            route = get_available_route(source_id)
+            if route and can_accept(route.target_node_id):
+                dispatch_unit_to_target(k, unit_id, route)
             else:
                 waiting_at_node[source_id].append(unit_id)
 
@@ -344,11 +356,10 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                     state=ProductionUnitState.IN_BUFFER,
                     location=node_id,
                 )
-                # Try forwarding downstream immediately
-                routes = routes_from.get(node_id, [])
-                if routes and can_accept(routes[0].target_node_id):
-                    buf.occupants.remove(unit_id)
-                    dispatch_unit_to_target(k, unit_id, routes[0])
+                route = get_available_route(node_id)
+                if route and can_accept(route.target_node_id):
+                    oldest_uid = buf.occupants.pop(0)
+                    dispatch_unit_to_target(k, oldest_uid, route)
                     try_pull_upstream(k, node_id)
 
             elif node.kind == "station":
@@ -385,12 +396,11 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             st = stations[station_id]
             st.complete_operation(operation_id, k.current_time_ns)
 
-            routes = routes_from.get(station_id, [])
-            target_route = routes[0] if routes else None
-            downstream_can_accept = target_route is not None and can_accept(target_route.target_node_id)
+            route = get_available_route(station_id)
+            downstream_can_accept = route is not None and can_accept(route.target_node_id)
 
-            if downstream_can_accept and target_route is not None:
-                dispatch_unit_to_target(k, unit_id, target_route)
+            if downstream_can_accept and route is not None:
+                dispatch_unit_to_target(k, unit_id, route)
                 try_start_next_operation(k, station_id)
                 try_pull_upstream(k, station_id)
             else:
@@ -399,7 +409,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                     units[unit_id].record_transition(
                         time_ns=k.current_time_ns,
                         state=ProductionUnitState.IN_STATION,
-                        location=f"{station_id}:output",
+                        location=station_id,
                         station_id=station_id,
                     )
                     try_start_next_operation(k, station_id)

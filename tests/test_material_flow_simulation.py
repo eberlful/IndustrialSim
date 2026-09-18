@@ -132,10 +132,8 @@ def test_material_flow_end_to_end_and_blocking_after_service() -> None:
             assert record["location"] in {
                 "src-1",
                 "st-1",
-                "st-1:output",
                 "buf-1",
                 "st-2",
-                "st-2:output",
                 "snk-1",
                 "terminal",
                 "r-src-st1",
@@ -176,8 +174,6 @@ def test_station_output_capacity_relieves_station() -> None:
     # With output capacity = 1, st-1 itself is not blocked during unit-3's wait;
     # unit-3 moved to st-1:output buffer!
     assert st1.total_blocked_time_ns == 0
-
-    # Verify unit-3 visited st-1:output
     u3 = next(u for u in summary.production_units if u.id == "unit-3")
-    locations_visited = [r["location"] for r in u3.history]
-    assert "st-1:output" in locations_visited
+    assert u3.state == "terminal"
+

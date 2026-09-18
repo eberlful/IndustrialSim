@@ -15,7 +15,7 @@ plant:
   name: "Main Assembly Plant"
   areas:
     - id: "area-body"
-      name: "Body Shop"
+      name: "Body Production Area"
       halls:
         - id: "hall-b1"
           name: "Body Welding Hall"
