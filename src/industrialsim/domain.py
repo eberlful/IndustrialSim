@@ -91,7 +91,6 @@ class Station:
     is_blocked: bool = False
     current_unit_id: str | None = None
     blocked_unit_id: str | None = None
-    input_queue: list[str] = field(default_factory=list)
     output_buffer: list[str] = field(default_factory=list)
     total_busy_time_ns: int = 0
     total_blocked_time_ns: int = 0
@@ -100,16 +99,7 @@ class Station:
     blocked_start_ns: int | None = None
 
     def can_accept(self) -> bool:
-        return (not self.is_busy) and (not self.is_blocked) and (len(self.input_queue) == 0)
-
-    def enqueue_input_unit(self, unit_id: str) -> None:
-        self.input_queue.append(unit_id)
-
-    def pop_next_input_unit(self) -> str | None:
-        return self.input_queue.pop(0) if self.input_queue else None
-
-    def has_waiting_units(self) -> bool:
-        return len(self.input_queue) > 0
+        return (not self.is_busy) and (not self.is_blocked)
 
     def has_output_space(self) -> bool:
         return len(self.output_buffer) < self.output_capacity

@@ -322,4 +322,20 @@ class SimulationConfig(StrictBaseModel):
                         f"Node '{node.id}' references unknown hall '{node.hall_id}' not found in plant"
                     )
 
+        # Validate production unit sources against material flow
+        if self.material_flow is not None:
+            source_nodes = [node for node in self.material_flow.nodes if node.kind == "source"]
+            source_ids = {node.id for node in source_nodes}
+            for u in self.production_units:
+                if u.source_id is not None:
+                    if u.source_id not in source_ids:
+                        raise ValueError(
+                            f"Production unit '{u.id}' references unknown source '{u.source_id}'"
+                        )
+                else:
+                    if len(source_ids) > 1:
+                        raise ValueError(
+                            f"Production unit '{u.id}' must specify 'source_id' when material flow contains multiple sources: {sorted(source_ids)}"
+                        )
+
         return self

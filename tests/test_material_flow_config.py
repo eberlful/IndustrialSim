@@ -148,3 +148,54 @@ def test_validate_material_flow_unreachable_sink() -> None:
     result = validate_config(broken_yaml)
     assert result.is_valid is False
     assert any("unreachable" in err.lower() for err in result.errors)
+
+
+def test_validate_rejects_unknown_source_id() -> None:
+    yaml_unknown_source = VALID_MATERIAL_FLOW_YAML.replace(
+        'release_time: "0s"',
+        'release_time: "0s"\n    source_id: "nonexistent-source"',
+    )
+    result = validate_config(yaml_unknown_source)
+    assert result.is_valid is False
+    assert any("references unknown source" in err for err in result.errors)
+
+
+def test_validate_rejects_omitted_source_id_with_multiple_sources() -> None:
+    multi_source_ambiguous_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+material_flow:
+  nodes:
+    - id: "src-1"
+      kind: "source"
+      output_ports: [{id: "out", port_type: "p", direction: "output"}]
+    - id: "src-2"
+      kind: "source"
+      output_ports: [{id: "out", port_type: "p", direction: "output"}]
+    - id: "snk-1"
+      kind: "sink"
+      input_ports: [{id: "in", port_type: "p", direction: "input"}]
+  routes:
+    - id: "r1"
+      source_node_id: "src-1"
+      source_port_id: "out"
+      target_node_id: "snk-1"
+      target_port_id: "in"
+    - id: "r2"
+      source_node_id: "src-2"
+      source_port_id: "out"
+      target_node_id: "snk-1"
+      target_port_id: "in"
+production_units:
+  - id: "u-1"
+    variant: "sedan"
+    release_time: "0s"
+"""
+    result = validate_config(multi_source_ambiguous_yaml)
+    assert result.is_valid is False
+    assert any("must specify 'source_id' when material flow contains multiple sources" in err for err in result.errors)
+

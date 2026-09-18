@@ -198,9 +198,9 @@ material_flow:
     - id: "st-multi"
       kind: "station"
       operations:
-        - id: "op-step-1"
+        - id: "op-prep"
           duration: "3s"
-        - id: "op-step-2"
+        - id: "op-finish"
           duration: "4s"
       input_ports:
         - id: "p-in"
@@ -235,14 +235,19 @@ production_units:
 """
     summary = run_episode(multi_op_yaml)
     assert summary.status == "completed"
-    # op-step-1 (3s) + op-step-2 (4s) = 7s total
+    # op-prep (3s) + op-finish (4s) = 7s total
     assert summary.simulated_time_ns == 7_000_000_000
 
     u = summary.production_units[0]
     assert u.state == "terminal"
     # Verify operations were executed
     ops_in_history = [h.get("operation_id") for h in u.history if h.get("operation_id")]
-    assert ops_in_history == ["op-step-1", "op-step-2"]
+    assert ops_in_history == ["op-prep", "op-finish"]
+
+    # Verify multi-op metrics: both operations accounted
+    st = next(s for s in summary.stations if s.id == "st-multi")
+    assert st.operations_completed == 2
+    assert st.total_busy_time_ns == 7_000_000_000
 
 
 def test_material_flow_multiple_sources() -> None:
@@ -303,5 +308,77 @@ production_units:
     u_b = next(u for u in summary.production_units if u.id == "unit-from-B")
     assert u_a.history[0]["location"] == "src-A"
     assert u_b.history[0]["location"] == "src-B"
+
+
+def test_in_flight_capacity_reservation_prevents_station_overflow() -> None:
+    in_flight_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+material_flow:
+  nodes:
+    - id: "src-1"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "st-1"
+      kind: "station"
+      operations:
+        - id: "op-process"
+          duration: "10s"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "snk-1"
+      kind: "sink"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+  routes:
+    - id: "r-transit"
+      source_node_id: "src-1"
+      source_port_id: "p-out"
+      target_node_id: "st-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+    - id: "r-out"
+      source_node_id: "st-1"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+
+production_units:
+  - id: "unit-first"
+    variant: "sedan"
+    release_time: "0s"
+  - id: "unit-second"
+    variant: "suv"
+    release_time: "2s"
+"""
+    summary = run_episode(in_flight_yaml)
+    assert summary.status == "completed"
+
+    u_first = next(u for u in summary.production_units if u.id == "unit-first")
+    u_second = next(u for u in summary.production_units if u.id == "unit-second")
+
+    # Unit 1 dispatched at 0s, arrives at 5s, finishes at 15s
+    # Unit 2 released at 2s; while unit 1 is in-flight (or processing), st-1 cannot accept.
+    # Unit 2 only leaves src-1 at 15s when st-1 finishes unit 1 and pulls unit 2!
+    second_transit_entry = next(
+        h for h in u_second.history if h["state"] == "in_transport"
+    )
+    assert second_transit_entry["time_ns"] == 15_000_000_000
 
 

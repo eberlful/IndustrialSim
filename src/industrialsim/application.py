@@ -286,15 +286,17 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         routes_from.setdefault(r.source_node_id, []).append(r)
         routes_to.setdefault(r.target_node_id, []).append(r)
 
-    source_waiting_queues: dict[str, list[str]] = {nid: [] for nid in sources}
+    in_flight_to: dict[str, int] = {node.id: 0 for node in mf.nodes}
+    source_pending_units: dict[str, list[str]] = {nid: [] for nid in sources}
 
     def can_accept(node_id: str) -> bool:
-        if node_id in sinks:
+        kind = nodes_by_id[node_id].kind
+        if kind == "sink":
             return True
-        if node_id in buffers:
-            return buffers[node_id].can_accept()
-        if node_id in stations:
-            return stations[node_id].can_accept()
+        if kind == "buffer":
+            return (len(buffers[node_id].occupants) + in_flight_to[node_id]) < buffers[node_id].capacity
+        if kind == "station":
+            return stations[node_id].can_accept() and in_flight_to[node_id] == 0
         return False
 
     def get_available_route(from_node_id: str) -> RouteConfig | None:
@@ -306,25 +308,69 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
 
     def dispatch_unit_to_target(k: EventKernel, unit_id: str, route: RouteConfig) -> None:
         target_id = route.target_node_id
+        in_flight_to[target_id] += 1
         units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_TRANSPORT,
             location=route.id,
         )
-        if route.transit_time_ns > 0:
-            k.schedule(
-                time_ns=k.current_time_ns + route.transit_time_ns,
-                priority=EventPriority.COMPLETION,
-                event_type="ARRIVAL_AT_NODE",
-                payload={"unit_id": unit_id, "node_id": target_id},
-            )
-        else:
-            k.schedule(
-                time_ns=k.current_time_ns,
-                priority=EventPriority.COMPLETION,
-                event_type="ARRIVAL_AT_NODE",
-                payload={"unit_id": unit_id, "node_id": target_id},
-            )
+        k.schedule(
+            time_ns=k.current_time_ns + route.transit_time_ns,
+            priority=EventPriority.COMPLETION,
+            event_type="ARRIVAL_AT_NODE",
+            payload={"unit_id": unit_id, "node_id": target_id},
+        )
+
+    def pull_from_station(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+        st = stations[upstream_id]
+        if st.has_output_units() and can_accept(route.target_node_id):
+            out_uid = st.pop_output_unit()
+            assert out_uid is not None
+            dispatch_unit_to_target(k, out_uid, route)
+            if st.is_blocked:
+                blocked_uid = st.blocked_unit_id
+                assert blocked_uid is not None
+                st.end_blocking(k.current_time_ns)
+                st.enqueue_output_unit(blocked_uid)
+                units[blocked_uid].record_transition(
+                    time_ns=k.current_time_ns,
+                    state=ProductionUnitState.IN_STATION,
+                    location=upstream_id,
+                    station_id=upstream_id,
+                )
+                try_pull_upstream(k, upstream_id, visited)
+            return True
+        elif st.is_blocked and can_accept(route.target_node_id):
+            blocked_uid = st.blocked_unit_id
+            assert blocked_uid is not None
+            st.end_blocking(k.current_time_ns)
+            dispatch_unit_to_target(k, blocked_uid, route)
+            try_pull_upstream(k, upstream_id, visited)
+            return True
+        return False
+
+    def pull_from_buffer(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+        buf = buffers[upstream_id]
+        if buf.has_occupants() and can_accept(route.target_node_id):
+            out_uid = buf.pop_unit()
+            assert out_uid is not None
+            dispatch_unit_to_target(k, out_uid, route)
+            try_pull_upstream(k, upstream_id, visited)
+            return True
+        return False
+
+    def pull_from_source(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+        if source_pending_units[upstream_id] and can_accept(route.target_node_id):
+            out_uid = source_pending_units[upstream_id].pop(0)
+            dispatch_unit_to_target(k, out_uid, route)
+            return True
+        return False
+
+    pull_suppliers = {
+        "station": pull_from_station,
+        "buffer": pull_from_buffer,
+        "source": pull_from_source,
+    }
 
     def try_pull_upstream(k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
         if visited is None:
@@ -335,64 +381,10 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
 
         for route in routes_to.get(node_id, []):
             upstream_id = route.source_node_id
-            if upstream_id in stations:
-                st = stations[upstream_id]
-                if st.has_output_units() and can_accept(node_id):
-                    out_uid = st.pop_output_unit()
-                    assert out_uid is not None
-                    dispatch_unit_to_target(k, out_uid, route)
-                    if st.is_blocked:
-                        blocked_uid = st.blocked_unit_id
-                        assert blocked_uid is not None
-                        st.end_blocking(k.current_time_ns)
-                        st.enqueue_output_unit(blocked_uid)
-                        units[blocked_uid].record_transition(
-                            time_ns=k.current_time_ns,
-                            state=ProductionUnitState.IN_STATION,
-                            location=upstream_id,
-                            station_id=upstream_id,
-                        )
-                        try_start_next_operation(k, upstream_id)
-                        try_pull_upstream(k, upstream_id, visited)
-                elif st.is_blocked and can_accept(node_id):
-                    blocked_uid = st.blocked_unit_id
-                    assert blocked_uid is not None
-                    st.end_blocking(k.current_time_ns)
-                    dispatch_unit_to_target(k, blocked_uid, route)
-                    try_start_next_operation(k, upstream_id)
-                    try_pull_upstream(k, upstream_id, visited)
-            elif upstream_id in buffers:
-                buf = buffers[upstream_id]
-                if buf.has_occupants() and can_accept(node_id):
-                    out_uid = buf.pop_unit()
-                    assert out_uid is not None
-                    dispatch_unit_to_target(k, out_uid, route)
-                    try_pull_upstream(k, upstream_id, visited)
-            elif upstream_id in sources:
-                if source_waiting_queues[upstream_id] and can_accept(node_id):
-                    out_uid = source_waiting_queues[upstream_id].pop(0)
-                    dispatch_unit_to_target(k, out_uid, route)
-
-    def try_start_next_operation(k: EventKernel, station_id: str) -> None:
-        st = stations[station_id]
-        if (not st.is_busy) and (not st.is_blocked) and st.has_waiting_units():
-            next_uid = st.pop_next_input_unit()
-            assert next_uid is not None
-            op = list(st.operations.values())[0]
-            st.start_operation(next_uid, op.id, k.current_time_ns)
-            units[next_uid].record_transition(
-                time_ns=k.current_time_ns,
-                state=ProductionUnitState.IN_STATION,
-                location=station_id,
-                station_id=station_id,
-                operation_id=op.id,
-            )
-            k.schedule(
-                time_ns=k.current_time_ns + op.duration_ns,
-                priority=EventPriority.COMPLETION,
-                event_type="COMPLETE_OPERATION",
-                payload={"unit_id": next_uid, "station_id": station_id, "op_index": 0},
-            )
+            kind = nodes_by_id[upstream_id].kind
+            supplier = pull_suppliers.get(kind)
+            if supplier:
+                supplier(k, upstream_id, route, visited)
 
     def handle_release(k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
@@ -408,61 +400,62 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         if route and can_accept(route.target_node_id):
             dispatch_unit_to_target(k, unit_id, route)
         else:
-            source_waiting_queues[source_id].append(unit_id)
+            source_pending_units[source_id].append(unit_id)
+
+    def handle_sink_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
+        units[unit_id].record_transition(
+            time_ns=k.current_time_ns,
+            state=ProductionUnitState.TERMINAL,
+            location="terminal",
+        )
+        try_pull_upstream(k, node_id)
+
+    def handle_buffer_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
+        buf = buffers[node_id]
+        buf.add_unit(unit_id)
+        units[unit_id].record_transition(
+            time_ns=k.current_time_ns,
+            state=ProductionUnitState.IN_BUFFER,
+            location=node_id,
+        )
+        route = get_available_route(node_id)
+        if route and can_accept(route.target_node_id):
+            oldest_uid = buf.pop_unit()
+            assert oldest_uid is not None
+            dispatch_unit_to_target(k, oldest_uid, route)
+        try_pull_upstream(k, node_id)
+
+    def handle_station_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
+        st = stations[node_id]
+        assert st.can_accept(), f"Station {node_id} accepted unit {unit_id} while busy/blocked"
+        op = list(st.operations.values())[0]
+        st.start_operation(unit_id, op.id, k.current_time_ns)
+        units[unit_id].record_transition(
+            time_ns=k.current_time_ns,
+            state=ProductionUnitState.IN_STATION,
+            location=node_id,
+            station_id=node_id,
+            operation_id=op.id,
+        )
+        k.schedule(
+            time_ns=k.current_time_ns + op.duration_ns,
+            priority=EventPriority.COMPLETION,
+            event_type="COMPLETE_OPERATION",
+            payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0},
+        )
+
+    arrival_handlers = {
+        "sink": handle_sink_arrival,
+        "buffer": handle_buffer_arrival,
+        "station": handle_station_arrival,
+    }
 
     def handle_arrival_at_node(k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         node_id = event.payload["node_id"]
-
-        if node_id in sinks:
-            units[unit_id].record_transition(
-                time_ns=k.current_time_ns,
-                state=ProductionUnitState.TERMINAL,
-                location="terminal",
-            )
-            try_pull_upstream(k, node_id)
-
-        elif node_id in buffers:
-            buf = buffers[node_id]
-            buf.add_unit(unit_id)
-            units[unit_id].record_transition(
-                time_ns=k.current_time_ns,
-                state=ProductionUnitState.IN_BUFFER,
-                location=node_id,
-            )
-            route = get_available_route(node_id)
-            if route and can_accept(route.target_node_id):
-                oldest_uid = buf.pop_unit()
-                assert oldest_uid is not None
-                dispatch_unit_to_target(k, oldest_uid, route)
-                try_pull_upstream(k, node_id)
-
-        elif node_id in stations:
-            st = stations[node_id]
-            if st.can_accept():
-                op = list(st.operations.values())[0]
-                st.start_operation(unit_id, op.id, k.current_time_ns)
-                units[unit_id].record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.IN_STATION,
-                    location=node_id,
-                    station_id=node_id,
-                    operation_id=op.id,
-                )
-                k.schedule(
-                    time_ns=k.current_time_ns + op.duration_ns,
-                    priority=EventPriority.COMPLETION,
-                    event_type="COMPLETE_OPERATION",
-                    payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0},
-                )
-            else:
-                st.enqueue_input_unit(unit_id)
-                units[unit_id].record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.IN_STATION,
-                    location=node_id,
-                    station_id=node_id,
-                )
+        in_flight_to[node_id] -= 1
+        handler = arrival_handlers[nodes_by_id[node_id].kind]
+        handler(k, unit_id, node_id)
 
     def handle_complete_operation(k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
@@ -470,11 +463,14 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         op_index = event.payload.get("op_index", 0)
         st = stations[station_id]
         ops_list = list(st.operations.values())
+        current_op = ops_list[op_index]
+
+        st.complete_operation(current_op.id, k.current_time_ns)
 
         # If station has multiple operations and more remain for this unit:
         if op_index + 1 < len(ops_list):
             next_op = ops_list[op_index + 1]
-            st.busy_start_ns = k.current_time_ns
+            st.start_operation(unit_id, next_op.id, k.current_time_ns)
             units[unit_id].record_transition(
                 time_ns=k.current_time_ns,
                 state=ProductionUnitState.IN_STATION,
@@ -490,16 +486,12 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             )
             return
 
-        # Last operation completed
-        completed_op = ops_list[op_index]
-        st.complete_operation(completed_op.id, k.current_time_ns)
-
+        # Last operation completed for this unit:
         route = get_available_route(station_id)
         downstream_can_accept = route is not None and can_accept(route.target_node_id)
 
         if downstream_can_accept and route is not None:
             dispatch_unit_to_target(k, unit_id, route)
-            try_start_next_operation(k, station_id)
             try_pull_upstream(k, station_id)
         else:
             if st.has_output_space():
@@ -510,7 +502,6 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
                     location=station_id,
                     station_id=station_id,
                 )
-                try_start_next_operation(k, station_id)
                 try_pull_upstream(k, station_id)
             else:
                 st.start_blocking(unit_id, k.current_time_ns)
@@ -525,13 +516,12 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
     kernel.register_handler("ARRIVAL_AT_NODE", handle_arrival_at_node)
     kernel.register_handler("COMPLETE_OPERATION", handle_complete_operation)
 
-    first_source_id = next(iter(sources.keys()))
+    sole_source_id = next(iter(sources.keys())) if len(sources) == 1 else None
 
     for u_cfg in cfg.production_units:
         release_ns = max(cfg.episode.start_time_ns, u_cfg.release_time_ns)
-        source_id = u_cfg.source_id or first_source_id
-        if source_id not in sources:
-            raise ValueError(f"Production unit '{u_cfg.id}' references unknown source '{source_id}'")
+        source_id = u_cfg.source_id or sole_source_id
+        assert source_id is not None and source_id in sources
         kernel.schedule(
             time_ns=release_ns,
             priority=EventPriority.NEW_WORK,
