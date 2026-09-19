@@ -236,6 +236,23 @@ class Machine:
     operations_completed: int = 0
     last_state_change_ns: int = 0
     pending_off_shift: bool = False
+    health: float = 1.0
+    operating_mode: str = "nominal"
+    modes: dict[str, Any] = field(default_factory=dict)
+    degradation_policy: dict[str, Any] | None = None
+    maintenance_policy: dict[str, Any] | None = None
+    inspection_policy: dict[str, Any] | None = None
+    failure_policy: dict[str, Any] | None = None
+    planned_disruptions: list[dict[str, Any]] = field(default_factory=list)
+    physical_state: dict[str, float] = field(default_factory=dict)
+    is_failed: bool = False
+    is_in_maintenance: bool = False
+    total_maintenance_time_ns: int = 0
+    total_failed_time_ns: int = 0
+    maintenance_count: int = 0
+    failure_count: int = 0
+    failure_start_ns: int | None = None
+    maintenance_start_ns: int | None = None
 
     def is_on_shift(self, time_ns: int) -> bool:
         if not self.shifts:
@@ -246,7 +263,7 @@ class Machine:
         return any(b.start_time_ns <= time_ns < b.end_time_ns for b in self.breaks)
 
     def is_available(self, time_ns: int) -> bool:
-        if self.pending_off_shift:
+        if self.pending_off_shift or self.is_failed or self.is_in_maintenance:
             return False
         return self.is_on_shift(time_ns) and not self.is_on_break(time_ns)
 
@@ -274,15 +291,73 @@ class Machine:
     def update_metrics(self, current_time_ns: int) -> None:
         elapsed = current_time_ns - self.last_state_change_ns
         if elapsed > 0:
-            if len(self.active_allocations) > 0:
+            dt_s = elapsed / 1_000_000_000.0
+            if self.is_failed:
+                self.total_failed_time_ns += elapsed
+            elif self.is_in_maintenance:
+                self.total_maintenance_time_ns += elapsed
+            elif len(self.active_allocations) > 0:
                 self.total_busy_time_ns += elapsed
+                if self.degradation_policy:
+                    use_rate = float(self.degradation_policy.get("use_rate_per_s", 0.0))
+                    mode_info = self.modes.get(self.operating_mode, {})
+                    if isinstance(mode_info, dict):
+                        mode_mult = float(mode_info.get("degradation_multiplier", 1.0))
+                    else:
+                        mode_mult = float(getattr(mode_info, "degradation_multiplier", 1.0))
+                    self.health = max(0.0, self.health - dt_s * use_rate * mode_mult)
+                    phys_rates = self.degradation_policy.get("physical_rates_per_s", {})
+                    for k, rate in phys_rates.items():
+                        self.physical_state[k] = self.physical_state.get(k, 0.0) + dt_s * float(rate)
             elif self.is_on_break(self.last_state_change_ns):
                 self.total_break_time_ns += elapsed
             elif not self.is_on_shift(self.last_state_change_ns):
                 self.total_off_shift_time_ns += elapsed
             else:
                 self.total_idle_time_ns += elapsed
+                if self.degradation_policy:
+                    idle_rate = float(self.degradation_policy.get("idle_rate_per_s", 0.0))
+                    self.health = max(0.0, self.health - dt_s * idle_rate)
+                    idle_phys_rates = self.degradation_policy.get("physical_idle_rates_per_s", {})
+                    for k, rate in idle_phys_rates.items():
+                        self.physical_state[k] = self.physical_state.get(k, 0.0) + dt_s * float(rate)
         self.last_state_change_ns = current_time_ns
+
+    def start_failure(self, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.is_failed = True
+        self.failure_count += 1
+        self.failure_start_ns = time_ns
+
+    def end_failure(self, time_ns: int, restored_health: float | None = None) -> None:
+        self.update_metrics(time_ns)
+        self.is_failed = False
+        self.failure_start_ns = None
+        if restored_health is not None:
+            self.health = min(1.0, max(0.0, restored_health))
+
+    def start_maintenance(self, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.is_in_maintenance = True
+        self.maintenance_count += 1
+        self.maintenance_start_ns = time_ns
+
+    def end_maintenance(self, time_ns: int, restored_health: float | None = None) -> None:
+        self.update_metrics(time_ns)
+        self.is_in_maintenance = False
+        self.maintenance_start_ns = None
+        if restored_health is not None:
+            self.health = min(1.0, max(0.0, restored_health))
+
+    def inspect(self, time_ns: int, restored_health: float | None = None, health_delta: float = 0.0) -> None:
+        self.update_metrics(time_ns)
+        if restored_health is not None:
+            self.health = min(1.0, max(0.0, restored_health))
+        elif health_delta != 0.0:
+            self.health = min(1.0, max(0.0, self.health + health_delta))
+
+    def set_operating_mode(self, mode: str) -> None:
+        self.operating_mode = mode
 
     @property
     def utilization(self) -> float:
@@ -300,6 +375,18 @@ class Machine:
             "total_off_shift_time_ns": self.total_off_shift_time_ns,
             "operations_completed": self.operations_completed,
             "last_state_change_ns": self.last_state_change_ns,
+            "pending_off_shift": self.pending_off_shift,
+            "health": self.health,
+            "operating_mode": self.operating_mode,
+            "physical_state": dict(self.physical_state),
+            "is_failed": self.is_failed,
+            "is_in_maintenance": self.is_in_maintenance,
+            "total_maintenance_time_ns": self.total_maintenance_time_ns,
+            "total_failed_time_ns": self.total_failed_time_ns,
+            "maintenance_count": self.maintenance_count,
+            "failure_count": self.failure_count,
+            "failure_start_ns": self.failure_start_ns,
+            "maintenance_start_ns": self.maintenance_start_ns,
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
@@ -310,6 +397,18 @@ class Machine:
         self.total_off_shift_time_ns = state.get("total_off_shift_time_ns", 0)
         self.operations_completed = state.get("operations_completed", 0)
         self.last_state_change_ns = state.get("last_state_change_ns", 0)
+        self.pending_off_shift = bool(state.get("pending_off_shift", False))
+        self.health = float(state.get("health", 1.0))
+        self.operating_mode = state.get("operating_mode", "nominal")
+        self.physical_state = dict(state.get("physical_state", {}))
+        self.is_failed = bool(state.get("is_failed", False))
+        self.is_in_maintenance = bool(state.get("is_in_maintenance", False))
+        self.total_maintenance_time_ns = state.get("total_maintenance_time_ns", 0)
+        self.total_failed_time_ns = state.get("total_failed_time_ns", 0)
+        self.maintenance_count = state.get("maintenance_count", 0)
+        self.failure_count = state.get("failure_count", 0)
+        self.failure_start_ns = state.get("failure_start_ns")
+        self.maintenance_start_ns = state.get("maintenance_start_ns")
 
 
 @dataclass

@@ -159,18 +159,168 @@ class ShiftConfig(StrictBaseModel):
         return self
 
 
+class MachineModeConfig(StrictBaseModel):
+    name: str | None = None
+    degradation_multiplier: float = 1.0
+    cycle_time_multiplier: float = 1.0
+    defect_probability_multiplier: float = 1.0
+    hazard_multiplier: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> MachineModeConfig:
+        if self.degradation_multiplier < 0.0:
+            raise ValueError(f"degradation_multiplier must be >= 0.0, got {self.degradation_multiplier}")
+        if self.cycle_time_multiplier <= 0.0:
+            raise ValueError(f"cycle_time_multiplier must be > 0.0, got {self.cycle_time_multiplier}")
+        if self.defect_probability_multiplier < 0.0:
+            raise ValueError(f"defect_probability_multiplier must be >= 0.0, got {self.defect_probability_multiplier}")
+        if self.hazard_multiplier < 0.0:
+            raise ValueError(f"hazard_multiplier must be >= 0.0, got {self.hazard_multiplier}")
+        return self
+
+
+class DegradationPolicyConfig(StrictBaseModel):
+    use_rate_per_s: float = 0.0
+    idle_rate_per_s: float = 0.0
+    cycle_time_factor: float = 0.0
+    defect_probability_factor: float = 0.0
+    failure_hazard_rate_per_s: float = 0.0
+    hazard_health_factor: float = 0.0
+    physical_rates_per_s: dict[str, float] = Field(default_factory=dict)
+    physical_idle_rates_per_s: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_degradation(self) -> DegradationPolicyConfig:
+        if self.use_rate_per_s < 0.0:
+            raise ValueError(f"use_rate_per_s must be >= 0.0, got {self.use_rate_per_s}")
+        if self.idle_rate_per_s < 0.0:
+            raise ValueError(f"idle_rate_per_s must be >= 0.0, got {self.idle_rate_per_s}")
+        if self.cycle_time_factor < 0.0:
+            raise ValueError(f"cycle_time_factor must be >= 0.0, got {self.cycle_time_factor}")
+        if self.defect_probability_factor < 0.0:
+            raise ValueError(f"defect_probability_factor must be >= 0.0, got {self.defect_probability_factor}")
+        if self.failure_hazard_rate_per_s < 0.0:
+            raise ValueError(f"failure_hazard_rate_per_s must be >= 0.0, got {self.failure_hazard_rate_per_s}")
+        if self.hazard_health_factor < 0.0:
+            raise ValueError(f"hazard_health_factor must be >= 0.0, got {self.hazard_health_factor}")
+        return self
+
+
+class MaintenancePolicyConfig(StrictBaseModel):
+    trigger: Literal["scheduled", "condition_threshold", "manual", "inspection"] = "condition_threshold"
+    health_threshold: float = 0.0
+    interval: int | str | None = None
+    interval_ns: int = 0
+    duration: int | str
+    duration_ns: int = 0
+    restored_health: float = 1.0
+    required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_maintenance(self) -> MaintenancePolicyConfig:
+        object.__setattr__(self, "duration_ns", parse_duration_ns(self.duration))
+        if self.interval is not None:
+            object.__setattr__(self, "interval_ns", parse_duration_ns(self.interval))
+        if not (0.0 <= self.health_threshold <= 1.0):
+            raise ValueError(f"health_threshold must be in [0.0, 1.0], got {self.health_threshold}")
+        if not (0.0 <= self.restored_health <= 1.0):
+            raise ValueError(f"restored_health must be in [0.0, 1.0], got {self.restored_health}")
+        return self
+
+
+class MachineInspectionPolicyConfig(StrictBaseModel):
+    interval: int | str | None = None
+    interval_ns: int = 0
+    duration: int | str = "0s"
+    duration_ns: int = 0
+    restored_health: float | None = None
+    health_delta: float = 0.0
+    required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_inspection(self) -> MachineInspectionPolicyConfig:
+        if self.interval is not None:
+            object.__setattr__(self, "interval_ns", parse_duration_ns(self.interval))
+        object.__setattr__(self, "duration_ns", parse_duration_ns(self.duration))
+        if self.restored_health is not None and not (0.0 <= self.restored_health <= 1.0):
+            raise ValueError(f"restored_health must be in [0.0, 1.0], got {self.restored_health}")
+        return self
+
+
+class FailurePolicyConfig(StrictBaseModel):
+    mttf: int | str | None = None
+    mttf_ns: int = 0
+    hazard_rate_per_s: float = 0.0
+    health_hazard_factor: float = 0.0
+    repair_duration: int | str = "0s"
+    repair_duration_ns: int = 0
+    mttr: int | str | None = None
+    mttr_ns: int = 0
+    repaired_health: float = 1.0
+    required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> FailurePolicyConfig:
+        if self.mttf is not None:
+            object.__setattr__(self, "mttf_ns", parse_duration_ns(self.mttf))
+        if self.mttr is not None:
+            object.__setattr__(self, "mttr_ns", parse_duration_ns(self.mttr))
+        object.__setattr__(self, "repair_duration_ns", parse_duration_ns(self.repair_duration))
+        if self.hazard_rate_per_s < 0.0:
+            raise ValueError(f"hazard_rate_per_s must be >= 0.0, got {self.hazard_rate_per_s}")
+        if self.health_hazard_factor < 0.0:
+            raise ValueError(f"health_hazard_factor must be >= 0.0, got {self.health_hazard_factor}")
+        if not (0.0 <= self.repaired_health <= 1.0):
+            raise ValueError(f"repaired_health must be in [0.0, 1.0], got {self.repaired_health}")
+        return self
+
+
+class PlannedDisruptionConfig(StrictBaseModel):
+    id: str | None = None
+    start_time: int | str
+    start_time_ns: int = 0
+    duration: int | str
+    duration_ns: int = 0
+    repaired_health: float | None = None
+    required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_disruption(self) -> PlannedDisruptionConfig:
+        object.__setattr__(self, "start_time_ns", parse_duration_ns(self.start_time))
+        object.__setattr__(self, "duration_ns", parse_duration_ns(self.duration))
+        if self.repaired_health is not None and not (0.0 <= self.repaired_health <= 1.0):
+            raise ValueError(f"repaired_health must be in [0.0, 1.0], got {self.repaired_health}")
+        return self
+
+
 class MachineConfig(StrictBaseModel):
     id: str
     name: str | None = None
     capacity: int = 1
     shifts: list[ShiftConfig] = Field(default_factory=list)
     breaks: list[BreakConfig] = Field(default_factory=list)
+    initial_health: float = 1.0
+    operating_mode: str = "nominal"
+    modes: dict[str, MachineModeConfig] = Field(default_factory=dict)
+    degradation: DegradationPolicyConfig | None = None
+    maintenance: MaintenancePolicyConfig | None = None
+    inspection: MachineInspectionPolicyConfig | None = None
+    failure: FailurePolicyConfig | None = None
+    planned_disruptions: list[PlannedDisruptionConfig] = Field(default_factory=list)
+    physical_state: dict[str, float] = Field(default_factory=dict)
 
     @field_validator("capacity")
     @classmethod
     def validate_capacity(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"Machine capacity must be >= 1, got {v}")
+        return v
+
+    @field_validator("initial_health")
+    @classmethod
+    def validate_initial_health(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"Machine initial_health must be in [0.0, 1.0], got {v}")
         return v
 
 
@@ -549,6 +699,20 @@ class SimulationConfig(StrictBaseModel):
                     raise ValueError(f"Operation '{op.id}' references unknown worker '{req.worker_id}'")
                 if req.qualification is not None and req.qualification not in valid_qual_set:
                     raise ValueError(f"Operation '{op.id}' references unknown qualification '{req.qualification}'")
+
+        for m in self.machines:
+            m_worker_reqs = []
+            if m.maintenance:
+                m_worker_reqs.extend(m.maintenance.required_workers)
+            if m.failure:
+                m_worker_reqs.extend(m.failure.required_workers)
+            for dis in m.planned_disruptions:
+                m_worker_reqs.extend(dis.required_workers)
+            for req in m_worker_reqs:
+                if req.worker_id is not None and req.worker_id not in valid_worker_set:
+                    raise ValueError(f"Machine '{m.id}' references unknown worker '{req.worker_id}'")
+                if req.qualification is not None and req.qualification not in valid_qual_set:
+                    raise ValueError(f"Machine '{m.id}' references unknown qualification '{req.qualification}'")
 
         if self.material_flow is None and not self.stations:
             raise ValueError("Either 'material_flow' or 'stations' must be defined")

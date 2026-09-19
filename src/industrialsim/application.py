@@ -115,6 +115,12 @@ class MachineSummary:
     total_break_time_ns: int
     total_off_shift_time_ns: int
     utilization: float
+    health: float = 1.0
+    operating_mode: str = "nominal"
+    total_maintenance_time_ns: int = 0
+    total_failed_time_ns: int = 0
+    maintenance_count: int = 0
+    failure_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -126,6 +132,12 @@ class MachineSummary:
             "total_break_time_ns": self.total_break_time_ns,
             "total_off_shift_time_ns": self.total_off_shift_time_ns,
             "utilization": self.utilization,
+            "health": self.health,
+            "operating_mode": self.operating_mode,
+            "total_maintenance_time_ns": self.total_maintenance_time_ns,
+            "total_failed_time_ns": self.total_failed_time_ns,
+            "maintenance_count": self.maintenance_count,
+            "failure_count": self.failure_count,
         }
 
 
@@ -387,6 +399,8 @@ class SimulationDomainState:
     workers: dict[str, Worker] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
     active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    maintenance_waiters: list[dict[str, Any]] = field(default_factory=list)
+    active_maintenances: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _verify_checkpoint_compatibility(
@@ -488,6 +502,14 @@ class EpisodeEngine:
     def active_operations(self) -> dict[str, dict[str, Any]]:
         return self.domain.active_operations
 
+    @property
+    def maintenance_waiters(self) -> list[dict[str, Any]]:
+        return self.domain.maintenance_waiters
+
+    @property
+    def active_maintenances(self) -> dict[str, dict[str, Any]]:
+        return self.domain.active_maintenances
+
     def _setup_handlers(self) -> None:
         self.kernel.register_handler("RELEASE_UNIT", self._handle_release)
         self.kernel.register_handler("ARRIVAL_AT_NODE", self._handle_arrival_at_node)
@@ -496,6 +518,11 @@ class EpisodeEngine:
         self.kernel.register_handler("SHIFT_END", self._handle_shift_end)
         self.kernel.register_handler("BREAK_START", self._handle_break_start)
         self.kernel.register_handler("BREAK_END", self._handle_break_end)
+        self.kernel.register_handler("DISRUPTION_START", self._handle_disruption_start)
+        self.kernel.register_handler("MACHINE_FAILURE", self._handle_machine_failure)
+        self.kernel.register_handler("COMPLETE_REPAIR", self._handle_complete_repair)
+        self.kernel.register_handler("MAINTENANCE_TRIGGER", self._handle_maintenance_trigger)
+        self.kernel.register_handler("COMPLETE_MAINTENANCE", self._handle_complete_maintenance)
 
     def _can_accept(self, node_id: str) -> bool:
         kind = self.nodes_by_id[node_id].kind
@@ -741,20 +768,13 @@ class EpisodeEngine:
                 self._dispatch_unit_to_target(k, oldest_uid, route)
         self._try_pull_upstream(k, node_id)
 
-    def _can_acquire_resources(
-        self, op: Operation, station_id: str, time_ns: int
-    ) -> tuple[bool, list[str], list[dict[str, Any]]]:
-        allocated_machines: list[str] = []
-        for m_id in op.required_machines:
-            mach = self.machines.get(m_id)
-            if not mach or not mach.can_allocate(1, time_ns):
-                return False, [], []
-            allocated_machines.append(m_id)
-
+    def _can_acquire_worker_requirements(
+        self, reqs: list[dict[str, Any]], time_ns: int
+    ) -> tuple[bool, list[dict[str, Any]]]:
         allocated_workers: list[dict[str, Any]] = []
         temp_worker_allocations: dict[str, int] = {}
 
-        for req in op.required_workers:
+        for req in reqs:
             needed_count = req.get("count", 1)
             target_worker_id = req.get("worker_id")
             target_qual = req.get("qualification")
@@ -762,10 +782,10 @@ class EpisodeEngine:
             if target_worker_id is not None:
                 w = self.workers.get(target_worker_id)
                 if not w or not w.is_available(time_ns):
-                    return False, [], []
+                    return False, []
                 curr_allocated = temp_worker_allocations.get(w.id, 0)
                 if w.available_capacity(time_ns) - curr_allocated < needed_count:
-                    return False, [], []
+                    return False, []
                 temp_worker_allocations[w.id] = curr_allocated + needed_count
                 allocated_workers.append({"worker_id": w.id, "count": needed_count, "qualification": target_qual})
             elif target_qual is not None:
@@ -787,9 +807,58 @@ class EpisodeEngine:
                         if satisfied == needed_count:
                             break
                 if satisfied < needed_count:
-                    return False, [], []
+                    return False, []
+
+        return True, allocated_workers
+
+    def _can_acquire_resources(
+        self, op: Operation, station_id: str, time_ns: int
+    ) -> tuple[bool, list[str], list[dict[str, Any]]]:
+        allocated_machines: list[str] = []
+        for m_id in op.required_machines:
+            mach = self.machines.get(m_id)
+            if not mach or not mach.can_allocate(1, time_ns):
+                return False, [], []
+            allocated_machines.append(m_id)
+
+        can_workers, allocated_workers = self._can_acquire_worker_requirements(op.required_workers, time_ns)
+        if not can_workers:
+            return False, [], []
 
         return True, allocated_machines, allocated_workers
+
+    def _compute_effective_operation_duration(self, op: Operation, time_ns: int) -> int:
+        if not op.required_machines:
+            return op.duration_ns
+        max_duration = 0
+        for m_id in op.required_machines:
+            mach = self.machines.get(m_id)
+            if mach:
+                mach.update_metrics(time_ns)
+                mode_info = mach.modes.get(mach.operating_mode, {})
+                mode_mult = float(mode_info.get("cycle_time_multiplier", 1.0)) if isinstance(mode_info, dict) else float(getattr(mode_info, "cycle_time_multiplier", 1.0))
+                cycle_factor = 0.0
+                if mach.degradation_policy:
+                    cycle_factor = float(mach.degradation_policy.get("cycle_time_factor", 0.0))
+                dur_mult = mode_mult * (1.0 + cycle_factor * (1.0 - mach.health))
+                eff_dur = max(1, int(round(op.duration_ns * dur_mult)))
+                if eff_dur > max_duration:
+                    max_duration = eff_dur
+        return max_duration if max_duration > 0 else op.duration_ns
+
+    def _compute_effective_defect_probability(self, op: Operation, time_ns: int) -> float:
+        effective_prob = op.defect_probability
+        for m_id in op.required_machines:
+            mach = self.machines.get(m_id)
+            if mach:
+                mach.update_metrics(time_ns)
+                mode_info = mach.modes.get(mach.operating_mode, {})
+                mode_defect_mult = float(mode_info.get("defect_probability_multiplier", 1.0)) if isinstance(mode_info, dict) else float(getattr(mode_info, "defect_probability_multiplier", 1.0))
+                defect_factor = 0.0
+                if mach.degradation_policy:
+                    defect_factor = float(mach.degradation_policy.get("defect_probability_factor", 0.0))
+                effective_prob = min(1.0, (effective_prob + defect_factor * (1.0 - mach.health)) * mode_defect_mult)
+        return effective_prob
 
     def _acquire_resources(
         self,
@@ -863,11 +932,16 @@ class EpisodeEngine:
             can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, station_id, time_ns)
             if can_acq:
                 allocated_indices.append(idx)
-                rem_dur = waiter.get("remaining_duration_ns", op.duration_ns)
                 if waiter.get("is_resuming"):
+                    rem_dur = waiter.get("remaining_duration_ns", op.duration_ns)
                     st.record_resume()
                 elif waiter.get("is_restarting"):
+                    rem_dur = self._compute_effective_operation_duration(op, time_ns)
                     st.record_restart()
+                else:
+                    rem_dur = waiter.get("remaining_duration_ns")
+                    if rem_dur is None:
+                        rem_dur = self._compute_effective_operation_duration(op, time_ns)
                 token = self._acquire_resources(
                     station_id=station_id,
                     unit_id=unit_id,
@@ -947,6 +1021,7 @@ class EpisodeEngine:
             m = self.machines[machine_id]
             m.pending_off_shift = False
             m.update_metrics(k.current_time_ns)
+        self._try_allocate_pending_maintenance(k.current_time_ns)
         self._try_allocate_pending_resources(k.current_time_ns)
 
     def _handle_shift_end(self, k: EventKernel, event: ScheduledEvent) -> None:
@@ -1021,6 +1096,7 @@ class EpisodeEngine:
                 else:
                     self._interrupt_operation(s_id, k.current_time_ns)
 
+        self._try_allocate_pending_maintenance(k.current_time_ns)
         self._try_allocate_pending_resources(k.current_time_ns)
 
     def _handle_break_start(self, k: EventKernel, event: ScheduledEvent) -> None:
@@ -1052,7 +1128,274 @@ class EpisodeEngine:
             self.workers[worker_id].update_metrics(k.current_time_ns)
         if machine_id and machine_id in self.machines:
             self.machines[machine_id].update_metrics(k.current_time_ns)
+        self._try_allocate_pending_maintenance(k.current_time_ns)
         self._try_allocate_pending_resources(k.current_time_ns)
+
+    def _handle_disruption_start(self, k: EventKernel, event: ScheduledEvent) -> None:
+        mach_id = event.payload["machine_id"]
+        mach = self.machines[mach_id]
+        disruption = event.payload.get("disruption", event.payload)
+        dur_ns = disruption.get("duration_ns", event.payload.get("duration_ns", 0))
+        repaired_health = disruption.get("repaired_health", event.payload.get("repaired_health"))
+        req_workers = disruption.get("required_workers", event.payload.get("required_workers", []))
+
+        mach.start_failure(k.current_time_ns)
+        active_stations = [
+            s_id for s_id, a_op in list(self.active_operations.items())
+            if mach_id in a_op["machines"]
+        ]
+        for s_id in active_stations:
+            self._interrupt_operation(s_id, k.current_time_ns)
+
+        can_acq, worker_allocs = self._can_acquire_worker_requirements(req_workers, k.current_time_ns)
+        if can_acq:
+            for alloc in worker_allocs:
+                for _ in range(alloc["count"]):
+                    self.workers[alloc["worker_id"]].allocate("maintenance", mach_id, "disruption", k.current_time_ns)
+            token = self.kernel.sequence_counter + 1
+            self.active_maintenances[mach_id] = {
+                "machine_id": mach_id,
+                "type": "disruption",
+                "token": token,
+                "workers": worker_allocs,
+                "repaired_health": repaired_health,
+            }
+            k.schedule(
+                time_ns=k.current_time_ns + dur_ns,
+                priority=EventPriority.COMPLETION,
+                event_type="COMPLETE_REPAIR",
+                payload={"machine_id": mach_id, "token": token},
+            )
+        else:
+            self.maintenance_waiters.append({
+                "machine_id": mach_id,
+                "type": "disruption",
+                "duration_ns": dur_ns,
+                "repaired_health": repaired_health,
+                "required_workers": req_workers,
+                "waiting_since_ns": k.current_time_ns,
+            })
+
+    def _handle_machine_failure(self, k: EventKernel, event: ScheduledEvent) -> None:
+        mach_id = event.payload["machine_id"]
+        mach = self.machines[mach_id]
+        if mach.is_failed or mach.is_in_maintenance:
+            return
+
+        mach.start_failure(k.current_time_ns)
+        active_stations = [
+            s_id for s_id, a_op in list(self.active_operations.items())
+            if mach_id in a_op["machines"]
+        ]
+        for s_id in active_stations:
+            self._interrupt_operation(s_id, k.current_time_ns)
+
+        f_policy = mach.failure_policy or {}
+        repaired_health = f_policy.get("repaired_health", 1.0)
+        req_workers = f_policy.get("required_workers", [])
+        if f_policy.get("mttr_ns", 0) > 0:
+            import math
+            u_rep = self.random_stream.draw_float("machine_repair", mach.id, "duration")
+            u_rep = max(1e-10, min(1.0 - 1e-10, u_rep))
+            dur_ns = max(1, int(-math.log(1.0 - u_rep) * f_policy["mttr_ns"]))
+        else:
+            dur_ns = f_policy.get("repair_duration_ns", 0)
+
+        can_acq, worker_allocs = self._can_acquire_worker_requirements(req_workers, k.current_time_ns)
+        if can_acq:
+            for alloc in worker_allocs:
+                for _ in range(alloc["count"]):
+                    self.workers[alloc["worker_id"]].allocate("maintenance", mach_id, "failure_repair", k.current_time_ns)
+            token = self.kernel.sequence_counter + 1
+            self.active_maintenances[mach_id] = {
+                "machine_id": mach_id,
+                "type": "failure_repair",
+                "token": token,
+                "workers": worker_allocs,
+                "repaired_health": repaired_health,
+            }
+            k.schedule(
+                time_ns=k.current_time_ns + dur_ns,
+                priority=EventPriority.COMPLETION,
+                event_type="COMPLETE_REPAIR",
+                payload={"machine_id": mach_id, "token": token},
+            )
+        else:
+            self.maintenance_waiters.append({
+                "machine_id": mach_id,
+                "type": "failure_repair",
+                "duration_ns": dur_ns,
+                "repaired_health": repaired_health,
+                "required_workers": req_workers,
+                "waiting_since_ns": k.current_time_ns,
+            })
+
+    def _handle_complete_repair(self, k: EventKernel, event: ScheduledEvent) -> None:
+        mach_id = event.payload["machine_id"]
+        token = event.payload.get("token")
+        active_m = self.active_maintenances.get(mach_id)
+        if not active_m or (token is not None and active_m.get("token") != token):
+            return
+        self.active_maintenances.pop(mach_id)
+
+        for alloc in active_m["workers"]:
+            w_id = alloc["worker_id"]
+            for _ in range(alloc["count"]):
+                self.workers[w_id].release("maintenance", mach_id, active_m.get("type", "repair"), k.current_time_ns, completed=True)
+
+        mach = self.machines[mach_id]
+        repaired_health = active_m.get("repaired_health")
+        mach.end_failure(k.current_time_ns, restored_health=repaired_health)
+
+        self._schedule_next_failure(k, mach)
+
+        self._try_allocate_pending_maintenance(k.current_time_ns)
+        self._try_allocate_pending_resources(k.current_time_ns)
+        for st_id, st in self.stations.items():
+            if not st.is_busy and not st.is_blocked:
+                self._try_pull_upstream(k, st_id)
+
+    def _trigger_maintenance(self, k: EventKernel, mach: Machine) -> None:
+        if mach.is_in_maintenance or mach.is_failed:
+            return
+        if len(mach.active_allocations) > 0:
+            return
+
+        mach.start_maintenance(k.current_time_ns)
+        m_policy = mach.maintenance_policy or {}
+        dur_ns = m_policy.get("duration_ns", 0)
+        restored_health = m_policy.get("restored_health", 1.0)
+        req_workers = m_policy.get("required_workers", [])
+
+        can_acq, worker_allocs = self._can_acquire_worker_requirements(req_workers, k.current_time_ns)
+        if can_acq:
+            for alloc in worker_allocs:
+                for _ in range(alloc["count"]):
+                    self.workers[alloc["worker_id"]].allocate("maintenance", mach.id, "maintenance", k.current_time_ns)
+            token = self.kernel.sequence_counter + 1
+            self.active_maintenances[mach.id] = {
+                "machine_id": mach.id,
+                "type": "maintenance",
+                "token": token,
+                "workers": worker_allocs,
+                "restored_health": restored_health,
+            }
+            k.schedule(
+                time_ns=k.current_time_ns + dur_ns,
+                priority=EventPriority.COMPLETION,
+                event_type="COMPLETE_MAINTENANCE",
+                payload={"machine_id": mach.id, "token": token},
+            )
+        else:
+            self.maintenance_waiters.append({
+                "machine_id": mach.id,
+                "type": "maintenance",
+                "duration_ns": dur_ns,
+                "restored_health": restored_health,
+                "required_workers": req_workers,
+                "waiting_since_ns": k.current_time_ns,
+            })
+
+    def _handle_maintenance_trigger(self, k: EventKernel, event: ScheduledEvent) -> None:
+        mach_id = event.payload["machine_id"]
+        mach = self.machines[mach_id]
+        self._trigger_maintenance(k, mach)
+        m_policy = mach.maintenance_policy or {}
+        interval_ns = m_policy.get("interval_ns", 0)
+        if interval_ns > 0:
+            k.schedule(
+                time_ns=k.current_time_ns + interval_ns,
+                priority=EventPriority.RESOURCE,
+                event_type="MAINTENANCE_TRIGGER",
+                payload={"machine_id": mach.id},
+            )
+
+    def _handle_complete_maintenance(self, k: EventKernel, event: ScheduledEvent) -> None:
+        mach_id = event.payload["machine_id"]
+        token = event.payload.get("token")
+        active_m = self.active_maintenances.get(mach_id)
+        if not active_m or (token is not None and active_m.get("token") != token):
+            return
+        self.active_maintenances.pop(mach_id)
+
+        for alloc in active_m["workers"]:
+            w_id = alloc["worker_id"]
+            for _ in range(alloc["count"]):
+                self.workers[w_id].release("maintenance", mach_id, "maintenance", k.current_time_ns, completed=True)
+
+        mach = self.machines[mach_id]
+        restored_health = active_m.get("restored_health")
+        mach.end_maintenance(k.current_time_ns, restored_health=restored_health)
+
+        self._try_allocate_pending_maintenance(k.current_time_ns)
+        self._try_allocate_pending_resources(k.current_time_ns)
+        for st_id, st in self.stations.items():
+            if not st.is_busy and not st.is_blocked:
+                self._try_pull_upstream(k, st_id)
+
+    def _try_allocate_pending_maintenance(self, time_ns: int) -> None:
+        if not self.maintenance_waiters:
+            return
+        self.maintenance_waiters.sort(key=lambda w: w["waiting_since_ns"])
+        allocated_indices: list[int] = []
+        for idx, waiter in enumerate(self.maintenance_waiters):
+            mach_id = waiter["machine_id"]
+            req_workers = waiter["required_workers"]
+            can_acq, worker_allocs = self._can_acquire_worker_requirements(req_workers, time_ns)
+            if can_acq:
+                allocated_indices.append(idx)
+                for alloc in worker_allocs:
+                    for _ in range(alloc["count"]):
+                        self.workers[alloc["worker_id"]].allocate("maintenance", mach_id, waiter["type"], time_ns)
+                token = self.kernel.sequence_counter + 1
+                self.active_maintenances[mach_id] = {
+                    "machine_id": mach_id,
+                    "type": waiter["type"],
+                    "token": token,
+                    "workers": worker_allocs,
+                    "repaired_health": waiter.get("repaired_health"),
+                    "restored_health": waiter.get("restored_health"),
+                }
+                ev_type = "COMPLETE_REPAIR" if waiter["type"] in ("disruption", "failure_repair") else "COMPLETE_MAINTENANCE"
+                self.kernel.schedule(
+                    time_ns=time_ns + waiter["duration_ns"],
+                    priority=EventPriority.COMPLETION,
+                    event_type=ev_type,
+                    payload={"machine_id": mach_id, "token": token},
+                )
+        for idx in reversed(allocated_indices):
+            self.maintenance_waiters.pop(idx)
+
+    def _schedule_next_failure(self, k: EventKernel, mach: Machine) -> None:
+        fp = mach.failure_policy or {}
+        dp = mach.degradation_policy or {}
+        mttf_ns = fp.get("mttf_ns", 0)
+        hazard_rate = float(fp.get("hazard_rate_per_s", 0.0)) or float(dp.get("failure_hazard_rate_per_s", 0.0))
+        if mttf_ns <= 0 and hazard_rate <= 0.0:
+            return
+
+        import math
+        roll = self.random_stream.draw_float("machine_failure", mach.id, "ttf")
+        u = max(1e-10, min(1.0 - 1e-10, roll))
+        mode_info = mach.modes.get(mach.operating_mode, {})
+        mode_mult = float(mode_info.get("hazard_multiplier", 1.0)) if isinstance(mode_info, dict) else float(getattr(mode_info, "hazard_multiplier", 1.0))
+        hazard_factor = float(fp.get("health_hazard_factor", 0.0)) or float(dp.get("hazard_health_factor", 0.0))
+        if mttf_ns > 0:
+            effective_mttf = mttf_ns / (mode_mult * (1.0 + hazard_factor * (1.0 - mach.health)))
+            t_ns = max(1, int(-math.log(1.0 - u) * effective_mttf))
+        else:
+            effective_hazard = hazard_rate * mode_mult * (1.0 + hazard_factor * (1.0 - mach.health))
+            if effective_hazard <= 0.0:
+                return
+            t_sec = -math.log(1.0 - u) / effective_hazard
+            t_ns = max(1, int(t_sec * 1_000_000_000))
+
+        k.schedule(
+            time_ns=k.current_time_ns + t_ns,
+            priority=EventPriority.FAILURE,
+            event_type="MACHINE_FAILURE",
+            payload={"machine_id": mach.id},
+        )
 
     def _handle_station_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
         st = self.stations[node_id]
@@ -1087,20 +1430,21 @@ class EpisodeEngine:
         )
 
         can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, node_id, k.current_time_ns)
+        eff_dur = self._compute_effective_operation_duration(op, k.current_time_ns)
         if can_acq:
             token = self._acquire_resources(
                 station_id=node_id,
                 unit_id=unit_id,
                 op=op,
                 op_index=op_index,
-                remaining_duration_ns=op.duration_ns,
+                remaining_duration_ns=eff_dur,
                 mach_ids=mach_ids,
                 worker_allocs=worker_allocs,
                 time_ns=k.current_time_ns,
             )
             st.start_operation(unit_id, op.id, k.current_time_ns)
             k.schedule(
-                time_ns=k.current_time_ns + op.duration_ns,
+                time_ns=k.current_time_ns + eff_dur,
                 priority=EventPriority.COMPLETION,
                 event_type="COMPLETE_OPERATION",
                 payload={"unit_id": unit_id, "station_id": node_id, "op_index": op_index, "token": token},
@@ -1112,7 +1456,7 @@ class EpisodeEngine:
                 "unit_id": unit_id,
                 "op_index": op_index,
                 "waiting_since_ns": k.current_time_ns,
-                "remaining_duration_ns": op.duration_ns,
+                "remaining_duration_ns": eff_dur,
             })
 
     def _handle_arrival_at_node(self, k: EventKernel, event: ScheduledEvent) -> None:
@@ -1180,12 +1524,22 @@ class EpisodeEngine:
         was_in_rework = unit.is_in_rework
 
         # 1. Defect generation (addressed by unit and operation for counterfactual consistency)
-        if current_op.defect_probability > 0.0:
+        eff_defect_prob = self._compute_effective_defect_probability(current_op, k.current_time_ns)
+        if eff_defect_prob > 0.0:
             defect_roll = self.random_stream.draw_float("quality", f"{unit.id}:{current_op.id}", "defect")
-            if defect_roll < current_op.defect_probability:
+            if defect_roll < eff_defect_prob:
                 defect_name = current_op.defect_name or f"defect_{current_op.id}"
                 target_state = current_op.target_quality_state or defect_name
                 unit.alter_quality(target_state=target_state, defect=defect_name)
+
+        # Check condition threshold maintenance for machines involved
+        for m_id in current_op.required_machines:
+            mach = self.machines.get(m_id)
+            if mach and mach.maintenance_policy:
+                trigger = mach.maintenance_policy.get("trigger", "condition_threshold")
+                thresh = float(mach.maintenance_policy.get("health_threshold", 0.0))
+                if trigger == "condition_threshold" and mach.health <= thresh:
+                    self._trigger_maintenance(k, mach)
 
         # 2. Quality restoration (rework completion)
         if current_op.restores_quality:
@@ -1277,20 +1631,21 @@ class EpisodeEngine:
                 operation_id=next_op.id,
             )
             can_acq, mach_ids, worker_allocs = self._can_acquire_resources(next_op, station_id, k.current_time_ns)
+            eff_dur = self._compute_effective_operation_duration(next_op, k.current_time_ns)
             if can_acq:
                 token = self._acquire_resources(
                     station_id=station_id,
                     unit_id=unit_id,
                     op=next_op,
                     op_index=op_index + 1,
-                    remaining_duration_ns=next_op.duration_ns,
+                    remaining_duration_ns=eff_dur,
                     mach_ids=mach_ids,
                     worker_allocs=worker_allocs,
                     time_ns=k.current_time_ns,
                 )
                 st.start_operation(unit_id, next_op.id, k.current_time_ns)
                 k.schedule(
-                    time_ns=k.current_time_ns + next_op.duration_ns,
+                    time_ns=k.current_time_ns + eff_dur,
                     priority=EventPriority.COMPLETION,
                     event_type="COMPLETE_OPERATION",
                     payload={"unit_id": unit_id, "station_id": station_id, "op_index": op_index + 1, "token": token},
@@ -1302,7 +1657,7 @@ class EpisodeEngine:
                     "unit_id": unit_id,
                     "op_index": op_index + 1,
                     "waiting_since_ns": k.current_time_ns,
-                    "remaining_duration_ns": next_op.duration_ns,
+                    "remaining_duration_ns": eff_dur,
                 })
             self._try_allocate_pending_resources(k.current_time_ns)
             return
@@ -1394,6 +1749,13 @@ class EpisodeEngine:
 
         machines: dict[str, Machine] = {}
         for m_cfg in cfg.machines:
+            modes = {k: v.model_dump() for k, v in m_cfg.modes.items()}
+            deg_policy = m_cfg.degradation.model_dump() if m_cfg.degradation else None
+            maint_policy = m_cfg.maintenance.model_dump() if m_cfg.maintenance else None
+            insp_policy = m_cfg.inspection.model_dump() if m_cfg.inspection else None
+            fail_policy = m_cfg.failure.model_dump() if m_cfg.failure else None
+            disruptions = [d.model_dump() for d in m_cfg.planned_disruptions]
+
             machines[m_cfg.id] = Machine(
                 id=m_cfg.id,
                 capacity=m_cfg.capacity,
@@ -1411,6 +1773,15 @@ class EpisodeEngine:
                     Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
                     for b in m_cfg.breaks
                 ],
+                health=m_cfg.initial_health,
+                operating_mode=m_cfg.operating_mode,
+                modes=modes,
+                degradation_policy=deg_policy,
+                maintenance_policy=maint_policy,
+                inspection_policy=insp_policy,
+                failure_policy=fail_policy,
+                planned_disruptions=disruptions,
+                physical_state=dict(m_cfg.physical_state),
             )
             for s in m_cfg.shifts:
                 if s.start_time_ns >= cfg.episode.start_time_ns:
@@ -1456,6 +1827,26 @@ class EpisodeEngine:
                         priority=EventPriority.RESOURCE,
                         event_type="BREAK_END",
                         payload={"machine_id": m_cfg.id},
+                    )
+            # Schedule planned disruptions
+            for d in m_cfg.planned_disruptions:
+                if d.start_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=d.start_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="DISRUPTION_START",
+                        payload={"machine_id": m_cfg.id, "disruption": d.model_dump()},
+                    )
+            # Schedule scheduled maintenance
+            if m_cfg.maintenance and m_cfg.maintenance.trigger == "scheduled":
+                interval_ns = m_cfg.maintenance.interval_ns
+                if interval_ns and interval_ns > 0:
+                    first_maint_t = cfg.episode.start_time_ns + interval_ns
+                    kernel.schedule(
+                        time_ns=first_maint_t,
+                        priority=EventPriority.RESOURCE,
+                        event_type="MAINTENANCE_TRIGGER",
+                        payload={"machine_id": m_cfg.id, "trigger_type": "scheduled"},
                     )
 
         workers: dict[str, Worker] = {}
@@ -1537,12 +1928,18 @@ class EpisodeEngine:
             workers=workers,
         )
 
-        return cls(
+        engine = cls(
             config=cfg,
             kernel=kernel,
             topology=topology,
             domain=domain,
         )
+
+        for m in machines.values():
+            if m.failure_policy:
+                engine._schedule_next_failure(kernel, m)
+
+        return engine
 
     @classmethod
     def restore(
@@ -1643,6 +2040,13 @@ class EpisodeEngine:
         # Restore machines
         machines: dict[str, Machine] = {}
         for m_cfg in cfg.machines:
+            modes = {k: v.model_dump() for k, v in m_cfg.modes.items()}
+            deg_policy = m_cfg.degradation.model_dump() if m_cfg.degradation else None
+            maint_policy = m_cfg.maintenance.model_dump() if m_cfg.maintenance else None
+            insp_policy = m_cfg.inspection.model_dump() if m_cfg.inspection else None
+            fail_policy = m_cfg.failure.model_dump() if m_cfg.failure else None
+            disruptions = [d.model_dump() for d in m_cfg.planned_disruptions]
+
             mach = Machine(
                 id=m_cfg.id,
                 capacity=m_cfg.capacity,
@@ -1660,6 +2064,15 @@ class EpisodeEngine:
                     Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
                     for b in m_cfg.breaks
                 ],
+                health=m_cfg.initial_health,
+                operating_mode=m_cfg.operating_mode,
+                modes=modes,
+                degradation_policy=deg_policy,
+                maintenance_policy=maint_policy,
+                inspection_policy=insp_policy,
+                failure_policy=fail_policy,
+                planned_disruptions=disruptions,
+                physical_state=dict(m_cfg.physical_state),
             )
             if m_cfg.id in domain_state.get("machines", {}):
                 mach.restore_state(domain_state["machines"][m_cfg.id])
@@ -1702,6 +2115,8 @@ class EpisodeEngine:
 
         resource_waiters = list(domain_state.get("resource_waiters", []))
         active_operations = {k: dict(v) for k, v in domain_state.get("active_operations", {}).items()}
+        maintenance_waiters = list(domain_state.get("maintenance_waiters", []))
+        active_maintenances = {k: dict(v) for k, v in domain_state.get("active_maintenances", {}).items()}
 
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
@@ -1714,6 +2129,8 @@ class EpisodeEngine:
             workers=workers,
             resource_waiters=resource_waiters,
             active_operations=active_operations,
+            maintenance_waiters=maintenance_waiters,
+            active_maintenances=active_maintenances,
         )
 
         return cls(
@@ -1752,6 +2169,8 @@ class EpisodeEngine:
             source_pending_units={k: list(v) for k, v in self.source_pending_units.items()},
             resource_waiters=list(self.resource_waiters),
             active_operations={k: dict(v) for k, v in self.active_operations.items()},
+            maintenance_waiters=list(self.maintenance_waiters),
+            active_maintenances={k: dict(v) for k, v in self.active_maintenances.items()},
         )
 
         return Checkpoint(
@@ -1854,6 +2273,12 @@ class EpisodeEngine:
                 total_idle_time_ns=m.total_idle_time_ns,
                 total_break_time_ns=m.total_break_time_ns,
                 total_off_shift_time_ns=m.total_off_shift_time_ns,
+                total_maintenance_time_ns=m.total_maintenance_time_ns,
+                total_failed_time_ns=m.total_failed_time_ns,
+                maintenance_count=m.maintenance_count,
+                failure_count=m.failure_count,
+                health=m.health,
+                operating_mode=m.operating_mode,
                 utilization=m.utilization,
             )
             for m in self.machines.values()

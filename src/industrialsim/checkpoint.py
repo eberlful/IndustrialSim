@@ -243,6 +243,17 @@ class MachineSnapshot:
     total_off_shift_time_ns: int = 0
     operations_completed: int = 0
     last_state_change_ns: int = 0
+    health: float = 1.0
+    operating_mode: str = "nominal"
+    physical_state: dict[str, float] = field(default_factory=dict)
+    is_failed: bool = False
+    is_in_maintenance: bool = False
+    total_maintenance_time_ns: int = 0
+    total_failed_time_ns: int = 0
+    maintenance_count: int = 0
+    failure_count: int = 0
+    failure_start_ns: int | None = None
+    maintenance_start_ns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -255,6 +266,17 @@ class MachineSnapshot:
             "total_off_shift_time_ns": self.total_off_shift_time_ns,
             "operations_completed": self.operations_completed,
             "last_state_change_ns": self.last_state_change_ns,
+            "health": self.health,
+            "operating_mode": self.operating_mode,
+            "physical_state": dict(self.physical_state),
+            "is_failed": self.is_failed,
+            "is_in_maintenance": self.is_in_maintenance,
+            "total_maintenance_time_ns": self.total_maintenance_time_ns,
+            "total_failed_time_ns": self.total_failed_time_ns,
+            "maintenance_count": self.maintenance_count,
+            "failure_count": self.failure_count,
+            "failure_start_ns": self.failure_start_ns,
+            "maintenance_start_ns": self.maintenance_start_ns,
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -275,6 +297,17 @@ class MachineSnapshot:
             total_off_shift_time_ns=int(data.get("total_off_shift_time_ns", 0)),
             operations_completed=int(data.get("operations_completed", 0)),
             last_state_change_ns=int(data.get("last_state_change_ns", 0)),
+            health=float(data.get("health", 1.0)),
+            operating_mode=str(data.get("operating_mode", "nominal")),
+            physical_state=dict(data.get("physical_state", {})),
+            is_failed=bool(data.get("is_failed", False)),
+            is_in_maintenance=bool(data.get("is_in_maintenance", False)),
+            total_maintenance_time_ns=int(data.get("total_maintenance_time_ns", 0)),
+            total_failed_time_ns=int(data.get("total_failed_time_ns", 0)),
+            maintenance_count=int(data.get("maintenance_count", 0)),
+            failure_count=int(data.get("failure_count", 0)),
+            failure_start_ns=data.get("failure_start_ns"),
+            maintenance_start_ns=data.get("maintenance_start_ns"),
         )
 
 
@@ -373,6 +406,8 @@ class DomainStateSnapshot:
     source_pending_units: dict[str, list[str]] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
     active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    maintenance_waiters: list[dict[str, Any]] = field(default_factory=list)
+    active_maintenances: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -385,6 +420,8 @@ class DomainStateSnapshot:
             "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
             "resource_waiters": list(self.resource_waiters),
             "active_operations": dict(self.active_operations),
+            "maintenance_waiters": list(self.maintenance_waiters),
+            "active_maintenances": dict(self.active_maintenances),
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -406,6 +443,10 @@ class DomainStateSnapshot:
             return self.resource_waiters
         if key == "active_operations":
             return self.active_operations
+        if key == "maintenance_waiters":
+            return self.maintenance_waiters
+        if key == "active_maintenances":
+            return self.active_maintenances
         raise KeyError(key)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -443,6 +484,8 @@ class DomainStateSnapshot:
             },
             resource_waiters=list(data.get("resource_waiters", [])),
             active_operations=dict(data.get("active_operations", {})),
+            maintenance_waiters=list(data.get("maintenance_waiters", [])),
+            active_maintenances=dict(data.get("active_maintenances", {})),
         )
 
 
