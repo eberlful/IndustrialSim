@@ -164,6 +164,7 @@ class Machine:
     total_off_shift_time_ns: int = 0
     operations_completed: int = 0
     last_state_change_ns: int = 0
+    pending_off_shift: bool = False
 
     def is_on_shift(self, time_ns: int) -> bool:
         if not self.shifts:
@@ -174,6 +175,8 @@ class Machine:
         return any(b.start_time_ns <= time_ns < b.end_time_ns for b in self.breaks)
 
     def is_available(self, time_ns: int) -> bool:
+        if self.pending_off_shift:
+            return False
         return self.is_on_shift(time_ns) and not self.is_on_break(time_ns)
 
     def available_capacity(self, time_ns: int) -> int:
@@ -188,12 +191,13 @@ class Machine:
         self.update_metrics(time_ns)
         self.active_allocations.append({"station_id": station_id, "unit_id": unit_id, "op_id": op_id})
 
-    def release(self, station_id: str, unit_id: str, op_id: str, time_ns: int) -> None:
+    def release(self, station_id: str, unit_id: str, op_id: str, time_ns: int, completed: bool = False) -> None:
         self.update_metrics(time_ns)
         for i, alloc in enumerate(self.active_allocations):
             if alloc["station_id"] == station_id and alloc["unit_id"] == unit_id and alloc["op_id"] == op_id:
                 self.active_allocations.pop(i)
-                self.operations_completed += 1
+                if completed:
+                    self.operations_completed += 1
                 break
 
     def update_metrics(self, current_time_ns: int) -> None:
@@ -285,12 +289,13 @@ class Worker:
         self.update_metrics(time_ns)
         self.active_allocations.append({"station_id": station_id, "unit_id": unit_id, "op_id": op_id})
 
-    def release(self, station_id: str, unit_id: str, op_id: str, time_ns: int) -> None:
+    def release(self, station_id: str, unit_id: str, op_id: str, time_ns: int, completed: bool = False) -> None:
         self.update_metrics(time_ns)
         for i, alloc in enumerate(self.active_allocations):
             if alloc["station_id"] == station_id and alloc["unit_id"] == unit_id and alloc["op_id"] == op_id:
                 self.active_allocations.pop(i)
-                self.operations_completed += 1
+                if completed:
+                    self.operations_completed += 1
                 break
 
     def update_metrics(self, current_time_ns: int) -> None:
@@ -410,6 +415,29 @@ class Station:
             self.total_busy_time_ns += completion_time_ns - self.busy_start_ns
             self.busy_start_ns = None
         self.operations_completed += 1
+
+    def interrupt_operation(self, time_ns: int) -> None:
+        if self.busy_start_ns is not None:
+            self.total_busy_time_ns += time_ns - self.busy_start_ns
+            self.busy_start_ns = None
+        self.is_busy = False
+        self.interrupted_count += 1
+        self.start_waiting(time_ns)
+
+    def record_resume(self) -> None:
+        self.resumed_count += 1
+
+    def record_restart(self) -> None:
+        self.restarted_count += 1
+
+    def scrap_operation(self, time_ns: int) -> None:
+        if self.busy_start_ns is not None:
+            self.total_busy_time_ns += time_ns - self.busy_start_ns
+            self.busy_start_ns = None
+        self.is_busy = False
+        self.current_unit_id = None
+        self.interrupted_count += 1
+        self.scrapped_count += 1
 
     def start_blocking(self, unit_id: str, blocked_time_ns: int) -> None:
         self.is_blocked = True

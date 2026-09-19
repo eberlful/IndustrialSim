@@ -640,7 +640,7 @@ class EpisodeEngine:
                 if w.available_capacity(time_ns) - curr_allocated < needed_count:
                     return False, [], []
                 temp_worker_allocations[w.id] = curr_allocated + needed_count
-                allocated_workers.append({"worker_id": w.id, "count": needed_count})
+                allocated_workers.append({"worker_id": w.id, "count": needed_count, "qualification": target_qual})
             elif target_qual is not None:
                 candidates = [
                     w for w in self.workers.values()
@@ -655,7 +655,7 @@ class EpisodeEngine:
                     if avail > 0:
                         take = min(avail, needed_count - satisfied)
                         temp_worker_allocations[c.id] = curr_allocated + take
-                        allocated_workers.append({"worker_id": c.id, "count": take})
+                        allocated_workers.append({"worker_id": c.id, "count": take, "qualification": target_qual})
                         satisfied += take
                         if satisfied == needed_count:
                             break
@@ -695,7 +695,7 @@ class EpisodeEngine:
         }
         return token
 
-    def _release_resources(self, station_id: str, time_ns: int) -> dict[str, Any] | None:
+    def _release_resources(self, station_id: str, time_ns: int, completed: bool = False) -> dict[str, Any] | None:
         active_op = self.active_operations.pop(station_id, None)
         if not active_op:
             return None
@@ -703,12 +703,12 @@ class EpisodeEngine:
         op_id = active_op["op_id"]
         for m_id in active_op["machines"]:
             if m_id in self.machines:
-                self.machines[m_id].release(station_id, unit_id, op_id, time_ns)
+                self.machines[m_id].release(station_id, unit_id, op_id, time_ns, completed=completed)
         for alloc in active_op["workers"]:
             w_id = alloc["worker_id"]
             if w_id in self.workers:
                 for _ in range(alloc["count"]):
-                    self.workers[w_id].release(station_id, unit_id, op_id, time_ns)
+                    self.workers[w_id].release(station_id, unit_id, op_id, time_ns, completed=completed)
         return active_op
 
     def _try_allocate_pending_resources(self, time_ns: int) -> None:
@@ -737,6 +737,10 @@ class EpisodeEngine:
             if can_acq:
                 allocated_indices.append(idx)
                 rem_dur = waiter.get("remaining_duration_ns", op.duration_ns)
+                if waiter.get("is_resuming"):
+                    st.record_resume()
+                elif waiter.get("is_restarting"):
+                    st.record_restart()
                 token = self._acquire_resources(
                     station_id=station_id,
                     unit_id=unit_id,
@@ -772,57 +776,50 @@ class EpisodeEngine:
         # Cancel current token
         active_op["token"] = -1
 
-        if st.busy_start_ns is not None:
-            st.total_busy_time_ns += time_ns - st.busy_start_ns
-            st.busy_start_ns = None
-
         if policy == "resume":
             elapsed = time_ns - active_op["start_time_ns"]
             active_op["remaining_duration_ns"] = max(0, active_op["remaining_duration_ns"] - elapsed)
             rem_dur = active_op["remaining_duration_ns"]
-            st.interrupted_count += 1
-            st.resumed_count += 1
-            st.is_busy = False
-            st.start_waiting(time_ns)
-            self._release_resources(station_id, time_ns)
+            st.interrupt_operation(time_ns)
+            self._release_resources(station_id, time_ns, completed=False)
             self.resource_waiters.append({
                 "station_id": station_id,
                 "unit_id": unit_id,
                 "op_index": active_op["op_index"],
                 "waiting_since_ns": time_ns,
                 "remaining_duration_ns": rem_dur,
+                "is_resuming": True,
             })
         elif policy == "restart":
-            st.interrupted_count += 1
-            st.restarted_count += 1
-            st.is_busy = False
-            st.start_waiting(time_ns)
-            self._release_resources(station_id, time_ns)
+            st.interrupt_operation(time_ns)
+            self._release_resources(station_id, time_ns, completed=False)
             self.resource_waiters.append({
                 "station_id": station_id,
                 "unit_id": unit_id,
                 "op_index": active_op["op_index"],
                 "waiting_since_ns": time_ns,
                 "remaining_duration_ns": op.duration_ns,
+                "is_restarting": True,
             })
         elif policy == "scrap":
-            st.interrupted_count += 1
-            st.scrapped_count += 1
-            st.is_busy = False
-            st.current_unit_id = None
+            st.scrap_operation(time_ns)
             u = self.units[unit_id]
             u.quality_state = "scrapped"
             u.record_transition(time_ns, ProductionUnitState.TERMINAL, location="terminal")
-            self._release_resources(station_id, time_ns)
+            self._release_resources(station_id, time_ns, completed=False)
             self._try_pull_upstream(self.kernel, station_id)
 
     def _handle_shift_start(self, k: EventKernel, event: ScheduledEvent) -> None:
         worker_id = event.payload.get("worker_id")
         machine_id = event.payload.get("machine_id")
         if worker_id and worker_id in self.workers:
-            self.workers[worker_id].update_metrics(k.current_time_ns)
+            w = self.workers[worker_id]
+            w.pending_off_shift = False
+            w.update_metrics(k.current_time_ns)
         if machine_id and machine_id in self.machines:
-            self.machines[machine_id].update_metrics(k.current_time_ns)
+            m = self.machines[machine_id]
+            m.pending_off_shift = False
+            m.update_metrics(k.current_time_ns)
         self._try_allocate_pending_resources(k.current_time_ns)
 
     def _handle_shift_end(self, k: EventKernel, event: ScheduledEvent) -> None:
@@ -846,19 +843,39 @@ class EpisodeEngine:
                     active_op = self.active_operations[s_id]
                     op = list(self.stations[s_id].operations.values())[active_op["op_index"]]
 
-                    incoming_worker = None
-                    for other_w in self.workers.values():
-                        if other_w.id != worker_id and other_w.is_available(k.current_time_ns) and other_w.available_capacity(k.current_time_ns) > 0:
-                            if any(q in other_w.qualifications for q in w.qualifications):
-                                incoming_worker = other_w
-                                break
+                    allocs_to_replace = [
+                        alloc for alloc in active_op["workers"]
+                        if alloc["worker_id"] == worker_id
+                    ]
+                    replacements: list[tuple[dict[str, Any], Worker]] = []
+                    temp_reserved: dict[str, int] = {}
+                    all_replaced = True
 
-                    if incoming_worker is not None:
-                        w.release(s_id, active_op["unit_id"], op.id, k.current_time_ns)
-                        incoming_worker.allocate(s_id, active_op["unit_id"], op.id, k.current_time_ns)
-                        for alloc in active_op["workers"]:
-                            if alloc["worker_id"] == worker_id:
-                                alloc["worker_id"] = incoming_worker.id
+                    for alloc in allocs_to_replace:
+                        req_qual = alloc.get("qualification")
+                        needed = alloc["count"]
+                        found_worker = None
+                        for other_w in sorted(self.workers.values(), key=lambda x: x.id):
+                            if other_w.id != worker_id and other_w.is_available(k.current_time_ns):
+                                matches_qual = (req_qual in other_w.qualifications) if req_qual else any(q in other_w.qualifications for q in w.qualifications)
+                                if matches_qual:
+                                    avail = other_w.available_capacity(k.current_time_ns) - temp_reserved.get(other_w.id, 0)
+                                    if avail >= needed:
+                                        found_worker = other_w
+                                        temp_reserved[other_w.id] = temp_reserved.get(other_w.id, 0) + needed
+                                        break
+                        if found_worker is not None:
+                            replacements.append((alloc, found_worker))
+                        else:
+                            all_replaced = False
+                            break
+
+                    if all_replaced:
+                        for alloc, incoming_worker in replacements:
+                            for _ in range(alloc["count"]):
+                                w.release(s_id, active_op["unit_id"], op.id, k.current_time_ns, completed=False)
+                                incoming_worker.allocate(s_id, active_op["unit_id"], op.id, k.current_time_ns)
+                            alloc["worker_id"] = incoming_worker.id
                     else:
                         self._interrupt_operation(s_id, k.current_time_ns)
                 else:  # interrupt
@@ -872,7 +889,10 @@ class EpisodeEngine:
                 if machine_id in a_op["machines"]
             ]
             for s_id in active_stations:
-                self._interrupt_operation(s_id, k.current_time_ns)
+                if handover_rule == "run_off":
+                    mach.pending_off_shift = True
+                else:
+                    self._interrupt_operation(s_id, k.current_time_ns)
 
         self._try_allocate_pending_resources(k.current_time_ns)
 
@@ -976,7 +996,7 @@ class EpisodeEngine:
         ops_list = list(st.operations.values())
         current_op = ops_list[op_index]
 
-        self._release_resources(station_id, k.current_time_ns)
+        self._release_resources(station_id, k.current_time_ns, completed=True)
         st.complete_operation(current_op.id, k.current_time_ns)
 
         # If station has multiple operations and more remain for this unit:

@@ -332,3 +332,86 @@ def test_machine_break_interrupts_and_resumes() -> None:
     mach = summary.machines[0]
     assert mach.total_busy_time_ns == 10_000_000_000
     assert mach.total_break_time_ns == 3_000_000_000
+
+
+MACHINE_RUN_OFF_YAML = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+machines:
+  - id: "mach-1"
+    capacity: 1
+    shifts:
+      - id: "shift-1"
+        start_time: "0s"
+        end_time: "5s"
+        handover_rule: "run_off"
+
+material_flow:
+  nodes:
+    - id: "src-1"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "st-1"
+      kind: "station"
+      operations:
+        - id: "op-1"
+          duration: "8s"
+          interruption_policy: "resume"
+          required_machines: ["mach-1"]
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "snk-1"
+      kind: "sink"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+  routes:
+    - id: "r-src-st1"
+      source_node_id: "src-1"
+      source_port_id: "p-out"
+      target_node_id: "st-1"
+      target_port_id: "p-in"
+    - id: "r-st1-snk"
+      source_node_id: "st-1"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+
+production_units:
+  - id: "unit-1"
+    variant: "sedan"
+    source_id: "src-1"
+    release_time: "0s"
+"""
+
+
+def test_machine_run_off_allows_completion_without_interruption() -> None:
+    # Op duration = 8s. Machine shift ends at 5s with handover_rule="run_off".
+    # The active operation is allowed to complete without interruption.
+    summary = run_episode(MACHINE_RUN_OFF_YAML)
+    assert summary.status == "completed"
+    assert summary.simulated_time_ns == 8_000_000_000
+
+    st = summary.stations[0]
+    assert st.operations_completed == 1
+    assert st.interrupted_count == 0
+    assert st.total_busy_time_ns == 8_000_000_000
+
+    mach = summary.machines[0]
+    assert mach.operations_completed == 1
+    assert mach.total_busy_time_ns == 8_000_000_000
