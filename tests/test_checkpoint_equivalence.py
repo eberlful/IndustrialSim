@@ -193,13 +193,18 @@ def test_checkpoint_compatibility_diagnostics(tmp_path: Path) -> None:
     with pytest.raises(IncompatibleCheckpointError, match=r"Incompatible kernel version: expected '1\.0', got '2\.0'"):
         resume_episode(cp_bad_kernel_file)
 
-    # Incompatible config hash when providing an explicitly different config
-    different_yaml = MINIMAL_YAML.replace("duration: \"10s\"", "duration: \"20s\"")
+    # Incompatible model hash when providing a config with different station operations
+    different_model_yaml = MINIMAL_YAML.replace('duration: "10s"', 'duration: "20s"')
     cp_file = tmp_path / "valid_cp.json"
     save_checkpoint(cp, cp_file)
 
-    with pytest.raises(IncompatibleCheckpointError, match=r"(?i)configuration hash mismatch|incompatible configuration"):
-        resume_episode(cp_file, config_source=different_yaml)
+    with pytest.raises(IncompatibleCheckpointError, match=r"(?i)model hash mismatch"):
+        resume_episode(cp_file, config_source=different_model_yaml)
+
+    # Incompatible config hash when providing a config with same model but different seed
+    different_config_yaml = MINIMAL_YAML.replace("seed: 42", "seed: 99")
+    with pytest.raises(IncompatibleCheckpointError, match=r"(?i)configuration hash mismatch"):
+        resume_episode(cp_file, config_source=different_config_yaml)
 
     # Incompatible plugin metadata
     cp_bad_plugin = create_checkpoint(MINIMAL_YAML, at_time_ns=5_000_000_000)
@@ -209,3 +214,21 @@ def test_checkpoint_compatibility_diagnostics(tmp_path: Path) -> None:
 
     with pytest.raises(IncompatibleCheckpointError, match=r"(?i)plugin"):
         resume_episode(cp_bad_plugin_file)
+
+
+def test_continue_checkpoint_intermediate_and_completion(tmp_path: Path) -> None:
+    from industrialsim.application import continue_checkpoint
+
+    # Checkpoint at 3s
+    cp1 = create_checkpoint(MINIMAL_YAML, at_time_ns=3_000_000_000)
+    assert cp1.simulated_time_ns == 3_000_000_000
+
+    # Continue until intermediate time 7s
+    intermediate_summary = continue_checkpoint(cp1, until_time_ns=7_000_000_000)
+    assert intermediate_summary.simulated_time_ns == 7_000_000_000
+    assert intermediate_summary.status == "incomplete"
+
+    # Continue from cp1 all the way to completion
+    final_summary = continue_checkpoint(cp1)
+    assert final_summary.status == "completed"
+    assert final_summary.simulated_time_ns == 10_000_000_000

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from pydantic import ValidationError
 from ruamel.yaml import YAML
 
@@ -247,6 +247,15 @@ from industrialsim.checkpoint import (
     save_checkpoint,
     serialize_checkpoint,
 )
+
+
+def _index_routes(routes: Sequence[RouteConfig]) -> tuple[dict[str, list[RouteConfig]], dict[str, list[RouteConfig]]]:
+    routes_from: dict[str, list[RouteConfig]] = {}
+    routes_to: dict[str, list[RouteConfig]] = {}
+    for r in routes:
+        routes_from.setdefault(r.source_node_id, []).append(r)
+        routes_to.setdefault(r.target_node_id, []).append(r)
+    return routes_from, routes_to
 
 
 class EpisodeEngine:
@@ -555,11 +564,7 @@ class EpisodeEngine:
             elif n.kind == "sink":
                 sinks[n.id] = n
 
-        routes_from: dict[str, list[RouteConfig]] = {}
-        routes_to: dict[str, list[RouteConfig]] = {}
-        for r in mf.routes:
-            routes_from.setdefault(r.source_node_id, []).append(r)
-            routes_to.setdefault(r.target_node_id, []).append(r)
+        routes_from, routes_to = _index_routes(mf.routes)
 
         in_flight_to: dict[str, int] = {node.id: 0 for node in mf.nodes}
         source_pending_units: dict[str, list[str]] = {nid: [] for nid in sources}
@@ -615,17 +620,17 @@ class EpisodeEngine:
                 f"Incompatible plugin metadata: plugins {list(checkpoint.plugin_metadata.keys())} are not available"
             )
 
-        # Resolve and validate configuration
+        # Resolve and validate configuration: prioritize model hash diagnostic over config hash
         if config is not None:
-            provided_config_hash = compute_config_hash(config)
-            if provided_config_hash != checkpoint.config_hash:
-                raise IncompatibleCheckpointError(
-                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but provided config has '{provided_config_hash}'"
-                )
             provided_model_hash = compute_model_hash(config)
             if provided_model_hash != checkpoint.model_hash:
                 raise IncompatibleCheckpointError(
                     f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but provided model has '{provided_model_hash}'"
+                )
+            provided_config_hash = compute_config_hash(config)
+            if provided_config_hash != checkpoint.config_hash:
+                raise IncompatibleCheckpointError(
+                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but provided config has '{provided_config_hash}'"
                 )
             cfg = config
         else:
@@ -634,6 +639,16 @@ class EpisodeEngine:
                     "Checkpoint contains no embedded configuration, and no configuration was provided"
                 )
             cfg = SimulationConfig.model_validate(checkpoint.configuration)
+            embedded_model_hash = compute_model_hash(cfg)
+            if embedded_model_hash != checkpoint.model_hash:
+                raise IncompatibleCheckpointError(
+                    f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but embedded model has '{embedded_model_hash}'"
+                )
+            embedded_config_hash = compute_config_hash(cfg)
+            if embedded_config_hash != checkpoint.config_hash:
+                raise IncompatibleCheckpointError(
+                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but embedded config has '{embedded_config_hash}'"
+                )
 
         mf: MaterialFlowConfig = (
             cfg.material_flow
@@ -645,41 +660,27 @@ class EpisodeEngine:
         sources = {n.id: n for n in mf.nodes if n.kind == "source"}
         sinks = {n.id: n for n in mf.nodes if n.kind == "sink"}
 
-        routes_from: dict[str, list[RouteConfig]] = {}
-        routes_to: dict[str, list[RouteConfig]] = {}
-        for r in mf.routes:
-            routes_from.setdefault(r.source_node_id, []).append(r)
-            routes_to.setdefault(r.target_node_id, []).append(r)
+        routes_from, routes_to = _index_routes(mf.routes)
 
         # Restore kernel
         kernel = EventKernel(initial_time_ns=checkpoint.simulated_time_ns)
         kernel.restore(
             {
                 "current_time_ns": checkpoint.simulated_time_ns,
-                "sequence_counter": checkpoint.sequence_counter,
+                "sequence_counter": checkpoint.next_sequence - 1,
                 "events_processed": checkpoint.events_processed,
                 "queue": checkpoint.event_queue,
             }
         )
 
-        # Restore production units
+        # Restore production units via domain encapsulation
         domain_state = checkpoint.domain_state
-        units: dict[str, ProductionUnit] = {}
-        for uid, u_data in domain_state["production_units"].items():
-            history = [
-                from_dict_history(h)
-                for h in u_data.get("history", [])
-            ]
-            units[uid] = ProductionUnit(
-                id=u_data["id"],
-                variant=u_data["variant"],
-                quality_state=u_data.get("quality_state", "nominal"),
-                state=ProductionUnitState(u_data["state"]),
-                location=u_data["location"],
-                history=history,
-            )
+        units: dict[str, ProductionUnit] = {
+            uid: ProductionUnit.from_snapshot(u_data)
+            for uid, u_data in domain_state["production_units"].items()
+        }
 
-        # Restore stations
+        # Restore stations via domain encapsulation
         stations: dict[str, Station] = {}
         for st_id, st_data in domain_state["stations"].items():
             node = nodes_by_id[st_id]
@@ -691,24 +692,14 @@ class EpisodeEngine:
                 },
                 output_capacity=node.output_capacity,
             )
-            st.operations_completed = st_data["operations_completed"]
-            st.total_busy_time_ns = st_data["total_busy_time_ns"]
-            st.total_blocked_time_ns = st_data.get("total_blocked_time_ns", 0)
-            st.is_busy = st_data["is_busy"]
-            st.is_blocked = st_data["is_blocked"]
-            st.current_unit_id = st_data["current_unit_id"]
-            st.blocked_unit_id = st_data["blocked_unit_id"]
-            st.output_buffer = list(st_data.get("output_buffer", []))
-            st.busy_start_ns = st_data.get("busy_start_ns")
-            st.blocked_start_ns = st_data.get("blocked_start_ns")
+            st.restore_state(st_data)
             stations[st_id] = st
 
-        # Restore buffers
+        # Restore buffers via domain encapsulation
         buffers: dict[str, Buffer] = {}
         for buf_id, buf_data in domain_state.get("buffers", {}).items():
             buf = Buffer(id=buf_id, capacity=buf_data["capacity"])
-            buf.occupants = list(buf_data.get("occupants", []))
-            buf.peak_occupancy = buf_data.get("peak_occupancy", len(buf.occupants))
+            buf.restore_state(buf_data)
             buffers[buf_id] = buf
 
         in_flight_to = {node.id: 0 for node in mf.nodes}
@@ -740,39 +731,15 @@ class EpisodeEngine:
         snap = self.kernel.snapshot()
         domain_state: dict[str, Any] = {
             "production_units": {
-                u.id: {
-                    "id": u.id,
-                    "variant": u.variant,
-                    "quality_state": u.quality_state,
-                    "state": str(u.state),
-                    "location": u.location,
-                    "history": [h.to_dict() for h in u.history],
-                }
+                u.id: u.to_snapshot()
                 for u in self.units.values()
             },
             "stations": {
-                s.id: {
-                    "id": s.id,
-                    "operations_completed": s.operations_completed,
-                    "total_busy_time_ns": s.total_busy_time_ns,
-                    "total_blocked_time_ns": s.total_blocked_time_ns,
-                    "is_busy": s.is_busy,
-                    "is_blocked": s.is_blocked,
-                    "current_unit_id": s.current_unit_id,
-                    "blocked_unit_id": s.blocked_unit_id,
-                    "output_buffer": list(s.output_buffer),
-                    "busy_start_ns": s.busy_start_ns,
-                    "blocked_start_ns": s.blocked_start_ns,
-                }
+                s.id: s.to_snapshot()
                 for s in self.stations.values()
             },
             "buffers": {
-                b.id: {
-                    "id": b.id,
-                    "capacity": b.capacity,
-                    "occupants": list(b.occupants),
-                    "peak_occupancy": b.peak_occupancy,
-                }
+                b.id: b.to_snapshot()
                 for b in self.buffers.values()
             },
             "in_flight_to": dict(self.in_flight_to),
@@ -785,7 +752,7 @@ class EpisodeEngine:
             model_hash=compute_model_hash(self.cfg),
             config_hash=compute_config_hash(self.cfg),
             simulated_time_ns=self.kernel.current_time_ns,
-            sequence_counter=snap["sequence_counter"],
+            next_sequence=snap["sequence_counter"] + 1,
             events_processed=self.kernel.events_processed,
             event_queue=snap["queue"],
             domain_state=domain_state,
@@ -871,17 +838,6 @@ class EpisodeEngine:
         )
 
 
-def from_dict_history(h: dict[str, Any]) -> Any:
-    from industrialsim.domain import HistoryRecord
-    return HistoryRecord(
-        time_ns=h["time_ns"],
-        state=ProductionUnitState(h["state"]),
-        location=h["location"],
-        station_id=h.get("station_id"),
-        operation_id=h.get("operation_id"),
-    )
-
-
 def create_checkpoint(
     source: str | Path | dict[str, Any] | SimulationConfig | EpisodeEngine,
     at_time_ns: int | None = None,
@@ -932,12 +888,20 @@ def restore_checkpoint(
     return EpisodeEngine.restore(cp, config=cfg)
 
 
+def continue_checkpoint(
+    checkpoint: str | Path | dict[str, Any] | Checkpoint,
+    config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+    until_time_ns: int | None = None,
+) -> EpisodeSummary:
+    engine = restore_checkpoint(checkpoint, config=config_source)
+    return engine.run(pause_at_ns=until_time_ns)
+
+
 def resume_episode(
     checkpoint: str | Path | dict[str, Any] | Checkpoint,
     config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
 ) -> EpisodeSummary:
-    engine = restore_checkpoint(checkpoint, config=config_source)
-    return engine.run()
+    return continue_checkpoint(checkpoint, config_source=config_source)
 
 
 def run_episode(

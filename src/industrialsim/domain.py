@@ -35,6 +35,16 @@ class HistoryRecord:
             result["operation_id"] = self.operation_id
         return result
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> HistoryRecord:
+        return cls(
+            time_ns=data["time_ns"],
+            state=ProductionUnitState(data["state"]),
+            location=data["location"],
+            station_id=data.get("station_id"),
+            operation_id=data.get("operation_id"),
+        )
+
 
 @dataclass
 class ProductionUnit:
@@ -65,7 +75,7 @@ class ProductionUnit:
             )
         )
 
-    def to_summary_dict(self) -> dict[str, Any]:
+    def to_snapshot(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "variant": self.variant,
@@ -74,6 +84,21 @@ class ProductionUnit:
             "location": self.location,
             "history": [h.to_dict() for h in self.history],
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any]) -> ProductionUnit:
+        history = [HistoryRecord.from_dict(h) for h in data.get("history", [])]
+        return cls(
+            id=data["id"],
+            variant=data["variant"],
+            quality_state=data.get("quality_state", "nominal"),
+            state=ProductionUnitState(data["state"]),
+            location=data["location"],
+            history=history,
+        )
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        return self.to_snapshot()
 
 
 @dataclass
@@ -139,6 +164,33 @@ class Station:
             self.is_blocked = False
             self.blocked_unit_id = None
 
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "operations_completed": self.operations_completed,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_blocked_time_ns": self.total_blocked_time_ns,
+            "is_busy": self.is_busy,
+            "is_blocked": self.is_blocked,
+            "current_unit_id": self.current_unit_id,
+            "blocked_unit_id": self.blocked_unit_id,
+            "output_buffer": list(self.output_buffer),
+            "busy_start_ns": self.busy_start_ns,
+            "blocked_start_ns": self.blocked_start_ns,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        self.operations_completed = state["operations_completed"]
+        self.total_busy_time_ns = state["total_busy_time_ns"]
+        self.total_blocked_time_ns = state.get("total_blocked_time_ns", 0)
+        self.is_busy = state["is_busy"]
+        self.is_blocked = state["is_blocked"]
+        self.current_unit_id = state.get("current_unit_id")
+        self.blocked_unit_id = state.get("blocked_unit_id")
+        self.output_buffer = list(state.get("output_buffer", []))
+        self.busy_start_ns = state.get("busy_start_ns")
+        self.blocked_start_ns = state.get("blocked_start_ns")
+
     def to_summary_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -174,6 +226,18 @@ class Buffer:
 
     def has_occupants(self) -> bool:
         return len(self.occupants) > 0
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capacity": self.capacity,
+            "occupants": list(self.occupants),
+            "peak_occupancy": self.peak_occupancy,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        self.occupants = list(state.get("occupants", []))
+        self.peak_occupancy = state.get("peak_occupancy", len(self.occupants))
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {

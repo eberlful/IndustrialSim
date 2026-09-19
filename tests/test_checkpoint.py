@@ -80,6 +80,7 @@ def test_checkpoint_serialize_and_deserialize() -> None:
     assert loaded.model_hash == cp.model_hash
     assert loaded.config_hash == cp.config_hash
     assert loaded.simulated_time_ns == 5_000_000_000
+    assert loaded.next_sequence == 42
     assert loaded.sequence_counter == 42
     assert loaded.events_processed == 10
     assert loaded.root_seed == 42
@@ -111,6 +112,7 @@ def test_checkpoint_inspect() -> None:
     assert inspection.model_hash == "abc123model"
     assert inspection.config_hash == "def456config"
     assert inspection.simulated_time_ns == 5_000_000_000
+    assert inspection.next_sequence == 42
     assert inspection.sequence_counter == 42
     assert inspection.events_processed == 10
     assert inspection.queue_size == 1

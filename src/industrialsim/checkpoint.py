@@ -57,7 +57,7 @@ class Checkpoint:
     model_hash: str
     config_hash: str
     simulated_time_ns: int
-    sequence_counter: int
+    next_sequence: int
     events_processed: int
     event_queue: list[dict[str, Any]]
     domain_state: dict[str, Any]
@@ -67,8 +67,51 @@ class Checkpoint:
     configuration: dict[str, Any] = field(default_factory=dict)
     checksum: str | None = None
 
+    def __init__(
+        self,
+        schema_version: str,
+        kernel_version: str,
+        model_hash: str,
+        config_hash: str,
+        simulated_time_ns: int,
+        events_processed: int,
+        event_queue: list[dict[str, Any]],
+        domain_state: dict[str, Any],
+        root_seed: int,
+        next_sequence: int | None = None,
+        sequence_counter: int | None = None,
+        random_occurrence_counters: dict[str, int] | None = None,
+        plugin_metadata: dict[str, str] | None = None,
+        configuration: dict[str, Any] | None = None,
+        checksum: str | None = None,
+    ) -> None:
+        self.schema_version = schema_version
+        self.kernel_version = kernel_version
+        self.model_hash = model_hash
+        self.config_hash = config_hash
+        self.simulated_time_ns = simulated_time_ns
+        if next_sequence is not None:
+            self.next_sequence = next_sequence
+        elif sequence_counter is not None:
+            self.next_sequence = sequence_counter
+        else:
+            raise TypeError("Checkpoint requires either 'next_sequence' or 'sequence_counter'")
+        self.events_processed = events_processed
+        self.event_queue = event_queue
+        self.domain_state = domain_state
+        self.root_seed = root_seed
+        self.random_occurrence_counters = random_occurrence_counters or {}
+        self.plugin_metadata = plugin_metadata or {}
+        self.configuration = configuration or {}
+        self.checksum = checksum
+
+    @property
+    def sequence_counter(self) -> int:
+        return self.next_sequence
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["sequence_counter"] = self.next_sequence
         return data
 
 
@@ -79,6 +122,7 @@ class CheckpointInspection:
     model_hash: str
     config_hash: str
     simulated_time_ns: int
+    next_sequence: int
     sequence_counter: int
     events_processed: int
     queue_size: int
@@ -93,6 +137,7 @@ class CheckpointInspection:
             "model_hash": self.model_hash,
             "config_hash": self.config_hash,
             "simulated_time_ns": self.simulated_time_ns,
+            "next_sequence": self.next_sequence,
             "sequence_counter": self.sequence_counter,
             "events_processed": self.events_processed,
             "queue_size": self.queue_size,
@@ -135,15 +180,21 @@ def deserialize_checkpoint(raw: str | dict[str, Any]) -> Checkpoint:
         "model_hash",
         "config_hash",
         "simulated_time_ns",
-        "sequence_counter",
         "events_processed",
         "event_queue",
         "domain_state",
         "root_seed",
     ]
     missing = [f for f in required_fields if f not in data]
+    if "next_sequence" not in data and "sequence_counter" not in data:
+        missing.append("next_sequence")
     if missing:
         raise InvalidCheckpointError(f"Checkpoint data missing required fields: {missing}")
+
+    raw_seq = data.get("next_sequence")
+    if raw_seq is None:
+        raw_seq = data.get("sequence_counter", 0)
+    seq_val = int(raw_seq)
 
     # Checksum verification
     recorded_checksum = data.get("checksum")
@@ -160,7 +211,7 @@ def deserialize_checkpoint(raw: str | dict[str, Any]) -> Checkpoint:
         model_hash=str(data["model_hash"]),
         config_hash=str(data["config_hash"]),
         simulated_time_ns=int(data["simulated_time_ns"]),
-        sequence_counter=int(data["sequence_counter"]),
+        next_sequence=seq_val,
         events_processed=int(data["events_processed"]),
         event_queue=list(data["event_queue"]),
         domain_state=dict(data["domain_state"]),
@@ -170,6 +221,7 @@ def deserialize_checkpoint(raw: str | dict[str, Any]) -> Checkpoint:
         configuration=dict(data.get("configuration", {})),
         checksum=recorded_checksum,
     )
+
 
 
 def save_checkpoint(checkpoint: Checkpoint, path: str | Path) -> None:
@@ -227,6 +279,7 @@ def inspect_checkpoint(source: str | Path | dict[str, Any] | Checkpoint) -> Chec
         model_hash=cp.model_hash,
         config_hash=cp.config_hash,
         simulated_time_ns=cp.simulated_time_ns,
+        next_sequence=cp.next_sequence,
         sequence_counter=cp.sequence_counter,
         events_processed=cp.events_processed,
         queue_size=len(cp.event_queue),
