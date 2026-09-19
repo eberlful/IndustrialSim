@@ -235,10 +235,15 @@ def _synthesize_minimal_material_flow(stations_cfg: list[StationConfig]) -> Mate
 
 
 from industrialsim.checkpoint import (
+    BufferSnapshot,
     Checkpoint,
+    CheckpointEventRecord,
     CheckpointInspection,
+    DomainStateSnapshot,
     IncompatibleCheckpointError,
     InvalidCheckpointError,
+    ProductionUnitSnapshot,
+    StationSnapshot,
     compute_config_hash,
     compute_model_hash,
     deserialize_checkpoint,
@@ -258,40 +263,96 @@ def _index_routes(routes: Sequence[RouteConfig]) -> tuple[dict[str, list[RouteCo
     return routes_from, routes_to
 
 
+@dataclass
+class MaterialFlowTopology:
+    nodes_by_id: dict[str, NodeConfig]
+    sources: dict[str, NodeConfig]
+    sinks: dict[str, NodeConfig]
+    routes_from: dict[str, list[RouteConfig]]
+    routes_to: dict[str, list[RouteConfig]]
+
+    @classmethod
+    def from_material_flow(cls, mf: MaterialFlowConfig) -> MaterialFlowTopology:
+        nodes_by_id = {n.id: n for n in mf.nodes}
+        sources = {n.id: n for n in mf.nodes if n.kind == "source"}
+        sinks = {n.id: n for n in mf.nodes if n.kind == "sink"}
+        routes_from, routes_to = _index_routes(mf.routes)
+        return cls(
+            nodes_by_id=nodes_by_id,
+            sources=sources,
+            sinks=sinks,
+            routes_from=routes_from,
+            routes_to=routes_to,
+        )
+
+
+@dataclass
+class SimulationDomainState:
+    units: dict[str, ProductionUnit]
+    stations: dict[str, Station]
+    buffers: dict[str, Buffer]
+    in_flight_to: dict[str, int]
+    source_pending_units: dict[str, list[str]]
+
+
 class EpisodeEngine:
     def __init__(
         self,
         config: SimulationConfig,
         kernel: EventKernel,
-        units: dict[str, ProductionUnit],
-        stations: dict[str, Station],
-        buffers: dict[str, Buffer],
-        sources: dict[str, NodeConfig],
-        sinks: dict[str, NodeConfig],
-        nodes_by_id: dict[str, NodeConfig],
-        routes_from: dict[str, list[RouteConfig]],
-        routes_to: dict[str, list[RouteConfig]],
-        in_flight_to: dict[str, int],
-        source_pending_units: dict[str, list[str]],
+        topology: MaterialFlowTopology,
+        domain: SimulationDomainState,
         random_occurrence_counters: dict[str, int] | None = None,
         plugin_metadata: dict[str, str] | None = None,
     ) -> None:
         self.cfg = config
         self.kernel = kernel
-        self.units = units
-        self.stations = stations
-        self.buffers = buffers
-        self.sources = sources
-        self.sinks = sinks
-        self.nodes_by_id = nodes_by_id
-        self.routes_from = routes_from
-        self.routes_to = routes_to
-        self.in_flight_to = in_flight_to
-        self.source_pending_units = source_pending_units
+        self.topology = topology
+        self.domain = domain
         self.random_occurrence_counters = random_occurrence_counters or {}
         self.plugin_metadata = plugin_metadata or {}
 
         self._setup_handlers()
+
+    @property
+    def units(self) -> dict[str, ProductionUnit]:
+        return self.domain.units
+
+    @property
+    def stations(self) -> dict[str, Station]:
+        return self.domain.stations
+
+    @property
+    def buffers(self) -> dict[str, Buffer]:
+        return self.domain.buffers
+
+    @property
+    def in_flight_to(self) -> dict[str, int]:
+        return self.domain.in_flight_to
+
+    @property
+    def source_pending_units(self) -> dict[str, list[str]]:
+        return self.domain.source_pending_units
+
+    @property
+    def nodes_by_id(self) -> dict[str, NodeConfig]:
+        return self.topology.nodes_by_id
+
+    @property
+    def sources(self) -> dict[str, NodeConfig]:
+        return self.topology.sources
+
+    @property
+    def sinks(self) -> dict[str, NodeConfig]:
+        return self.topology.sinks
+
+    @property
+    def routes_from(self) -> dict[str, list[RouteConfig]]:
+        return self.topology.routes_from
+
+    @property
+    def routes_to(self) -> dict[str, list[RouteConfig]]:
+        return self.topology.routes_to
 
     def _setup_handlers(self) -> None:
         self.kernel.register_handler("RELEASE_UNIT", self._handle_release)
@@ -585,19 +646,20 @@ class EpisodeEngine:
                 payload={"unit_id": u_cfg.id, "source_id": source_id},
             )
 
-        return cls(
-            config=cfg,
-            kernel=kernel,
+        topology = MaterialFlowTopology.from_material_flow(mf)
+        domain = SimulationDomainState(
             units=units,
             stations=stations,
             buffers=buffers,
-            sources=sources,
-            sinks=sinks,
-            nodes_by_id=nodes_by_id,
-            routes_from=routes_from,
-            routes_to=routes_to,
             in_flight_to=in_flight_to,
             source_pending_units=source_pending_units,
+        )
+
+        return cls(
+            config=cfg,
+            kernel=kernel,
+            topology=topology,
+            domain=domain,
         )
 
     @classmethod
@@ -710,41 +772,42 @@ class EpisodeEngine:
             for nid in sources
         }
 
-        return cls(
-            config=cfg,
-            kernel=kernel,
+        topology = MaterialFlowTopology.from_material_flow(mf)
+        domain = SimulationDomainState(
             units=units,
             stations=stations,
             buffers=buffers,
-            sources=sources,
-            sinks=sinks,
-            nodes_by_id=nodes_by_id,
-            routes_from=routes_from,
-            routes_to=routes_to,
             in_flight_to=in_flight_to,
             source_pending_units=source_pending_units,
+        )
+
+        return cls(
+            config=cfg,
+            kernel=kernel,
+            topology=topology,
+            domain=domain,
             random_occurrence_counters=checkpoint.random_occurrence_counters,
             plugin_metadata=checkpoint.plugin_metadata,
         )
 
     def create_checkpoint(self) -> Checkpoint:
         snap = self.kernel.snapshot()
-        domain_state: dict[str, Any] = {
-            "production_units": {
-                u.id: u.to_snapshot()
+        domain_state = DomainStateSnapshot(
+            production_units={
+                u.id: ProductionUnitSnapshot.from_dict(u.to_snapshot())
                 for u in self.units.values()
             },
-            "stations": {
-                s.id: s.to_snapshot()
+            stations={
+                s.id: StationSnapshot.from_dict(s.to_snapshot())
                 for s in self.stations.values()
             },
-            "buffers": {
-                b.id: b.to_snapshot()
+            buffers={
+                b.id: BufferSnapshot.from_dict(b.to_snapshot())
                 for b in self.buffers.values()
             },
-            "in_flight_to": dict(self.in_flight_to),
-            "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
-        }
+            in_flight_to=dict(self.in_flight_to),
+            source_pending_units={k: list(v) for k, v in self.source_pending_units.items()},
+        )
 
         return Checkpoint(
             schema_version="1.0",
@@ -754,7 +817,10 @@ class EpisodeEngine:
             simulated_time_ns=self.kernel.current_time_ns,
             next_sequence=snap["sequence_counter"] + 1,
             events_processed=self.kernel.events_processed,
-            event_queue=snap["queue"],
+            event_queue=[
+                CheckpointEventRecord.from_dict(e) if isinstance(e, dict) else e
+                for e in snap["queue"]
+            ],
             domain_state=domain_state,
             root_seed=self.cfg.seed,
             random_occurrence_counters=dict(self.random_occurrence_counters),

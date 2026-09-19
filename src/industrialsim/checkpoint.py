@@ -50,6 +50,222 @@ class InvalidCheckpointError(ValueError):
     """Raised when a checkpoint file or data is corrupted, malformed, or fails integrity checks."""
 
 
+@dataclass(frozen=True)
+class CheckpointEventRecord:
+    time_ns: int
+    priority: int
+    sequence: int
+    event_type: str
+    payload_version: int = 1
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time_ns": self.time_ns,
+            "priority": self.priority,
+            "sequence": self.sequence,
+            "event_type": self.event_type,
+            "payload_version": self.payload_version,
+            "payload": dict(self.payload),
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CheckpointEventRecord:
+        return cls(
+            time_ns=int(data["time_ns"]),
+            priority=int(data["priority"]),
+            sequence=int(data["sequence"]),
+            event_type=str(data["event_type"]),
+            payload_version=int(data.get("payload_version", 1)),
+            payload=dict(data.get("payload", {})),
+        )
+
+
+@dataclass(frozen=True)
+class ProductionUnitSnapshot:
+    id: str
+    variant: str
+    quality_state: str
+    state: str
+    location: str
+    history: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "variant": self.variant,
+            "quality_state": self.quality_state,
+            "state": self.state,
+            "location": self.location,
+            "history": list(self.history),
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProductionUnitSnapshot:
+        return cls(
+            id=str(data["id"]),
+            variant=str(data["variant"]),
+            quality_state=str(data.get("quality_state", "nominal")),
+            state=str(data["state"]),
+            location=str(data["location"]),
+            history=list(data.get("history", [])),
+        )
+
+
+@dataclass(frozen=True)
+class StationSnapshot:
+    id: str
+    operations_completed: int
+    total_busy_time_ns: int
+    total_blocked_time_ns: int = 0
+    is_busy: bool = False
+    is_blocked: bool = False
+    current_unit_id: str | None = None
+    blocked_unit_id: str | None = None
+    output_buffer: list[str] = field(default_factory=list)
+    busy_start_ns: int | None = None
+    blocked_start_ns: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "operations_completed": self.operations_completed,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_blocked_time_ns": self.total_blocked_time_ns,
+            "is_busy": self.is_busy,
+            "is_blocked": self.is_blocked,
+            "current_unit_id": self.current_unit_id,
+            "blocked_unit_id": self.blocked_unit_id,
+            "output_buffer": list(self.output_buffer),
+            "busy_start_ns": self.busy_start_ns,
+            "blocked_start_ns": self.blocked_start_ns,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StationSnapshot:
+        return cls(
+            id=str(data["id"]),
+            operations_completed=int(data["operations_completed"]),
+            total_busy_time_ns=int(data["total_busy_time_ns"]),
+            total_blocked_time_ns=int(data.get("total_blocked_time_ns", 0)),
+            is_busy=bool(data.get("is_busy", False)),
+            is_blocked=bool(data.get("is_blocked", False)),
+            current_unit_id=data.get("current_unit_id"),
+            blocked_unit_id=data.get("blocked_unit_id"),
+            output_buffer=list(data.get("output_buffer", [])),
+            busy_start_ns=data.get("busy_start_ns"),
+            blocked_start_ns=data.get("blocked_start_ns"),
+        )
+
+
+@dataclass(frozen=True)
+class BufferSnapshot:
+    id: str
+    capacity: int
+    occupants: list[str] = field(default_factory=list)
+    peak_occupancy: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capacity": self.capacity,
+            "occupants": list(self.occupants),
+            "peak_occupancy": self.peak_occupancy,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BufferSnapshot:
+        occupants = list(data.get("occupants", []))
+        return cls(
+            id=str(data["id"]),
+            capacity=int(data["capacity"]),
+            occupants=occupants,
+            peak_occupancy=int(data.get("peak_occupancy", len(occupants))),
+        )
+
+
+@dataclass
+class DomainStateSnapshot:
+    production_units: dict[str, ProductionUnitSnapshot]
+    stations: dict[str, StationSnapshot]
+    buffers: dict[str, BufferSnapshot] = field(default_factory=dict)
+    in_flight_to: dict[str, int] = field(default_factory=dict)
+    source_pending_units: dict[str, list[str]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "production_units": {k: v.to_dict() for k, v in self.production_units.items()},
+            "stations": {k: v.to_dict() for k, v in self.stations.items()},
+            "buffers": {k: v.to_dict() for k, v in self.buffers.items()},
+            "in_flight_to": dict(self.in_flight_to),
+            "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "production_units":
+            return self.production_units
+        if key == "stations":
+            return self.stations
+        if key == "buffers":
+            return self.buffers
+        if key == "in_flight_to":
+            return self.in_flight_to
+        if key == "source_pending_units":
+            return self.source_pending_units
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DomainStateSnapshot:
+        return cls(
+            production_units={
+                k: ProductionUnitSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("production_units", {}).items()
+            },
+            stations={
+                k: StationSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("stations", {}).items()
+            },
+            buffers={
+                k: BufferSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("buffers", {}).items()
+            },
+            in_flight_to=dict(data.get("in_flight_to", {})),
+            source_pending_units={
+                k: list(v) for k, v in data.get("source_pending_units", {}).items()
+            },
+        )
+
+
 @dataclass
 class Checkpoint:
     schema_version: str
@@ -59,8 +275,8 @@ class Checkpoint:
     simulated_time_ns: int
     next_sequence: int
     events_processed: int
-    event_queue: list[dict[str, Any]]
-    domain_state: dict[str, Any]
+    event_queue: list[CheckpointEventRecord]
+    domain_state: DomainStateSnapshot
     root_seed: int
     random_occurrence_counters: dict[str, int] = field(default_factory=dict)
     plugin_metadata: dict[str, str] = field(default_factory=dict)
@@ -75,8 +291,8 @@ class Checkpoint:
         config_hash: str,
         simulated_time_ns: int,
         events_processed: int,
-        event_queue: list[dict[str, Any]],
-        domain_state: dict[str, Any],
+        event_queue: list[Any],
+        domain_state: Any,
         root_seed: int,
         next_sequence: int | None = None,
         sequence_counter: int | None = None,
@@ -97,8 +313,21 @@ class Checkpoint:
         else:
             raise TypeError("Checkpoint requires either 'next_sequence' or 'sequence_counter'")
         self.events_processed = events_processed
-        self.event_queue = event_queue
-        self.domain_state = domain_state
+
+        # Wrap event queue records if needed
+        self.event_queue = [
+            CheckpointEventRecord.from_dict(e) if isinstance(e, dict) else e
+            for e in event_queue
+        ]
+
+        # Wrap domain state snapshot if needed
+        if isinstance(domain_state, DomainStateSnapshot):
+            self.domain_state = domain_state
+        elif isinstance(domain_state, dict):
+            self.domain_state = DomainStateSnapshot.from_dict(domain_state)
+        else:
+            self.domain_state = domain_state
+
         self.root_seed = root_seed
         self.random_occurrence_counters = random_occurrence_counters or {}
         self.plugin_metadata = plugin_metadata or {}
@@ -110,9 +339,23 @@ class Checkpoint:
         return self.next_sequence
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["sequence_counter"] = self.next_sequence
-        return data
+        return {
+            "schema_version": self.schema_version,
+            "kernel_version": self.kernel_version,
+            "model_hash": self.model_hash,
+            "config_hash": self.config_hash,
+            "simulated_time_ns": self.simulated_time_ns,
+            "next_sequence": self.next_sequence,
+            "sequence_counter": self.next_sequence,
+            "events_processed": self.events_processed,
+            "event_queue": [e.to_dict() for e in self.event_queue],
+            "domain_state": self.domain_state.to_dict(),
+            "root_seed": self.root_seed,
+            "random_occurrence_counters": dict(self.random_occurrence_counters),
+            "plugin_metadata": dict(self.plugin_metadata),
+            "configuration": dict(self.configuration),
+            "checksum": self.checksum,
+        }
 
 
 @dataclass(frozen=True)
@@ -145,6 +388,7 @@ class CheckpointInspection:
             "random_occurrence_counters": self.random_occurrence_counters,
             "plugin_metadata": self.plugin_metadata,
         }
+
 
 
 def _compute_checksum(data: dict[str, Any]) -> str:

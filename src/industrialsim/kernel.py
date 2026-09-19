@@ -160,14 +160,24 @@ class EventKernel:
         self._events_processed = state["events_processed"]
         self._queue = []
         for item in state["queue"]:
-            event = ScheduledEvent(
-                time_ns=item["time_ns"],
-                priority=item["priority"],
-                sequence=item["sequence"],
-                event_type=item["event_type"],
-                payload_version=item.get("payload_version", 1),
-                payload=item.get("payload", {}),
-            )
+            if hasattr(item, "time_ns"):
+                event = ScheduledEvent(
+                    time_ns=item.time_ns,
+                    priority=item.priority,
+                    sequence=item.sequence,
+                    event_type=item.event_type,
+                    payload_version=getattr(item, "payload_version", 1),
+                    payload=getattr(item, "payload", {}),
+                )
+            else:
+                event = ScheduledEvent(
+                    time_ns=item["time_ns"],
+                    priority=item["priority"],
+                    sequence=item["sequence"],
+                    event_type=item["event_type"],
+                    payload_version=item.get("payload_version", 1),
+                    payload=item.get("payload", {}),
+                )
             heapq.heappush(
                 self._queue,
                 (event.time_ns, event.priority, event.sequence, event),
