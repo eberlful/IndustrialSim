@@ -5,7 +5,12 @@ import json
 import sys
 from typing import Sequence
 
-from industrialsim.application import run_episode, validate_config
+from industrialsim.application import (
+    inspect_checkpoint,
+    resume_episode,
+    run_episode,
+    validate_config,
+)
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -33,6 +38,30 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to the YAML configuration file",
     )
 
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help="Inspect a simulation checkpoint file",
+    )
+    inspect_parser.add_argument(
+        "checkpoint_path",
+        help="Path to the checkpoint file",
+    )
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Resume an episode from a simulation checkpoint file",
+    )
+    resume_parser.add_argument(
+        "checkpoint_path",
+        help="Path to the checkpoint file",
+    )
+    resume_parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="Optional path to the YAML configuration file to validate against checkpoint",
+    )
+
     return parser
 
 
@@ -48,6 +77,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         try:
             summary = run_episode(args.config_path)
+            print(json.dumps(summary.to_dict(), indent=2))
+            return 0
+        except Exception as e:
+            print(json.dumps({"status": "error", "error": str(e)}, indent=2))
+            return 1
+
+    if args.command == "inspect":
+        try:
+            inspection = inspect_checkpoint(args.checkpoint_path)
+            print(json.dumps(inspection.to_dict(), indent=2))
+            return 0
+        except Exception as e:
+            print(json.dumps({"status": "error", "error": str(e)}, indent=2))
+            return 1
+
+    if args.command == "resume":
+        try:
+            summary = resume_episode(args.checkpoint_path, config_source=args.config_path)
             print(json.dumps(summary.to_dict(), indent=2))
             return 0
         except Exception as e:

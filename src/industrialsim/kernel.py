@@ -56,6 +56,17 @@ class EventKernel:
     def register_handler(self, event_type: str, handler: EventHandler) -> None:
         self._handlers[event_type] = handler
 
+    def advance_to(self, time_ns: int) -> None:
+        if not isinstance(time_ns, int) or isinstance(time_ns, bool):
+            raise TypeError(f"time_ns must be integer nanoseconds, got {type(time_ns).__name__}")
+        if time_ns < self._current_time_ns:
+            raise ValueError(f"Cannot rewind time: {time_ns} < {self._current_time_ns}")
+        if self._queue and self._queue[0][0] < time_ns:
+            raise ValueError(
+                f"Cannot advance time past pending events: next event at {self._queue[0][0]} < {time_ns}"
+            )
+        self._current_time_ns = time_ns
+
     def schedule(
         self,
         time_ns: int,

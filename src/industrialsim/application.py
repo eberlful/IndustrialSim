@@ -234,83 +234,82 @@ def _synthesize_minimal_material_flow(stations_cfg: list[StationConfig]) -> Mate
     return MaterialFlowConfig(nodes=nodes, routes=routes)
 
 
-def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
-    validation = validate_config(source)
-    if not validation.is_valid or validation.config is None:
-        raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+from industrialsim.checkpoint import (
+    Checkpoint,
+    CheckpointInspection,
+    IncompatibleCheckpointError,
+    InvalidCheckpointError,
+    compute_config_hash,
+    compute_model_hash,
+    deserialize_checkpoint,
+    inspect_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    serialize_checkpoint,
+)
 
-    cfg = validation.config
 
-    units: dict[str, ProductionUnit] = {
-        u_cfg.id: ProductionUnit(id=u_cfg.id, variant=u_cfg.variant)
-        for u_cfg in cfg.production_units
-    }
+class EpisodeEngine:
+    def __init__(
+        self,
+        config: SimulationConfig,
+        kernel: EventKernel,
+        units: dict[str, ProductionUnit],
+        stations: dict[str, Station],
+        buffers: dict[str, Buffer],
+        sources: dict[str, NodeConfig],
+        sinks: dict[str, NodeConfig],
+        nodes_by_id: dict[str, NodeConfig],
+        routes_from: dict[str, list[RouteConfig]],
+        routes_to: dict[str, list[RouteConfig]],
+        in_flight_to: dict[str, int],
+        source_pending_units: dict[str, list[str]],
+        random_occurrence_counters: dict[str, int] | None = None,
+        plugin_metadata: dict[str, str] | None = None,
+    ) -> None:
+        self.cfg = config
+        self.kernel = kernel
+        self.units = units
+        self.stations = stations
+        self.buffers = buffers
+        self.sources = sources
+        self.sinks = sinks
+        self.nodes_by_id = nodes_by_id
+        self.routes_from = routes_from
+        self.routes_to = routes_to
+        self.in_flight_to = in_flight_to
+        self.source_pending_units = source_pending_units
+        self.random_occurrence_counters = random_occurrence_counters or {}
+        self.plugin_metadata = plugin_metadata or {}
 
-    kernel = EventKernel(initial_time_ns=cfg.episode.start_time_ns)
+        self._setup_handlers()
 
-    # Use unified material flow execution pipeline
-    mf: MaterialFlowConfig = (
-        cfg.material_flow
-        if cfg.material_flow is not None
-        else _synthesize_minimal_material_flow(cfg.stations)
-    )
+    def _setup_handlers(self) -> None:
+        self.kernel.register_handler("RELEASE_UNIT", self._handle_release)
+        self.kernel.register_handler("ARRIVAL_AT_NODE", self._handle_arrival_at_node)
+        self.kernel.register_handler("COMPLETE_OPERATION", self._handle_complete_operation)
 
-    nodes_by_id = {n.id: n for n in mf.nodes}
+    def _can_accept(self, node_id: str) -> bool:
+        kind = self.nodes_by_id[node_id].kind
+        if kind == "sink":
+            return True
+        elif kind == "buffer":
+            return self.buffers[node_id].can_accept(reserved=self.in_flight_to[node_id])
+        elif kind == "station":
+            return self.stations[node_id].can_accept(reserved=self.in_flight_to[node_id])
+        return False
 
-    stations: dict[str, Station] = {}
-    buffers: dict[str, Buffer] = {}
-    sources: dict[str, NodeConfig] = {}
-    sinks: dict[str, NodeConfig] = {}
-
-    for n in mf.nodes:
-        if n.kind == "station":
-            stations[n.id] = Station(
-                id=n.id,
-                operations={
-                    op.id: Operation(id=op.id, duration_ns=op.duration_ns)
-                    for op in n.operations
-                },
-                output_capacity=n.output_capacity,
-            )
-        elif n.kind == "buffer":
-            assert n.capacity is not None
-            buffers[n.id] = Buffer(id=n.id, capacity=n.capacity)
-        elif n.kind == "source":
-            sources[n.id] = n
-        elif n.kind == "sink":
-            sinks[n.id] = n
-
-    routes_from: dict[str, list[RouteConfig]] = {}
-    routes_to: dict[str, list[RouteConfig]] = {}
-    for r in mf.routes:
-        routes_from.setdefault(r.source_node_id, []).append(r)
-        routes_to.setdefault(r.target_node_id, []).append(r)
-
-    in_flight_to: dict[str, int] = {node.id: 0 for node in mf.nodes}
-    source_pending_units: dict[str, list[str]] = {nid: [] for nid in sources}
-
-    accept_checkers = {
-        "sink": lambda nid: True,
-        "buffer": lambda nid: buffers[nid].can_accept(reserved=in_flight_to[nid]),
-        "station": lambda nid: stations[nid].can_accept(reserved=in_flight_to[nid]),
-        "source": lambda nid: False,
-    }
-
-    def can_accept(node_id: str) -> bool:
-        checker = accept_checkers.get(nodes_by_id[node_id].kind)
-        return checker(node_id) if checker else False
-
-    def get_available_route(from_node_id: str) -> RouteConfig | None:
-        routes = routes_from.get(from_node_id, [])
+    def _get_available_route(self, from_node_id: str) -> RouteConfig | None:
+        routes = self.routes_from.get(from_node_id, [])
         for r in routes:
-            if can_accept(r.target_node_id):
+            if self._can_accept(r.target_node_id):
                 return r
         return routes[0] if routes else None
 
-    def dispatch_unit_to_target(k: EventKernel, unit_id: str, route: RouteConfig) -> None:
+    def _dispatch_unit_to_target(self, k: EventKernel, unit_id: str, route: RouteConfig) -> None:
         target_id = route.target_node_id
-        in_flight_to[target_id] += 1
-        units[unit_id].record_transition(
+        self.in_flight_to[target_id] += 1
+        self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_TRANSPORT,
             location=route.id,
@@ -322,119 +321,116 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             payload={"unit_id": unit_id, "node_id": target_id},
         )
 
-    def pull_from_station(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        st = stations[upstream_id]
-        if st.has_output_units() and can_accept(route.target_node_id):
+    def _pull_from_station(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+        st = self.stations[upstream_id]
+        if st.has_output_units() and self._can_accept(route.target_node_id):
             out_uid = st.pop_output_unit()
             assert out_uid is not None
-            dispatch_unit_to_target(k, out_uid, route)
+            self._dispatch_unit_to_target(k, out_uid, route)
             if st.is_blocked:
                 blocked_uid = st.blocked_unit_id
                 assert blocked_uid is not None
                 st.end_blocking(k.current_time_ns)
                 st.enqueue_output_unit(blocked_uid)
-                units[blocked_uid].record_transition(
+                self.units[blocked_uid].record_transition(
                     time_ns=k.current_time_ns,
                     state=ProductionUnitState.IN_STATION,
                     location=upstream_id,
                     station_id=upstream_id,
                 )
-                try_pull_upstream(k, upstream_id, visited)
+                self._try_pull_upstream(k, upstream_id, visited)
             return True
-        elif st.is_blocked and can_accept(route.target_node_id):
+        elif st.is_blocked and self._can_accept(route.target_node_id):
             blocked_uid = st.blocked_unit_id
             assert blocked_uid is not None
             st.end_blocking(k.current_time_ns)
-            dispatch_unit_to_target(k, blocked_uid, route)
-            try_pull_upstream(k, upstream_id, visited)
+            self._dispatch_unit_to_target(k, blocked_uid, route)
+            self._try_pull_upstream(k, upstream_id, visited)
             return True
         return False
 
-    def pull_from_buffer(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        buf = buffers[upstream_id]
+    def _pull_from_buffer(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+        buf = self.buffers[upstream_id]
         pulled = False
-        while buf.has_occupants() and can_accept(route.target_node_id):
+        while buf.has_occupants() and self._can_accept(route.target_node_id):
             out_uid = buf.pop_unit()
             assert out_uid is not None
-            dispatch_unit_to_target(k, out_uid, route)
+            self._dispatch_unit_to_target(k, out_uid, route)
             pulled = True
         if pulled:
-            try_pull_upstream(k, upstream_id, visited)
+            self._try_pull_upstream(k, upstream_id, visited)
         return pulled
 
-    def pull_from_source(k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
+    def _pull_from_source(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
         pulled = False
-        while source_pending_units[upstream_id] and can_accept(route.target_node_id):
-            out_uid = source_pending_units[upstream_id].pop(0)
-            dispatch_unit_to_target(k, out_uid, route)
+        while self.source_pending_units[upstream_id] and self._can_accept(route.target_node_id):
+            out_uid = self.source_pending_units[upstream_id].pop(0)
+            self._dispatch_unit_to_target(k, out_uid, route)
             pulled = True
         return pulled
 
-    pull_suppliers = {
-        "station": pull_from_station,
-        "buffer": pull_from_buffer,
-        "source": pull_from_source,
-    }
-
-    def try_pull_upstream(k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
+    def _try_pull_upstream(self, k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
         if visited is None:
             visited = set()
         if node_id in visited:
             return
         visited.add(node_id)
 
-        for route in routes_to.get(node_id, []):
+        for route in self.routes_to.get(node_id, []):
             upstream_id = route.source_node_id
-            kind = nodes_by_id[upstream_id].kind
-            supplier = pull_suppliers.get(kind)
-            if supplier:
-                supplier(k, upstream_id, route, visited)
+            kind = self.nodes_by_id[upstream_id].kind
+            if kind == "station":
+                self._pull_from_station(k, upstream_id, route, visited)
+            elif kind == "buffer":
+                self._pull_from_buffer(k, upstream_id, route, visited)
+            elif kind == "source":
+                self._pull_from_source(k, upstream_id, route, visited)
 
-    def handle_release(k: EventKernel, event: ScheduledEvent) -> None:
+    def _handle_release(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         source_id = event.payload["source_id"]
-        unit = units[unit_id]
+        unit = self.units[unit_id]
         unit.record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.RELEASED,
             location=source_id,
         )
 
-        route = get_available_route(source_id)
-        if route and can_accept(route.target_node_id):
-            dispatch_unit_to_target(k, unit_id, route)
+        route = self._get_available_route(source_id)
+        if route and self._can_accept(route.target_node_id):
+            self._dispatch_unit_to_target(k, unit_id, route)
         else:
-            source_pending_units[source_id].append(unit_id)
+            self.source_pending_units[source_id].append(unit_id)
 
-    def handle_sink_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
-        units[unit_id].record_transition(
+    def _handle_sink_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
+        self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.TERMINAL,
             location="terminal",
         )
-        try_pull_upstream(k, node_id)
+        self._try_pull_upstream(k, node_id)
 
-    def handle_buffer_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
-        buf = buffers[node_id]
+    def _handle_buffer_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
+        buf = self.buffers[node_id]
         buf.add_unit(unit_id)
-        units[unit_id].record_transition(
+        self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_BUFFER,
             location=node_id,
         )
-        route = get_available_route(node_id)
-        if route and can_accept(route.target_node_id):
+        route = self._get_available_route(node_id)
+        if route and self._can_accept(route.target_node_id):
             oldest_uid = buf.pop_unit()
             assert oldest_uid is not None
-            dispatch_unit_to_target(k, oldest_uid, route)
-        try_pull_upstream(k, node_id)
+            self._dispatch_unit_to_target(k, oldest_uid, route)
+        self._try_pull_upstream(k, node_id)
 
-    def handle_station_arrival(k: EventKernel, unit_id: str, node_id: str) -> None:
-        st = stations[node_id]
+    def _handle_station_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
+        st = self.stations[node_id]
         assert st.can_accept(), f"Station {node_id} accepted unit {unit_id} while busy/blocked"
         op = list(st.operations.values())[0]
         st.start_operation(unit_id, op.id, k.current_time_ns)
-        units[unit_id].record_transition(
+        self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_STATION,
             location=node_id,
@@ -448,24 +444,23 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0},
         )
 
-    arrival_handlers = {
-        "sink": handle_sink_arrival,
-        "buffer": handle_buffer_arrival,
-        "station": handle_station_arrival,
-    }
-
-    def handle_arrival_at_node(k: EventKernel, event: ScheduledEvent) -> None:
+    def _handle_arrival_at_node(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         node_id = event.payload["node_id"]
-        in_flight_to[node_id] -= 1
-        handler = arrival_handlers[nodes_by_id[node_id].kind]
-        handler(k, unit_id, node_id)
+        self.in_flight_to[node_id] -= 1
+        kind = self.nodes_by_id[node_id].kind
+        if kind == "sink":
+            self._handle_sink_arrival(k, unit_id, node_id)
+        elif kind == "buffer":
+            self._handle_buffer_arrival(k, unit_id, node_id)
+        elif kind == "station":
+            self._handle_station_arrival(k, unit_id, node_id)
 
-    def handle_complete_operation(k: EventKernel, event: ScheduledEvent) -> None:
+    def _handle_complete_operation(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         station_id = event.payload["station_id"]
         op_index = event.payload.get("op_index", 0)
-        st = stations[station_id]
+        st = self.stations[station_id]
         ops_list = list(st.operations.values())
         current_op = ops_list[op_index]
 
@@ -475,7 +470,7 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
         if op_index + 1 < len(ops_list):
             next_op = ops_list[op_index + 1]
             st.start_operation(unit_id, next_op.id, k.current_time_ns)
-            units[unit_id].record_transition(
+            self.units[unit_id].record_transition(
                 time_ns=k.current_time_ns,
                 state=ProductionUnitState.IN_STATION,
                 location=station_id,
@@ -491,112 +486,477 @@ def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
             return
 
         # Last operation completed for this unit:
-        route = get_available_route(station_id)
-        downstream_can_accept = route is not None and can_accept(route.target_node_id)
+        route = self._get_available_route(station_id)
+        downstream_can_accept = route is not None and self._can_accept(route.target_node_id)
 
         if downstream_can_accept and route is not None:
-            dispatch_unit_to_target(k, unit_id, route)
-            try_pull_upstream(k, station_id)
+            self._dispatch_unit_to_target(k, unit_id, route)
+            self._try_pull_upstream(k, station_id)
         else:
             if st.has_output_space():
                 st.enqueue_output_unit(unit_id)
-                units[unit_id].record_transition(
+                self.units[unit_id].record_transition(
                     time_ns=k.current_time_ns,
                     state=ProductionUnitState.IN_STATION,
                     location=station_id,
                     station_id=station_id,
                 )
-                try_pull_upstream(k, station_id)
+                self._try_pull_upstream(k, station_id)
             else:
                 st.start_blocking(unit_id, k.current_time_ns)
-                units[unit_id].record_transition(
+                self.units[unit_id].record_transition(
                     time_ns=k.current_time_ns,
                     state=ProductionUnitState.BLOCKED,
                     location=station_id,
                     station_id=station_id,
                 )
 
-    kernel.register_handler("RELEASE_UNIT", handle_release)
-    kernel.register_handler("ARRIVAL_AT_NODE", handle_arrival_at_node)
-    kernel.register_handler("COMPLETE_OPERATION", handle_complete_operation)
-
-    sole_source_id = next(iter(sources.keys())) if len(sources) == 1 else None
-
-    for u_cfg in cfg.production_units:
-        release_ns = max(cfg.episode.start_time_ns, u_cfg.release_time_ns)
-        source_id = u_cfg.source_id or sole_source_id
-        if source_id is None or source_id not in sources:
-            raise ValueError(
-                f"Production unit '{u_cfg.id}' cannot be released: no valid source node found in material flow"
-            )
-        kernel.schedule(
-            time_ns=release_ns,
-            priority=EventPriority.NEW_WORK,
-            event_type="RELEASE_UNIT",
-            payload={"unit_id": u_cfg.id, "source_id": source_id},
-        )
-
-    def is_terminal_condition_met(k: EventKernel) -> bool:
-        if cfg.episode.end_condition.type == "all_units_terminal":
-            return all(u.state == ProductionUnitState.TERMINAL for u in units.values())
+    def _is_terminal_condition_met(self, k: EventKernel) -> bool:
+        if self.cfg.episode.end_condition.type == "all_units_terminal":
+            return all(u.state == ProductionUnitState.TERMINAL for u in self.units.values())
         return False
 
-    kernel.run_until(
-        max_time_ns=cfg.episode.end_condition.max_time_ns,
-        stop_condition=is_terminal_condition_met,
+    @classmethod
+    def create(cls, cfg: SimulationConfig) -> EpisodeEngine:
+        units: dict[str, ProductionUnit] = {
+            u_cfg.id: ProductionUnit(id=u_cfg.id, variant=u_cfg.variant)
+            for u_cfg in cfg.production_units
+        }
+
+        kernel = EventKernel(initial_time_ns=cfg.episode.start_time_ns)
+
+        mf: MaterialFlowConfig = (
+            cfg.material_flow
+            if cfg.material_flow is not None
+            else _synthesize_minimal_material_flow(cfg.stations)
+        )
+
+        nodes_by_id = {n.id: n for n in mf.nodes}
+        stations: dict[str, Station] = {}
+        buffers: dict[str, Buffer] = {}
+        sources: dict[str, NodeConfig] = {}
+        sinks: dict[str, NodeConfig] = {}
+
+        for n in mf.nodes:
+            if n.kind == "station":
+                stations[n.id] = Station(
+                    id=n.id,
+                    operations={
+                        op.id: Operation(id=op.id, duration_ns=op.duration_ns)
+                        for op in n.operations
+                    },
+                    output_capacity=n.output_capacity,
+                )
+            elif n.kind == "buffer":
+                assert n.capacity is not None
+                buffers[n.id] = Buffer(id=n.id, capacity=n.capacity)
+            elif n.kind == "source":
+                sources[n.id] = n
+            elif n.kind == "sink":
+                sinks[n.id] = n
+
+        routes_from: dict[str, list[RouteConfig]] = {}
+        routes_to: dict[str, list[RouteConfig]] = {}
+        for r in mf.routes:
+            routes_from.setdefault(r.source_node_id, []).append(r)
+            routes_to.setdefault(r.target_node_id, []).append(r)
+
+        in_flight_to: dict[str, int] = {node.id: 0 for node in mf.nodes}
+        source_pending_units: dict[str, list[str]] = {nid: [] for nid in sources}
+
+        sole_source_id = next(iter(sources.keys())) if len(sources) == 1 else None
+
+        for u_cfg in cfg.production_units:
+            release_ns = max(cfg.episode.start_time_ns, u_cfg.release_time_ns)
+            source_id = u_cfg.source_id or sole_source_id
+            if source_id is None or source_id not in sources:
+                raise ValueError(
+                    f"Production unit '{u_cfg.id}' cannot be released: no valid source node found in material flow"
+                )
+            kernel.schedule(
+                time_ns=release_ns,
+                priority=EventPriority.NEW_WORK,
+                event_type="RELEASE_UNIT",
+                payload={"unit_id": u_cfg.id, "source_id": source_id},
+            )
+
+        return cls(
+            config=cfg,
+            kernel=kernel,
+            units=units,
+            stations=stations,
+            buffers=buffers,
+            sources=sources,
+            sinks=sinks,
+            nodes_by_id=nodes_by_id,
+            routes_from=routes_from,
+            routes_to=routes_to,
+            in_flight_to=in_flight_to,
+            source_pending_units=source_pending_units,
+        )
+
+    @classmethod
+    def restore(
+        cls,
+        checkpoint: Checkpoint,
+        config: SimulationConfig | None = None,
+    ) -> EpisodeEngine:
+        # Schema and kernel version compatibility checks
+        if checkpoint.schema_version != "1.0":
+            raise IncompatibleCheckpointError(
+                f"Incompatible schema version: expected '1.0', got '{checkpoint.schema_version}'"
+            )
+        if checkpoint.kernel_version != "1.0":
+            raise IncompatibleCheckpointError(
+                f"Incompatible kernel version: expected '1.0', got '{checkpoint.kernel_version}'"
+            )
+        if checkpoint.plugin_metadata:
+            raise IncompatibleCheckpointError(
+                f"Incompatible plugin metadata: plugins {list(checkpoint.plugin_metadata.keys())} are not available"
+            )
+
+        # Resolve and validate configuration
+        if config is not None:
+            provided_config_hash = compute_config_hash(config)
+            if provided_config_hash != checkpoint.config_hash:
+                raise IncompatibleCheckpointError(
+                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but provided config has '{provided_config_hash}'"
+                )
+            provided_model_hash = compute_model_hash(config)
+            if provided_model_hash != checkpoint.model_hash:
+                raise IncompatibleCheckpointError(
+                    f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but provided model has '{provided_model_hash}'"
+                )
+            cfg = config
+        else:
+            if not checkpoint.configuration:
+                raise IncompatibleCheckpointError(
+                    "Checkpoint contains no embedded configuration, and no configuration was provided"
+                )
+            cfg = SimulationConfig.model_validate(checkpoint.configuration)
+
+        mf: MaterialFlowConfig = (
+            cfg.material_flow
+            if cfg.material_flow is not None
+            else _synthesize_minimal_material_flow(cfg.stations)
+        )
+
+        nodes_by_id = {n.id: n for n in mf.nodes}
+        sources = {n.id: n for n in mf.nodes if n.kind == "source"}
+        sinks = {n.id: n for n in mf.nodes if n.kind == "sink"}
+
+        routes_from: dict[str, list[RouteConfig]] = {}
+        routes_to: dict[str, list[RouteConfig]] = {}
+        for r in mf.routes:
+            routes_from.setdefault(r.source_node_id, []).append(r)
+            routes_to.setdefault(r.target_node_id, []).append(r)
+
+        # Restore kernel
+        kernel = EventKernel(initial_time_ns=checkpoint.simulated_time_ns)
+        kernel.restore(
+            {
+                "current_time_ns": checkpoint.simulated_time_ns,
+                "sequence_counter": checkpoint.sequence_counter,
+                "events_processed": checkpoint.events_processed,
+                "queue": checkpoint.event_queue,
+            }
+        )
+
+        # Restore production units
+        domain_state = checkpoint.domain_state
+        units: dict[str, ProductionUnit] = {}
+        for uid, u_data in domain_state["production_units"].items():
+            history = [
+                from_dict_history(h)
+                for h in u_data.get("history", [])
+            ]
+            units[uid] = ProductionUnit(
+                id=u_data["id"],
+                variant=u_data["variant"],
+                quality_state=u_data.get("quality_state", "nominal"),
+                state=ProductionUnitState(u_data["state"]),
+                location=u_data["location"],
+                history=history,
+            )
+
+        # Restore stations
+        stations: dict[str, Station] = {}
+        for st_id, st_data in domain_state["stations"].items():
+            node = nodes_by_id[st_id]
+            st = Station(
+                id=st_id,
+                operations={
+                    op.id: Operation(id=op.id, duration_ns=op.duration_ns)
+                    for op in node.operations
+                },
+                output_capacity=node.output_capacity,
+            )
+            st.operations_completed = st_data["operations_completed"]
+            st.total_busy_time_ns = st_data["total_busy_time_ns"]
+            st.total_blocked_time_ns = st_data.get("total_blocked_time_ns", 0)
+            st.is_busy = st_data["is_busy"]
+            st.is_blocked = st_data["is_blocked"]
+            st.current_unit_id = st_data["current_unit_id"]
+            st.blocked_unit_id = st_data["blocked_unit_id"]
+            st.output_buffer = list(st_data.get("output_buffer", []))
+            st.busy_start_ns = st_data.get("busy_start_ns")
+            st.blocked_start_ns = st_data.get("blocked_start_ns")
+            stations[st_id] = st
+
+        # Restore buffers
+        buffers: dict[str, Buffer] = {}
+        for buf_id, buf_data in domain_state.get("buffers", {}).items():
+            buf = Buffer(id=buf_id, capacity=buf_data["capacity"])
+            buf.occupants = list(buf_data.get("occupants", []))
+            buf.peak_occupancy = buf_data.get("peak_occupancy", len(buf.occupants))
+            buffers[buf_id] = buf
+
+        in_flight_to = {node.id: 0 for node in mf.nodes}
+        in_flight_to.update(domain_state.get("in_flight_to", {}))
+
+        source_pending_units = {
+            nid: list(domain_state.get("source_pending_units", {}).get(nid, []))
+            for nid in sources
+        }
+
+        return cls(
+            config=cfg,
+            kernel=kernel,
+            units=units,
+            stations=stations,
+            buffers=buffers,
+            sources=sources,
+            sinks=sinks,
+            nodes_by_id=nodes_by_id,
+            routes_from=routes_from,
+            routes_to=routes_to,
+            in_flight_to=in_flight_to,
+            source_pending_units=source_pending_units,
+            random_occurrence_counters=checkpoint.random_occurrence_counters,
+            plugin_metadata=checkpoint.plugin_metadata,
+        )
+
+    def create_checkpoint(self) -> Checkpoint:
+        snap = self.kernel.snapshot()
+        domain_state: dict[str, Any] = {
+            "production_units": {
+                u.id: {
+                    "id": u.id,
+                    "variant": u.variant,
+                    "quality_state": u.quality_state,
+                    "state": str(u.state),
+                    "location": u.location,
+                    "history": [h.to_dict() for h in u.history],
+                }
+                for u in self.units.values()
+            },
+            "stations": {
+                s.id: {
+                    "id": s.id,
+                    "operations_completed": s.operations_completed,
+                    "total_busy_time_ns": s.total_busy_time_ns,
+                    "total_blocked_time_ns": s.total_blocked_time_ns,
+                    "is_busy": s.is_busy,
+                    "is_blocked": s.is_blocked,
+                    "current_unit_id": s.current_unit_id,
+                    "blocked_unit_id": s.blocked_unit_id,
+                    "output_buffer": list(s.output_buffer),
+                    "busy_start_ns": s.busy_start_ns,
+                    "blocked_start_ns": s.blocked_start_ns,
+                }
+                for s in self.stations.values()
+            },
+            "buffers": {
+                b.id: {
+                    "id": b.id,
+                    "capacity": b.capacity,
+                    "occupants": list(b.occupants),
+                    "peak_occupancy": b.peak_occupancy,
+                }
+                for b in self.buffers.values()
+            },
+            "in_flight_to": dict(self.in_flight_to),
+            "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
+        }
+
+        return Checkpoint(
+            schema_version="1.0",
+            kernel_version="1.0",
+            model_hash=compute_model_hash(self.cfg),
+            config_hash=compute_config_hash(self.cfg),
+            simulated_time_ns=self.kernel.current_time_ns,
+            sequence_counter=snap["sequence_counter"],
+            events_processed=self.kernel.events_processed,
+            event_queue=snap["queue"],
+            domain_state=domain_state,
+            root_seed=self.cfg.seed,
+            random_occurrence_counters=dict(self.random_occurrence_counters),
+            plugin_metadata=dict(self.plugin_metadata),
+            configuration=self.cfg.model_dump(mode="json"),
+        )
+
+    def run(self, pause_at_ns: int | None = None) -> EpisodeSummary:
+        if pause_at_ns is not None:
+            max_t = pause_at_ns
+            if self.cfg.episode.end_condition.max_time_ns is not None:
+                max_t = min(max_t, self.cfg.episode.end_condition.max_time_ns)
+            self.kernel.run_until(
+                max_time_ns=max_t,
+                stop_condition=self._is_terminal_condition_met,
+            )
+            if not self._is_terminal_condition_met(self.kernel) and self.kernel.current_time_ns < pause_at_ns:
+                self.kernel.advance_to(pause_at_ns)
+        else:
+            self.kernel.run_until(
+                max_time_ns=self.cfg.episode.end_condition.max_time_ns,
+                stop_condition=self._is_terminal_condition_met,
+            )
+
+        return self.to_summary()
+
+    def to_summary(self) -> EpisodeSummary:
+        all_terminal = self._is_terminal_condition_met(self.kernel)
+        status = "completed" if all_terminal else "incomplete"
+
+        unit_summaries = [
+            ProductionUnitSummary(
+                id=u.id,
+                variant=u.variant,
+                quality_state=u.quality_state,
+                state=str(u.state),
+                location=u.location,
+                history=[h.to_dict() for h in u.history],
+            )
+            for u in self.units.values()
+        ]
+
+        station_summaries = [
+            StationSummary(
+                id=s.id,
+                operations_completed=s.operations_completed,
+                total_busy_time_ns=s.total_busy_time_ns,
+                total_blocked_time_ns=s.total_blocked_time_ns,
+            )
+            for s in self.stations.values()
+        ]
+
+        buffer_summaries = [
+            BufferSummary(
+                id=b.id,
+                capacity=b.capacity,
+                peak_occupancy=b.peak_occupancy,
+            )
+            for b in self.buffers.values()
+        ]
+
+        result_hash = _compute_result_hash(
+            status=status,
+            seed=self.cfg.seed,
+            simulated_time_ns=self.kernel.current_time_ns,
+            events_processed=self.kernel.events_processed,
+            units=unit_summaries,
+            stations=station_summaries,
+            buffers=buffer_summaries,
+        )
+
+        return EpisodeSummary(
+            status=status,
+            seed=self.cfg.seed,
+            simulated_time_ns=self.kernel.current_time_ns,
+            events_processed=self.kernel.events_processed,
+            production_units=unit_summaries,
+            stations=station_summaries,
+            buffers=buffer_summaries,
+            result_hash=result_hash,
+        )
+
+
+def from_dict_history(h: dict[str, Any]) -> Any:
+    from industrialsim.domain import HistoryRecord
+    return HistoryRecord(
+        time_ns=h["time_ns"],
+        state=ProductionUnitState(h["state"]),
+        location=h["location"],
+        station_id=h.get("station_id"),
+        operation_id=h.get("operation_id"),
     )
 
-    all_terminal = is_terminal_condition_met(kernel)
-    status = "completed" if all_terminal else "incomplete"
 
-    unit_summaries = [
-        ProductionUnitSummary(
-            id=u.id,
-            variant=u.variant,
-            quality_state=u.quality_state,
-            state=str(u.state),
-            location=u.location,
-            history=[h.to_dict() for h in u.history],
-        )
-        for u in units.values()
-    ]
+def create_checkpoint(
+    source: str | Path | dict[str, Any] | SimulationConfig | EpisodeEngine,
+    at_time_ns: int | None = None,
+) -> Checkpoint:
+    if isinstance(source, EpisodeEngine):
+        engine = source
+        if at_time_ns is not None and at_time_ns > engine.kernel.current_time_ns:
+            engine.run(pause_at_ns=at_time_ns)
+        return engine.create_checkpoint()
 
-    station_summaries = [
-        StationSummary(
-            id=s.id,
-            operations_completed=s.operations_completed,
-            total_busy_time_ns=s.total_busy_time_ns,
-            total_blocked_time_ns=s.total_blocked_time_ns,
-        )
-        for s in stations.values()
-    ]
+    if isinstance(source, SimulationConfig):
+        cfg = source
+    else:
+        validation = validate_config(source)
+        if not validation.is_valid or validation.config is None:
+            raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+        cfg = validation.config
 
-    buffer_summaries = [
-        BufferSummary(
-            id=b.id,
-            capacity=b.capacity,
-            peak_occupancy=b.peak_occupancy,
-        )
-        for b in buffers.values()
-    ]
+    engine = EpisodeEngine.create(cfg)
+    if at_time_ns is not None and at_time_ns > cfg.episode.start_time_ns:
+        engine.run(pause_at_ns=at_time_ns)
+    return engine.create_checkpoint()
 
-    result_hash = _compute_result_hash(
-        status=status,
-        seed=cfg.seed,
-        simulated_time_ns=kernel.current_time_ns,
-        events_processed=kernel.events_processed,
-        units=unit_summaries,
-        stations=station_summaries,
-        buffers=buffer_summaries,
-    )
 
-    return EpisodeSummary(
-        status=status,
-        seed=cfg.seed,
-        simulated_time_ns=kernel.current_time_ns,
-        events_processed=kernel.events_processed,
-        production_units=unit_summaries,
-        stations=station_summaries,
-        buffers=buffer_summaries,
-        result_hash=result_hash,
-    )
+def restore_checkpoint(
+    checkpoint: str | Path | dict[str, Any] | Checkpoint,
+    config: str | Path | dict[str, Any] | SimulationConfig | None = None,
+) -> EpisodeEngine:
+    if isinstance(checkpoint, (str, Path)):
+        cp = load_checkpoint(checkpoint)
+    elif isinstance(checkpoint, dict):
+        cp = deserialize_checkpoint(checkpoint)
+    elif isinstance(checkpoint, Checkpoint):
+        cp = checkpoint
+    else:
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    cfg: SimulationConfig | None = None
+    if config is not None:
+        if isinstance(config, SimulationConfig):
+            cfg = config
+        else:
+            validation = validate_config(config)
+            if not validation.is_valid or validation.config is None:
+                raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+            cfg = validation.config
+
+    return EpisodeEngine.restore(cp, config=cfg)
+
+
+def resume_episode(
+    checkpoint: str | Path | dict[str, Any] | Checkpoint,
+    config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+) -> EpisodeSummary:
+    engine = restore_checkpoint(checkpoint, config=config_source)
+    return engine.run()
+
+
+def run_episode(
+    source: str | Path | dict[str, Any],
+    checkpoint_at_ns: int | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> EpisodeSummary:
+    validation = validate_config(source)
+    if not validation.is_valid or validation.config is None:
+        raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+
+    cfg = validation.config
+    engine = EpisodeEngine.create(cfg)
+
+    if checkpoint_at_ns is not None:
+        engine.run(pause_at_ns=checkpoint_at_ns)
+        if checkpoint_path is not None:
+            cp = engine.create_checkpoint()
+            save_checkpoint(cp, checkpoint_path)
+
+    return engine.run()
+
