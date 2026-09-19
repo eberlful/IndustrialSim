@@ -207,6 +207,25 @@ class WorkerRequirementConfig(StrictBaseModel):
 
 
 # Operations & Stations
+class InspectionConfig(StrictBaseModel):
+    sensitivity: float = 1.0
+    false_positive_rate: float = 0.0
+    rework_operation_id: str | None = None
+    rework_station_id: str | None = None
+    max_reworks: int = 1
+    disposition_on_defect: Literal["rework", "scrap"] = "rework"
+
+    @model_validator(mode="after")
+    def validate_inspection(self) -> InspectionConfig:
+        if not (0.0 <= self.sensitivity <= 1.0):
+            raise ValueError(f"Sensitivity must be in [0.0, 1.0], got {self.sensitivity}")
+        if not (0.0 <= self.false_positive_rate <= 1.0):
+            raise ValueError(f"False positive rate must be in [0.0, 1.0], got {self.false_positive_rate}")
+        if self.max_reworks < 0:
+            raise ValueError(f"Max reworks cannot be negative: {self.max_reworks}")
+        return self
+
+
 class OperationConfig(StrictBaseModel):
     id: str
     duration: int | str
@@ -214,10 +233,20 @@ class OperationConfig(StrictBaseModel):
     required_machines: list[str] = Field(default_factory=list)
     required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
     interruption_policy: Literal["resume", "restart", "scrap"] = "resume"
+    defect_probability: float = 0.0
+    defect_name: str | None = None
+    target_quality_state: str | None = None
+    restores_quality: bool = False
+    rework_success_probability: float = 1.0
+    inspection: InspectionConfig | None = None
 
     @model_validator(mode="after")
     def compute_duration_ns(self) -> OperationConfig:
         object.__setattr__(self, "duration_ns", parse_duration_ns(self.duration))
+        if not (0.0 <= self.defect_probability <= 1.0):
+            raise ValueError(f"defect_probability must be in [0.0, 1.0], got {self.defect_probability}")
+        if not (0.0 <= self.rework_success_probability <= 1.0):
+            raise ValueError(f"rework_success_probability must be in [0.0, 1.0], got {self.rework_success_probability}")
         return self
 
 
@@ -376,10 +405,36 @@ class ProductionUnitConfig(StrictBaseModel):
     source_id: str | None = None
     release_time: int | str = 0
     release_time_ns: int = 0
+    due_date: int | str | None = None
+    due_date_ns: int | None = None
+    quality_state: str = "nominal"
 
     @model_validator(mode="after")
     def compute_release_time_ns(self) -> ProductionUnitConfig:
         object.__setattr__(self, "release_time_ns", parse_duration_ns(self.release_time))
+        if self.due_date is not None:
+            object.__setattr__(self, "due_date_ns", parse_duration_ns(self.due_date))
+        return self
+
+
+class ProductionPlanEntryConfig(StrictBaseModel):
+    id: str | None = None
+    variant: str
+    quantity: int = 1
+    release_time: int | str = 0
+    release_time_ns: int = 0
+    due_date: int | str | None = None
+    due_date_ns: int | None = None
+    source_id: str | None = None
+    quality_state: str = "nominal"
+
+    @model_validator(mode="after")
+    def compute_plan_entry_times(self) -> ProductionPlanEntryConfig:
+        object.__setattr__(self, "release_time_ns", parse_duration_ns(self.release_time))
+        if self.due_date is not None:
+            object.__setattr__(self, "due_date_ns", parse_duration_ns(self.due_date))
+        if self.quantity < 1:
+            raise ValueError(f"Production plan entry quantity must be >= 1, got {self.quantity}")
         return self
 
 
@@ -410,6 +465,17 @@ class EpisodeConfig(StrictBaseModel):
         return self
 
 
+class ProcessPlanStepConfig(StrictBaseModel):
+    id: str | None = None
+    operation_id: str
+    compatible_stations: list[str] = Field(min_length=1)
+
+
+class ProcessPlanConfig(StrictBaseModel):
+    variant: str
+    steps: list[ProcessPlanStepConfig] = Field(min_length=1)
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
@@ -418,11 +484,39 @@ class SimulationConfig(StrictBaseModel):
     material_flow: MaterialFlowConfig | None = None
     machines: list[MachineConfig] = Field(default_factory=list)
     workers: list[WorkerConfig] = Field(default_factory=list)
-    production_units: list[ProductionUnitConfig] = Field(min_length=1)
+    production_units: list[ProductionUnitConfig] = Field(default_factory=list)
+    production_plan: list[ProductionPlanEntryConfig] = Field(default_factory=list)
+    process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
     stations: list[StationConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_simulation_config(self) -> SimulationConfig:
+        if not self.production_units and not self.production_plan:
+            raise ValueError("At least one production unit or production plan entry must be defined")
+
+        if self.production_plan:
+            materialized: list[ProductionUnitConfig] = []
+            for entry_idx, entry in enumerate(self.production_plan, start=1):
+                prefix = entry.id if entry.id else f"{entry.variant}-{entry_idx}"
+                for i in range(1, entry.quantity + 1):
+                    unit_id = f"{prefix}-{i}"
+                    materialized.append(
+                        ProductionUnitConfig(
+                            id=unit_id,
+                            variant=entry.variant,
+                            source_id=entry.source_id,
+                            release_time=entry.release_time,
+                            release_time_ns=entry.release_time_ns,
+                            due_date=entry.due_date,
+                            due_date_ns=entry.due_date_ns,
+                            quality_state=entry.quality_state,
+                        )
+                    )
+            if self.production_units:
+                if [u.id for u in self.production_units] != [u.id for u in materialized]:
+                    raise ValueError("Cannot specify conflicting 'production_units' and 'production_plan'")
+            else:
+                object.__setattr__(self, "production_units", materialized)
         unit_ids = [u.id for u in self.production_units]
         if len(unit_ids) != len(set(unit_ids)):
             raise ValueError(f"Duplicate production unit IDs found: {unit_ids}")
@@ -494,5 +588,40 @@ class SimulationConfig(StrictBaseModel):
                         raise ValueError(
                             f"Production unit '{unit_cfg.id}' must specify 'source_id' when material flow contains multiple sources: {sorted(source_ids)}"
                         )
+
+        # Validate process plans
+        if self.process_plans:
+            plan_variants = [p.variant for p in self.process_plans]
+            if len(plan_variants) != len(set(plan_variants)):
+                raise ValueError(f"Duplicate process plans for variants: {plan_variants}")
+
+            valid_station_ops: dict[str, set[str]] = {}
+            for s_cfg in self.stations:
+                valid_station_ops[s_cfg.id] = {op.id for op in s_cfg.operations}
+            if self.material_flow is not None:
+                for node in self.material_flow.nodes:
+                    if node.kind == "station":
+                        valid_station_ops[node.id] = {op.id for op in node.operations}
+
+            for plan in self.process_plans:
+                for step_idx, step in enumerate(plan.steps):
+                    for st_id in step.compatible_stations:
+                        if st_id not in valid_station_ops:
+                            raise ValueError(
+                                f"Process plan for variant '{plan.variant}' step {step_idx + 1} "
+                                f"references unknown station '{st_id}'"
+                            )
+                        if step.operation_id not in valid_station_ops[st_id]:
+                            raise ValueError(
+                                f"Station '{st_id}' does not provide operation '{step.operation_id}' "
+                                f"required by process plan for variant '{plan.variant}'"
+                            )
+
+            plan_variant_set = set(plan_variants)
+            for u in self.production_units:
+                if u.variant not in plan_variant_set:
+                    raise ValueError(
+                        f"Production unit '{u.id}' variant '{u.variant}' has no matching process plan"
+                    )
 
         return self

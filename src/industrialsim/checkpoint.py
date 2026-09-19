@@ -34,6 +34,8 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["machines"] = [m.model_dump(mode="json") for m in cfg.machines]
         if getattr(cfg, "workers", None):
             model_data["workers"] = [w.model_dump(mode="json") for w in cfg.workers]
+        if getattr(cfg, "process_plans", None):
+            model_data["process_plans"] = [p.model_dump(mode="json") for p in cfg.process_plans]
     elif isinstance(cfg, dict):
         model_data = {
             "plant": cfg.get("plant"),
@@ -44,6 +46,8 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["machines"] = cfg.get("machines")
         if cfg.get("workers"):
             model_data["workers"] = cfg.get("workers")
+        if cfg.get("process_plans"):
+            model_data["process_plans"] = cfg.get("process_plans")
     else:
         raise TypeError(f"Expected SimulationConfig or dict, got {type(cfg).__name__}")
     canonical = json.dumps(model_data, sort_keys=True, separators=(",", ":"))
@@ -103,16 +107,34 @@ class ProductionUnitSnapshot:
     state: str
     location: str
     history: list[dict[str, Any]] = field(default_factory=list)
+    due_date_ns: int | None = None
+    process_step_index: int = 0
+    rework_count: int = 0
+    is_in_rework: bool = False
+    rework_target_station_id: str | None = None
+    rework_operation_id: str | None = None
+    defects: list[str] = field(default_factory=list)
+    findings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "id": self.id,
             "variant": self.variant,
             "quality_state": self.quality_state,
             "state": self.state,
             "location": self.location,
             "history": list(self.history),
+            "process_step_index": self.process_step_index,
+            "rework_count": self.rework_count,
+            "is_in_rework": self.is_in_rework,
+            "rework_target_station_id": self.rework_target_station_id,
+            "rework_operation_id": self.rework_operation_id,
+            "defects": list(self.defects),
+            "findings": list(self.findings),
         }
+        if self.due_date_ns is not None:
+            result["due_date_ns"] = self.due_date_ns
+        return result
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -129,6 +151,14 @@ class ProductionUnitSnapshot:
             state=str(data["state"]),
             location=str(data["location"]),
             history=list(data.get("history", [])),
+            due_date_ns=data.get("due_date_ns"),
+            process_step_index=int(data.get("process_step_index", 0)),
+            rework_count=int(data.get("rework_count", 0)),
+            is_in_rework=bool(data.get("is_in_rework", False)),
+            rework_target_station_id=data.get("rework_target_station_id"),
+            rework_operation_id=data.get("rework_operation_id"),
+            defects=list(data.get("defects", [])),
+            findings=list(data.get("findings", [])),
         )
 
 

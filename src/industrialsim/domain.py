@@ -46,14 +46,66 @@ class HistoryRecord:
         )
 
 
+@dataclass(frozen=True)
+class QualityFinding:
+    time_ns: int
+    unit_id: str
+    station_id: str
+    operation_id: str
+    result: str  # "nominal" or "defect_detected"
+    disposition: str | None = None  # "pass", "rework", "scrap"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time_ns": self.time_ns,
+            "unit_id": self.unit_id,
+            "station_id": self.station_id,
+            "operation_id": self.operation_id,
+            "result": self.result,
+            "disposition": self.disposition,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QualityFinding:
+        return cls(
+            time_ns=data["time_ns"],
+            unit_id=data["unit_id"],
+            station_id=data["station_id"],
+            operation_id=data["operation_id"],
+            result=data["result"],
+            disposition=data.get("disposition"),
+        )
+
+
 @dataclass
 class ProductionUnit:
     id: str
     variant: str
     quality_state: str = "nominal"
+    due_date_ns: int | None = None
+    process_step_index: int = 0
+    rework_count: int = 0
+    is_in_rework: bool = False
+    rework_target_station_id: str | None = None
+    rework_operation_id: str | None = None
+    defects: list[str] = field(default_factory=list)
+    findings: list[QualityFinding] = field(default_factory=list)
     state: ProductionUnitState = ProductionUnitState.CREATED
     location: str = "unreleased"
     history: list[HistoryRecord] = field(default_factory=list)
+
+    @property
+    def is_defective(self) -> bool:
+        return self.quality_state != "nominal" or len(self.defects) > 0
+
+    def alter_quality(self, target_state: str, defect: str | None = None) -> None:
+        self.quality_state = target_state
+        if defect and defect not in self.defects:
+            self.defects.append(defect)
+
+    def restore_quality(self, target_state: str = "nominal") -> None:
+        self.quality_state = target_state
+        self.defects.clear()
 
     def record_transition(
         self,
@@ -76,22 +128,41 @@ class ProductionUnit:
         )
 
     def to_snapshot(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "id": self.id,
             "variant": self.variant,
             "quality_state": self.quality_state,
+            "process_step_index": self.process_step_index,
+            "rework_count": self.rework_count,
+            "is_in_rework": self.is_in_rework,
+            "rework_target_station_id": self.rework_target_station_id,
+            "rework_operation_id": self.rework_operation_id,
+            "defects": list(self.defects),
+            "findings": [f.to_dict() for f in self.findings],
             "state": str(self.state),
             "location": self.location,
             "history": [h.to_dict() for h in self.history],
         }
+        if self.due_date_ns is not None:
+            result["due_date_ns"] = self.due_date_ns
+        return result
 
     @classmethod
     def from_snapshot(cls, data: dict[str, Any]) -> ProductionUnit:
         history = [HistoryRecord.from_dict(h) for h in data.get("history", [])]
+        findings = [QualityFinding.from_dict(f) for f in data.get("findings", [])]
         return cls(
             id=data["id"],
             variant=data["variant"],
             quality_state=data.get("quality_state", "nominal"),
+            due_date_ns=data.get("due_date_ns"),
+            process_step_index=data.get("process_step_index", 0),
+            rework_count=data.get("rework_count", 0),
+            is_in_rework=bool(data.get("is_in_rework", False)),
+            rework_target_station_id=data.get("rework_target_station_id"),
+            rework_operation_id=data.get("rework_operation_id"),
+            defects=list(data.get("defects", [])),
+            findings=findings,
             state=ProductionUnitState(data["state"]),
             location=data["location"],
             history=history,
@@ -349,6 +420,12 @@ class Operation:
     required_machines: list[str] = field(default_factory=list)
     required_workers: list[dict[str, Any]] = field(default_factory=list)
     interruption_policy: str = "resume"
+    defect_probability: float = 0.0
+    defect_name: str | None = None
+    target_quality_state: str | None = None
+    restores_quality: bool = False
+    rework_success_probability: float = 1.0
+    inspection: dict[str, Any] | None = None
 
 
 @dataclass

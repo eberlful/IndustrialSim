@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -12,6 +13,7 @@ from industrialsim.config import (
     MaterialFlowConfig,
     NodeConfig,
     PortConfig,
+    ProcessPlanConfig,
     RouteConfig,
     SimulationConfig,
     StationConfig,
@@ -23,11 +25,13 @@ from industrialsim.domain import (
     Operation,
     ProductionUnit,
     ProductionUnitState,
+    QualityFinding,
     Shift,
     Station,
     Worker,
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
+from industrialsim.random import SemanticRandomStream
 
 
 _yaml = YAML(typ="safe", pure=True)
@@ -55,16 +59,24 @@ class ProductionUnitSummary:
     state: str
     location: str
     history: list[dict[str, Any]]
+    due_date_ns: int | None = None
+    process_step_index: int = 0
+    findings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "id": self.id,
             "variant": self.variant,
             "quality_state": self.quality_state,
             "state": self.state,
             "location": self.location,
             "history": self.history,
+            "process_step_index": self.process_step_index,
+            "findings": list(self.findings),
         }
+        if self.due_date_ns is not None:
+            result["due_date_ns"] = self.due_date_ns
+        return result
 
 
 @dataclass(frozen=True)
@@ -410,6 +422,13 @@ class EpisodeEngine:
         self.domain = domain
         self.random_occurrence_counters = random_occurrence_counters or {}
         self.plugin_metadata = plugin_metadata or {}
+        self.process_plans: dict[str, ProcessPlanConfig] = {
+            p.variant: p for p in self.cfg.process_plans
+        }
+        self.random_stream = SemanticRandomStream(
+            root_seed=self.cfg.seed,
+            occurrence_counters=self.random_occurrence_counters,
+        )
 
         self._setup_handlers()
 
@@ -488,6 +507,94 @@ class EpisodeEngine:
             return self.stations[node_id].can_accept(reserved=self.in_flight_to[node_id])
         return False
 
+    def _find_path_to_target(self, start_node_id: str, target_id: str) -> int | None:
+        if start_node_id == target_id:
+            return 0
+        queue: deque[tuple[str, int]] = deque([(start_node_id, 0)])
+        visited: set[str] = {start_node_id}
+        best_dist: int | None = None
+        while queue:
+            curr, dist = queue.popleft()
+            if curr == target_id:
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                continue
+            if curr != start_node_id and self.nodes_by_id[curr].kind != "buffer":
+                continue
+            for r in self.routes_from.get(curr, []):
+                nxt = r.target_node_id
+                if nxt not in visited or nxt == target_id:
+                    visited.add(nxt)
+                    queue.append((nxt, dist + r.transit_time_ns))
+        return best_dist
+
+    def _get_target_nodes_for_unit(self, unit: ProductionUnit) -> set[str]:
+        if unit.is_in_rework:
+            if unit.rework_target_station_id:
+                return {unit.rework_target_station_id}
+            if unit.rework_operation_id:
+                matching = {s_id for s_id, s in self.stations.items() if unit.rework_operation_id in s.operations}
+                if matching:
+                    return matching
+            restoring = {s_id for s_id, s in self.stations.items() if any(op.restores_quality for op in s.operations.values())}
+            if restoring:
+                return restoring
+        if unit.variant in self.process_plans:
+            plan = self.process_plans[unit.variant]
+            if unit.process_step_index < len(plan.steps):
+                return set(plan.steps[unit.process_step_index].compatible_stations)
+            return set(self.sinks.keys())
+        return set(self.nodes_by_id.keys())
+
+    def _select_route_for_unit(self, from_node_id: str, unit: ProductionUnit) -> RouteConfig | None:
+        routes = self.routes_from.get(from_node_id, [])
+        if not routes:
+            return None
+
+        if unit.variant not in self.process_plans and not unit.is_in_rework:
+            for r in routes:
+                if self._can_accept(r.target_node_id):
+                    return r
+            return routes[0] if routes else None
+
+        target_nodes = self._get_target_nodes_for_unit(unit)
+        candidates: list[tuple[int, int, int, int, int, str, str, RouteConfig]] = []
+
+        for r in routes:
+            for target_id in target_nodes:
+                d = self._find_path_to_target(r.target_node_id, target_id)
+                if d is not None:
+                    total_dist = r.transit_time_ns + d
+                    can_accept = 1 if self._can_accept(r.target_node_id) else 0
+                    is_direct = 1 if r.target_node_id == target_id else 0
+                    target_st = self.stations.get(target_id)
+                    target_avail = 1 if (target_st and target_st.can_accept(reserved=self.in_flight_to[target_id])) else 0
+                    target_load = (
+                        (1 if target_st.is_busy else 0)
+                        + (1 if target_st.is_blocked else 0)
+                        + len(target_st.output_buffer)
+                        + self.in_flight_to[target_id]
+                    ) if target_st else 0
+                    candidates.append((
+                        -can_accept,
+                        -is_direct,
+                        -target_avail,
+                        target_load,
+                        total_dist,
+                        target_id,
+                        r.id,
+                        r,
+                    ))
+
+        if not candidates:
+            for r in routes:
+                if self._can_accept(r.target_node_id):
+                    return r
+            return routes[0] if routes else None
+
+        candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+        return candidates[0][7]
+
     def _get_available_route(self, from_node_id: str) -> RouteConfig | None:
         routes = self.routes_from.get(from_node_id, [])
         for r in routes:
@@ -512,50 +619,68 @@ class EpisodeEngine:
 
     def _pull_from_station(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
         st = self.stations[upstream_id]
-        if st.has_output_units() and self._can_accept(route.target_node_id):
-            out_uid = st.pop_output_unit()
-            assert out_uid is not None
-            self._dispatch_unit_to_target(k, out_uid, route)
-            if st.is_blocked:
-                blocked_uid = st.blocked_unit_id
-                assert blocked_uid is not None
-                st.end_blocking(k.current_time_ns)
-                st.enqueue_output_unit(blocked_uid)
-                self.units[blocked_uid].record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.IN_STATION,
-                    location=upstream_id,
-                    station_id=upstream_id,
-                )
-                self._try_pull_upstream(k, upstream_id, visited)
-            return True
-        elif st.is_blocked and self._can_accept(route.target_node_id):
+        if st.has_output_units():
+            out_uid = st.output_buffer[0]
+            u = self.units[out_uid]
+            selected_route = self._select_route_for_unit(upstream_id, u)
+            if selected_route and selected_route.id == route.id and self._can_accept(route.target_node_id):
+                st.pop_output_unit()
+                self._dispatch_unit_to_target(k, out_uid, route)
+                if st.is_blocked:
+                    blocked_uid = st.blocked_unit_id
+                    assert blocked_uid is not None
+                    st.end_blocking(k.current_time_ns)
+                    st.enqueue_output_unit(blocked_uid)
+                    self.units[blocked_uid].record_transition(
+                        time_ns=k.current_time_ns,
+                        state=ProductionUnitState.IN_STATION,
+                        location=upstream_id,
+                        station_id=upstream_id,
+                    )
+                    self._try_pull_upstream(k, upstream_id, visited)
+                return True
+        elif st.is_blocked:
             blocked_uid = st.blocked_unit_id
             assert blocked_uid is not None
-            st.end_blocking(k.current_time_ns)
-            self._dispatch_unit_to_target(k, blocked_uid, route)
-            self._try_pull_upstream(k, upstream_id, visited)
-            return True
+            u = self.units[blocked_uid]
+            selected_route = self._select_route_for_unit(upstream_id, u)
+            if selected_route and selected_route.id == route.id and self._can_accept(route.target_node_id):
+                st.end_blocking(k.current_time_ns)
+                self._dispatch_unit_to_target(k, blocked_uid, route)
+                self._try_pull_upstream(k, upstream_id, visited)
+                return True
         return False
 
     def _pull_from_buffer(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
         buf = self.buffers[upstream_id]
         pulled = False
         while buf.has_occupants() and self._can_accept(route.target_node_id):
-            out_uid = buf.pop_unit()
-            assert out_uid is not None
-            self._dispatch_unit_to_target(k, out_uid, route)
-            pulled = True
+            out_uid = buf.occupants[0]
+            u = self.units[out_uid]
+            selected_route = self._select_route_for_unit(upstream_id, u)
+            if selected_route and selected_route.id == route.id:
+                buf.pop_unit()
+                self._dispatch_unit_to_target(k, out_uid, route)
+                pulled = True
+            else:
+                break
         if pulled:
             self._try_pull_upstream(k, upstream_id, visited)
         return pulled
 
     def _pull_from_source(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
         pulled = False
-        while self.source_pending_units[upstream_id] and self._can_accept(route.target_node_id):
-            out_uid = self.source_pending_units[upstream_id].pop(0)
-            self._dispatch_unit_to_target(k, out_uid, route)
-            pulled = True
+        i = 0
+        while i < len(self.source_pending_units[upstream_id]) and self._can_accept(route.target_node_id):
+            candidate_uid = self.source_pending_units[upstream_id][i]
+            u = self.units[candidate_uid]
+            selected_route = self._select_route_for_unit(upstream_id, u)
+            if selected_route and selected_route.id == route.id:
+                self.source_pending_units[upstream_id].pop(i)
+                self._dispatch_unit_to_target(k, candidate_uid, route)
+                pulled = True
+            else:
+                i += 1
         return pulled
 
     def _try_pull_upstream(self, k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
@@ -585,7 +710,7 @@ class EpisodeEngine:
             location=source_id,
         )
 
-        route = self._get_available_route(source_id)
+        route = self._select_route_for_unit(source_id, unit)
         if route and self._can_accept(route.target_node_id):
             self._dispatch_unit_to_target(k, unit_id, route)
         else:
@@ -607,11 +732,13 @@ class EpisodeEngine:
             state=ProductionUnitState.IN_BUFFER,
             location=node_id,
         )
-        route = self._get_available_route(node_id)
-        if route and self._can_accept(route.target_node_id):
-            oldest_uid = buf.pop_unit()
-            assert oldest_uid is not None
-            self._dispatch_unit_to_target(k, oldest_uid, route)
+        if buf.has_occupants():
+            oldest_uid = buf.occupants[0]
+            oldest_unit = self.units[oldest_uid]
+            route = self._select_route_for_unit(node_id, oldest_unit)
+            if route and self._can_accept(route.target_node_id):
+                buf.pop_unit()
+                self._dispatch_unit_to_target(k, oldest_uid, route)
         self._try_pull_upstream(k, node_id)
 
     def _can_acquire_resources(
@@ -931,7 +1058,26 @@ class EpisodeEngine:
         st = self.stations[node_id]
         assert st.can_accept(), f"Station {node_id} accepted unit {unit_id} while busy/blocked"
         st.current_unit_id = unit_id
-        op = list(st.operations.values())[0]
+        unit = self.units[unit_id]
+
+        if unit.is_in_rework and unit.rework_operation_id and unit.rework_operation_id in st.operations:
+            op = st.operations[unit.rework_operation_id]
+            op_index = list(st.operations.keys()).index(unit.rework_operation_id)
+        elif unit.is_in_rework and any(op.restores_quality for op in st.operations.values()):
+            op = next(op for op in st.operations.values() if op.restores_quality)
+            op_index = list(st.operations.keys()).index(op.id)
+        elif unit.is_in_rework and len(st.operations) == 1:
+            op = list(st.operations.values())[0]
+            op_index = 0
+        elif unit.variant in self.process_plans:
+            plan = self.process_plans[unit.variant]
+            step = plan.steps[unit.process_step_index]
+            op = st.operations[step.operation_id]
+            op_index = list(st.operations.keys()).index(step.operation_id)
+        else:
+            op = list(st.operations.values())[0]
+            op_index = 0
+
         self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_STATION,
@@ -946,7 +1092,7 @@ class EpisodeEngine:
                 station_id=node_id,
                 unit_id=unit_id,
                 op=op,
-                op_index=0,
+                op_index=op_index,
                 remaining_duration_ns=op.duration_ns,
                 mach_ids=mach_ids,
                 worker_allocs=worker_allocs,
@@ -957,14 +1103,14 @@ class EpisodeEngine:
                 time_ns=k.current_time_ns + op.duration_ns,
                 priority=EventPriority.COMPLETION,
                 event_type="COMPLETE_OPERATION",
-                payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0, "token": token},
+                payload={"unit_id": unit_id, "station_id": node_id, "op_index": op_index, "token": token},
             )
         else:
             st.start_waiting(k.current_time_ns)
             self.resource_waiters.append({
                 "station_id": node_id,
                 "unit_id": unit_id,
-                "op_index": 0,
+                "op_index": op_index,
                 "waiting_since_ns": k.current_time_ns,
                 "remaining_duration_ns": op.duration_ns,
             })
@@ -981,6 +1127,37 @@ class EpisodeEngine:
         elif kind == "station":
             self._handle_station_arrival(k, unit_id, node_id)
 
+    def _route_or_buffer_unit(self, k: EventKernel, station_id: str, unit_id: str) -> None:
+        st = self.stations[station_id]
+        unit = self.units[unit_id]
+        route = self._select_route_for_unit(station_id, unit)
+        downstream_can_accept = route is not None and self._can_accept(route.target_node_id)
+
+        if downstream_can_accept and route is not None:
+            st.current_unit_id = None
+            self._dispatch_unit_to_target(k, unit_id, route)
+            self._try_pull_upstream(k, station_id)
+        else:
+            if st.has_output_space():
+                st.current_unit_id = None
+                st.enqueue_output_unit(unit_id)
+                unit.record_transition(
+                    time_ns=k.current_time_ns,
+                    state=ProductionUnitState.IN_STATION,
+                    location=station_id,
+                    station_id=station_id,
+                )
+                self._try_pull_upstream(k, station_id)
+            else:
+                st.start_blocking(unit_id, k.current_time_ns)
+                unit.record_transition(
+                    time_ns=k.current_time_ns,
+                    state=ProductionUnitState.BLOCKED,
+                    location=station_id,
+                    station_id=station_id,
+                )
+        self._try_allocate_pending_resources(k.current_time_ns)
+
     def _handle_complete_operation(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         station_id = event.payload["station_id"]
@@ -995,9 +1172,98 @@ class EpisodeEngine:
         st = self.stations[station_id]
         ops_list = list(st.operations.values())
         current_op = ops_list[op_index]
+        unit = self.units[unit_id]
 
         self._release_resources(station_id, k.current_time_ns, completed=True)
         st.complete_operation(current_op.id, k.current_time_ns)
+
+        was_in_rework = unit.is_in_rework
+
+        # 1. Defect generation (addressed by unit and operation for counterfactual consistency)
+        if current_op.defect_probability > 0.0:
+            defect_roll = self.random_stream.draw_float("quality", f"{unit.id}:{current_op.id}", "defect")
+            if defect_roll < current_op.defect_probability:
+                defect_name = current_op.defect_name or f"defect_{current_op.id}"
+                target_state = current_op.target_quality_state or defect_name
+                unit.alter_quality(target_state=target_state, defect=defect_name)
+
+        # 2. Quality restoration (rework completion)
+        if current_op.restores_quality:
+            rework_success = True
+            if current_op.rework_success_probability < 1.0:
+                success_roll = self.random_stream.draw_float("quality", f"{unit.id}:{current_op.id}", "rework_success")
+                rework_success = success_roll < current_op.rework_success_probability
+            if rework_success:
+                unit.restore_quality()
+                unit.is_in_rework = False
+                unit.rework_target_station_id = None
+                unit.rework_operation_id = None
+
+        # 3. Inspection
+        if current_op.inspection:
+            insp = current_op.inspection
+            sensitivity = float(insp.get("sensitivity", 1.0))
+            fp_rate = float(insp.get("false_positive_rate", 0.0))
+            disp_on_defect = insp.get("disposition_on_defect", "scrap")
+            max_reworks = int(insp.get("max_reworks", 1))
+
+            is_defect_detected = False
+            if unit.is_defective:
+                detection_roll = self.random_stream.draw_float("inspection", f"{unit.id}:{current_op.id}", "detection")
+                if detection_roll < sensitivity:
+                    is_defect_detected = True
+            else:
+                fp_roll = self.random_stream.draw_float("inspection", f"{unit.id}:{current_op.id}", "false_positive")
+                if fp_roll < fp_rate:
+                    is_defect_detected = True
+
+            if is_defect_detected:
+                result = "defect_detected"
+                if disp_on_defect == "rework" and unit.rework_count >= max_reworks:
+                    disposition = "scrap"
+                else:
+                    disposition = disp_on_defect
+            else:
+                result = "nominal"
+                disposition = "pass"
+
+            finding = QualityFinding(
+                time_ns=k.current_time_ns,
+                unit_id=unit_id,
+                station_id=station_id,
+                operation_id=current_op.id,
+                result=result,
+                disposition=disposition,
+            )
+            unit.findings.append(finding)
+
+            if disposition == "scrap":
+                unit.record_transition(
+                    time_ns=k.current_time_ns,
+                    state=ProductionUnitState.TERMINAL,
+                    location="terminal",
+                    station_id=station_id,
+                    operation_id=current_op.id,
+                )
+                st.scrapped_count += 1
+                st.current_unit_id = None
+                self._try_pull_upstream(k, station_id)
+                self._try_allocate_pending_resources(k.current_time_ns)
+                return
+
+            elif disposition == "rework":
+                unit.is_in_rework = True
+                unit.rework_count += 1
+                unit.rework_target_station_id = insp.get("rework_station_id")
+                unit.rework_operation_id = insp.get("rework_operation_id")
+                self._route_or_buffer_unit(k, station_id, unit_id)
+                return
+
+        if unit.variant in self.process_plans:
+            if not was_in_rework:
+                unit.process_step_index += 1
+            self._route_or_buffer_unit(k, station_id, unit_id)
+            return
 
         # If station has multiple operations and more remain for this unit:
         if op_index + 1 < len(ops_list):
@@ -1042,34 +1308,7 @@ class EpisodeEngine:
             return
 
         # Last operation completed for this unit:
-        route = self._get_available_route(station_id)
-        downstream_can_accept = route is not None and self._can_accept(route.target_node_id)
-
-        if downstream_can_accept and route is not None:
-            st.current_unit_id = None
-            self._dispatch_unit_to_target(k, unit_id, route)
-            self._try_pull_upstream(k, station_id)
-        else:
-            if st.has_output_space():
-                st.current_unit_id = None
-                st.enqueue_output_unit(unit_id)
-                self.units[unit_id].record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.IN_STATION,
-                    location=station_id,
-                    station_id=station_id,
-                )
-                self._try_pull_upstream(k, station_id)
-            else:
-                st.start_blocking(unit_id, k.current_time_ns)
-                self.units[unit_id].record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.BLOCKED,
-                    location=station_id,
-                    station_id=station_id,
-                )
-
-        self._try_allocate_pending_resources(k.current_time_ns)
+        self._route_or_buffer_unit(k, station_id, unit_id)
 
     def _is_terminal_condition_met(self, k: EventKernel) -> bool:
         if self.cfg.episode.end_condition.type == "all_units_terminal":
@@ -1079,7 +1318,12 @@ class EpisodeEngine:
     @classmethod
     def create(cls, cfg: SimulationConfig) -> EpisodeEngine:
         units: dict[str, ProductionUnit] = {
-            u_cfg.id: ProductionUnit(id=u_cfg.id, variant=u_cfg.variant)
+            u_cfg.id: ProductionUnit(
+                id=u_cfg.id,
+                variant=u_cfg.variant,
+                due_date_ns=u_cfg.due_date_ns,
+                quality_state=u_cfg.quality_state,
+            )
             for u_cfg in cfg.production_units
         }
 
@@ -1108,6 +1352,12 @@ class EpisodeEngine:
                             required_machines=list(op.required_machines),
                             required_workers=[req.model_dump() for req in op.required_workers],
                             interruption_policy=op.interruption_policy,
+                            defect_probability=op.defect_probability,
+                            defect_name=op.defect_name,
+                            target_quality_state=op.target_quality_state,
+                            restores_quality=op.restores_quality,
+                            rework_success_probability=op.rework_success_probability,
+                            inspection=op.inspection.model_dump() if op.inspection else None,
                         )
                         for op in n.operations
                     },
@@ -1369,6 +1619,12 @@ class EpisodeEngine:
                         required_machines=list(op.required_machines),
                         required_workers=[req.model_dump() for req in op.required_workers],
                         interruption_policy=op.interruption_policy,
+                        defect_probability=op.defect_probability,
+                        defect_name=op.defect_name,
+                        target_quality_state=op.target_quality_state,
+                        restores_quality=op.restores_quality,
+                        rework_success_probability=op.rework_success_probability,
+                        inspection=op.inspection.model_dump() if op.inspection else None,
                     )
                     for op in node.operations
                 },
@@ -1558,6 +1814,9 @@ class EpisodeEngine:
                 state=str(u.state),
                 location=u.location,
                 history=[h.to_dict() for h in u.history],
+                due_date_ns=u.due_date_ns,
+                process_step_index=u.process_step_index,
+                findings=[f.to_dict() for f in u.findings],
             )
             for u in self.units.values()
         ]
