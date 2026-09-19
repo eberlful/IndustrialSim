@@ -261,3 +261,140 @@ def test_observable_interleaved_event_order_equivalence(tmp_path: Path) -> None:
 
     assert len(uninterrupted_events) > 0
     assert resumed_events == uninterrupted_events
+
+
+RESOURCE_CHECKPOINT_YAML = """schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "all_units_terminal"
+
+machines:
+  - id: "mach-shared"
+    capacity: 1
+
+workers:
+  - id: "worker-pool"
+    kind: "pool"
+    capacity: 2
+    qualifications: ["assembler"]
+    shifts:
+      - id: "shift-1"
+        start_time: "0s"
+        end_time: "50s"
+
+material_flow:
+  nodes:
+    - id: "src-1"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "src-2"
+      kind: "source"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "st-1"
+      kind: "station"
+      operations:
+        - id: "op-1"
+          duration: "6s"
+          required_machines: ["mach-shared"]
+          required_workers:
+            - qualification: "assembler"
+              count: 1
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "st-2"
+      kind: "station"
+      operations:
+        - id: "op-2"
+          duration: "8s"
+          required_machines: ["mach-shared"]
+          required_workers:
+            - qualification: "assembler"
+              count: 1
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "part"
+          direction: "output"
+    - id: "snk-1"
+      kind: "sink"
+      input_ports:
+        - id: "p-in"
+          port_type: "part"
+          direction: "input"
+  routes:
+    - id: "r-src1-st1"
+      source_node_id: "src-1"
+      source_port_id: "p-out"
+      target_node_id: "st-1"
+      target_port_id: "p-in"
+    - id: "r-src2-st2"
+      source_node_id: "src-2"
+      source_port_id: "p-out"
+      target_node_id: "st-2"
+      target_port_id: "p-in"
+    - id: "r-st1-snk"
+      source_node_id: "st-1"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+    - id: "r-st2-snk"
+      source_node_id: "st-2"
+      source_port_id: "p-out"
+      target_node_id: "snk-1"
+      target_port_id: "p-in"
+
+production_units:
+  - id: "unit-1"
+    variant: "sedan"
+    source_id: "src-1"
+    release_time: "0s"
+  - id: "unit-2"
+    variant: "suv"
+    source_id: "src-2"
+    release_time: "0s"
+"""
+
+
+def test_resource_allocation_checkpoint_equivalence(tmp_path: Path) -> None:
+    # 1. Full uninterrupted run
+    uninterrupted_summary = run_episode(RESOURCE_CHECKPOINT_YAML)
+    assert uninterrupted_summary.status == "completed"
+
+    # 2. Checkpoint mid-run at 3s (while st-1 is actively holding resources and st-2 is waiting)
+    cp = create_checkpoint(RESOURCE_CHECKPOINT_YAML, at_time_ns=3_000_000_000)
+    assert cp.simulated_time_ns == 3_000_000_000
+    assert len(cp.domain_state.active_operations) > 0
+
+    cp_file = tmp_path / "resource_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    # Inspect checkpoint
+    info = inspect_checkpoint(cp_file)
+    assert info.schema_version == "1.0"
+    assert info.simulated_time_ns == 3_000_000_000
+
+    # 3. Resume from checkpoint to completion
+    resumed_summary = resume_episode(cp_file)
+    assert resumed_summary.status == "completed"
+
+    # 4. Assert bit-for-bit equivalence
+    assert resumed_summary.simulated_time_ns == uninterrupted_summary.simulated_time_ns
+    assert resumed_summary.result_hash == uninterrupted_summary.result_hash
+    assert resumed_summary.to_dict() == uninterrupted_summary.to_dict()

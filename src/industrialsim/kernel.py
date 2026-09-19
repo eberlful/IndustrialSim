@@ -53,6 +53,10 @@ class EventKernel:
     def queue_size(self) -> int:
         return len(self._queue)
 
+    @property
+    def sequence_counter(self) -> int:
+        return self._sequence_counter
+
     def register_handler(self, event_type: str, handler: EventHandler) -> None:
         self._handlers[event_type] = handler
 

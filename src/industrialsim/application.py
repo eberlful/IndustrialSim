@@ -17,11 +17,15 @@ from industrialsim.config import (
     StationConfig,
 )
 from industrialsim.domain import (
+    Break,
     Buffer,
+    Machine,
     Operation,
     ProductionUnit,
     ProductionUnitState,
+    Shift,
     Station,
+    Worker,
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
 
@@ -69,6 +73,11 @@ class StationSummary:
     operations_completed: int
     total_busy_time_ns: int
     total_blocked_time_ns: int = 0
+    total_waiting_time_ns: int = 0
+    interrupted_count: int = 0
+    resumed_count: int = 0
+    restarted_count: int = 0
+    scrapped_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +85,63 @@ class StationSummary:
             "operations_completed": self.operations_completed,
             "total_busy_time_ns": self.total_busy_time_ns,
             "total_blocked_time_ns": self.total_blocked_time_ns,
+            "total_waiting_time_ns": self.total_waiting_time_ns,
+            "interrupted_count": self.interrupted_count,
+            "resumed_count": self.resumed_count,
+            "restarted_count": self.restarted_count,
+            "scrapped_count": self.scrapped_count,
+        }
+
+
+@dataclass(frozen=True)
+class MachineSummary:
+    id: str
+    capacity: int
+    operations_completed: int
+    total_busy_time_ns: int
+    total_idle_time_ns: int
+    total_break_time_ns: int
+    total_off_shift_time_ns: int
+    utilization: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capacity": self.capacity,
+            "operations_completed": self.operations_completed,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "total_break_time_ns": self.total_break_time_ns,
+            "total_off_shift_time_ns": self.total_off_shift_time_ns,
+            "utilization": self.utilization,
+        }
+
+
+@dataclass(frozen=True)
+class WorkerSummary:
+    id: str
+    kind: str
+    capacity: int
+    qualifications: list[str]
+    operations_completed: int
+    total_busy_time_ns: int
+    total_idle_time_ns: int
+    total_break_time_ns: int
+    total_off_shift_time_ns: int
+    utilization: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "capacity": self.capacity,
+            "qualifications": list(self.qualifications),
+            "operations_completed": self.operations_completed,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "total_break_time_ns": self.total_break_time_ns,
+            "total_off_shift_time_ns": self.total_off_shift_time_ns,
+            "utilization": self.utilization,
         }
 
 
@@ -103,6 +169,8 @@ class EpisodeSummary:
     stations: list[StationSummary]
     result_hash: str
     buffers: list[BufferSummary] = field(default_factory=list)
+    machines: list[MachineSummary] = field(default_factory=list)
+    workers: list[WorkerSummary] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +181,8 @@ class EpisodeSummary:
             "production_units": [u.to_dict() for u in self.production_units],
             "stations": [s.to_dict() for s in self.stations],
             "buffers": [b.to_dict() for b in self.buffers],
+            "machines": [m.to_dict() for m in self.machines],
+            "workers": [w.to_dict() for w in self.workers],
             "result_hash": self.result_hash,
         }
 
@@ -166,8 +236,10 @@ def _compute_result_hash(
     units: list[ProductionUnitSummary],
     stations: list[StationSummary],
     buffers: list[BufferSummary] | None = None,
+    machines: list[MachineSummary] | None = None,
+    workers: list[WorkerSummary] | None = None,
 ) -> str:
-    data = {
+    data: dict[str, Any] = {
         "status": status,
         "seed": seed,
         "simulated_time_ns": simulated_time_ns,
@@ -176,6 +248,10 @@ def _compute_result_hash(
         "stations": [s.to_dict() for s in stations],
         "buffers": [b.to_dict() for b in (buffers or [])],
     }
+    if machines:
+        data["machines"] = [m.to_dict() for m in machines]
+    if workers:
+        data["workers"] = [w.to_dict() for w in workers]
     canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -242,8 +318,10 @@ from industrialsim.checkpoint import (
     DomainStateSnapshot,
     IncompatibleCheckpointError,
     InvalidCheckpointError,
+    MachineSnapshot,
     ProductionUnitSnapshot,
     StationSnapshot,
+    WorkerSnapshot,
     compute_config_hash,
     compute_model_hash,
     deserialize_checkpoint,
@@ -293,6 +371,10 @@ class SimulationDomainState:
     buffers: dict[str, Buffer]
     in_flight_to: dict[str, int]
     source_pending_units: dict[str, list[str]]
+    machines: dict[str, Machine] = field(default_factory=dict)
+    workers: dict[str, Worker] = field(default_factory=dict)
+    resource_waiters: list[dict[str, Any]] = field(default_factory=list)
+    active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _verify_checkpoint_compatibility(
@@ -371,10 +453,30 @@ class EpisodeEngine:
     def routes_to(self) -> dict[str, list[RouteConfig]]:
         return self.topology.routes_to
 
+    @property
+    def machines(self) -> dict[str, Machine]:
+        return self.domain.machines
+
+    @property
+    def workers(self) -> dict[str, Worker]:
+        return self.domain.workers
+
+    @property
+    def resource_waiters(self) -> list[dict[str, Any]]:
+        return self.domain.resource_waiters
+
+    @property
+    def active_operations(self) -> dict[str, dict[str, Any]]:
+        return self.domain.active_operations
+
     def _setup_handlers(self) -> None:
         self.kernel.register_handler("RELEASE_UNIT", self._handle_release)
         self.kernel.register_handler("ARRIVAL_AT_NODE", self._handle_arrival_at_node)
         self.kernel.register_handler("COMPLETE_OPERATION", self._handle_complete_operation)
+        self.kernel.register_handler("SHIFT_START", self._handle_shift_start)
+        self.kernel.register_handler("SHIFT_END", self._handle_shift_end)
+        self.kernel.register_handler("BREAK_START", self._handle_break_start)
+        self.kernel.register_handler("BREAK_END", self._handle_break_end)
 
     def _can_accept(self, node_id: str) -> bool:
         kind = self.nodes_by_id[node_id].kind
@@ -512,11 +614,304 @@ class EpisodeEngine:
             self._dispatch_unit_to_target(k, oldest_uid, route)
         self._try_pull_upstream(k, node_id)
 
+    def _can_acquire_resources(
+        self, op: Operation, station_id: str, time_ns: int
+    ) -> tuple[bool, list[str], list[dict[str, Any]]]:
+        allocated_machines: list[str] = []
+        for m_id in op.required_machines:
+            mach = self.machines.get(m_id)
+            if not mach or not mach.can_allocate(1, time_ns):
+                return False, [], []
+            allocated_machines.append(m_id)
+
+        allocated_workers: list[dict[str, Any]] = []
+        temp_worker_allocations: dict[str, int] = {}
+
+        for req in op.required_workers:
+            needed_count = req.get("count", 1)
+            target_worker_id = req.get("worker_id")
+            target_qual = req.get("qualification")
+
+            if target_worker_id is not None:
+                w = self.workers.get(target_worker_id)
+                if not w or not w.is_available(time_ns):
+                    return False, [], []
+                curr_allocated = temp_worker_allocations.get(w.id, 0)
+                if w.available_capacity(time_ns) - curr_allocated < needed_count:
+                    return False, [], []
+                temp_worker_allocations[w.id] = curr_allocated + needed_count
+                allocated_workers.append({"worker_id": w.id, "count": needed_count})
+            elif target_qual is not None:
+                candidates = [
+                    w for w in self.workers.values()
+                    if target_qual in w.qualifications and w.is_available(time_ns)
+                ]
+                candidates.sort(key=lambda w: (0 if w.kind == "pool" else 1, w.id))
+
+                satisfied = 0
+                for c in candidates:
+                    curr_allocated = temp_worker_allocations.get(c.id, 0)
+                    avail = c.available_capacity(time_ns) - curr_allocated
+                    if avail > 0:
+                        take = min(avail, needed_count - satisfied)
+                        temp_worker_allocations[c.id] = curr_allocated + take
+                        allocated_workers.append({"worker_id": c.id, "count": take})
+                        satisfied += take
+                        if satisfied == needed_count:
+                            break
+                if satisfied < needed_count:
+                    return False, [], []
+
+        return True, allocated_machines, allocated_workers
+
+    def _acquire_resources(
+        self,
+        station_id: str,
+        unit_id: str,
+        op: Operation,
+        op_index: int,
+        remaining_duration_ns: int,
+        mach_ids: list[str],
+        worker_allocs: list[dict[str, Any]],
+        time_ns: int,
+    ) -> int:
+        for m_id in mach_ids:
+            self.machines[m_id].allocate(station_id, unit_id, op.id, time_ns)
+        for alloc in worker_allocs:
+            for _ in range(alloc["count"]):
+                self.workers[alloc["worker_id"]].allocate(station_id, unit_id, op.id, time_ns)
+
+        token = self.kernel.sequence_counter + 1
+        self.active_operations[station_id] = {
+            "station_id": station_id,
+            "unit_id": unit_id,
+            "op_id": op.id,
+            "op_index": op_index,
+            "start_time_ns": time_ns,
+            "remaining_duration_ns": remaining_duration_ns,
+            "machines": list(mach_ids),
+            "workers": [dict(a) for a in worker_allocs],
+            "token": token,
+        }
+        return token
+
+    def _release_resources(self, station_id: str, time_ns: int) -> dict[str, Any] | None:
+        active_op = self.active_operations.pop(station_id, None)
+        if not active_op:
+            return None
+        unit_id = active_op["unit_id"]
+        op_id = active_op["op_id"]
+        for m_id in active_op["machines"]:
+            if m_id in self.machines:
+                self.machines[m_id].release(station_id, unit_id, op_id, time_ns)
+        for alloc in active_op["workers"]:
+            w_id = alloc["worker_id"]
+            if w_id in self.workers:
+                for _ in range(alloc["count"]):
+                    self.workers[w_id].release(station_id, unit_id, op_id, time_ns)
+        return active_op
+
+    def _try_allocate_pending_resources(self, time_ns: int) -> None:
+        if not self.resource_waiters:
+            return
+
+        self.resource_waiters.sort(
+            key=lambda w: (
+                w["waiting_since_ns"],
+                w.get("priority", 0),
+                w["station_id"],
+                w["unit_id"],
+            )
+        )
+
+        allocated_indices: list[int] = []
+        for idx, waiter in enumerate(self.resource_waiters):
+            station_id = waiter["station_id"]
+            st = self.stations[station_id]
+            unit_id = waiter["unit_id"]
+            op_index = waiter["op_index"]
+            ops_list = list(st.operations.values())
+            op = ops_list[op_index]
+
+            can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, station_id, time_ns)
+            if can_acq:
+                allocated_indices.append(idx)
+                rem_dur = waiter.get("remaining_duration_ns", op.duration_ns)
+                token = self._acquire_resources(
+                    station_id=station_id,
+                    unit_id=unit_id,
+                    op=op,
+                    op_index=op_index,
+                    remaining_duration_ns=rem_dur,
+                    mach_ids=mach_ids,
+                    worker_allocs=worker_allocs,
+                    time_ns=time_ns,
+                )
+                st.start_operation(unit_id, op.id, time_ns)
+                self.kernel.schedule(
+                    time_ns=time_ns + rem_dur,
+                    priority=EventPriority.COMPLETION,
+                    event_type="COMPLETE_OPERATION",
+                    payload={"unit_id": unit_id, "station_id": station_id, "op_index": op_index, "token": token},
+                )
+
+        if allocated_indices:
+            for idx in reversed(allocated_indices):
+                self.resource_waiters.pop(idx)
+
+    def _interrupt_operation(self, station_id: str, time_ns: int) -> None:
+        active_op = self.active_operations.get(station_id)
+        if not active_op:
+            return
+
+        st = self.stations[station_id]
+        unit_id = active_op["unit_id"]
+        op = list(st.operations.values())[active_op["op_index"]]
+        policy = op.interruption_policy
+
+        # Cancel current token
+        active_op["token"] = -1
+
+        if st.busy_start_ns is not None:
+            st.total_busy_time_ns += time_ns - st.busy_start_ns
+            st.busy_start_ns = None
+
+        if policy == "resume":
+            elapsed = time_ns - active_op["start_time_ns"]
+            active_op["remaining_duration_ns"] = max(0, active_op["remaining_duration_ns"] - elapsed)
+            rem_dur = active_op["remaining_duration_ns"]
+            st.interrupted_count += 1
+            st.resumed_count += 1
+            st.is_busy = False
+            st.start_waiting(time_ns)
+            self._release_resources(station_id, time_ns)
+            self.resource_waiters.append({
+                "station_id": station_id,
+                "unit_id": unit_id,
+                "op_index": active_op["op_index"],
+                "waiting_since_ns": time_ns,
+                "remaining_duration_ns": rem_dur,
+            })
+        elif policy == "restart":
+            st.interrupted_count += 1
+            st.restarted_count += 1
+            st.is_busy = False
+            st.start_waiting(time_ns)
+            self._release_resources(station_id, time_ns)
+            self.resource_waiters.append({
+                "station_id": station_id,
+                "unit_id": unit_id,
+                "op_index": active_op["op_index"],
+                "waiting_since_ns": time_ns,
+                "remaining_duration_ns": op.duration_ns,
+            })
+        elif policy == "scrap":
+            st.interrupted_count += 1
+            st.scrapped_count += 1
+            st.is_busy = False
+            st.current_unit_id = None
+            u = self.units[unit_id]
+            u.quality_state = "scrapped"
+            u.record_transition(time_ns, ProductionUnitState.TERMINAL, location="terminal")
+            self._release_resources(station_id, time_ns)
+            self._try_pull_upstream(self.kernel, station_id)
+
+    def _handle_shift_start(self, k: EventKernel, event: ScheduledEvent) -> None:
+        worker_id = event.payload.get("worker_id")
+        machine_id = event.payload.get("machine_id")
+        if worker_id and worker_id in self.workers:
+            self.workers[worker_id].update_metrics(k.current_time_ns)
+        if machine_id and machine_id in self.machines:
+            self.machines[machine_id].update_metrics(k.current_time_ns)
+        self._try_allocate_pending_resources(k.current_time_ns)
+
+    def _handle_shift_end(self, k: EventKernel, event: ScheduledEvent) -> None:
+        worker_id = event.payload.get("worker_id")
+        machine_id = event.payload.get("machine_id")
+        handover_rule = event.payload.get("handover_rule", "handover")
+
+        if worker_id and worker_id in self.workers:
+            w = self.workers[worker_id]
+            w.update_metrics(k.current_time_ns)
+
+            active_stations = [
+                s_id for s_id, a_op in list(self.active_operations.items())
+                if any(alloc["worker_id"] == worker_id for alloc in a_op["workers"])
+            ]
+
+            for s_id in active_stations:
+                if handover_rule == "run_off":
+                    w.pending_off_shift = True
+                elif handover_rule == "handover":
+                    active_op = self.active_operations[s_id]
+                    op = list(self.stations[s_id].operations.values())[active_op["op_index"]]
+
+                    incoming_worker = None
+                    for other_w in self.workers.values():
+                        if other_w.id != worker_id and other_w.is_available(k.current_time_ns) and other_w.available_capacity(k.current_time_ns) > 0:
+                            if any(q in other_w.qualifications for q in w.qualifications):
+                                incoming_worker = other_w
+                                break
+
+                    if incoming_worker is not None:
+                        w.release(s_id, active_op["unit_id"], op.id, k.current_time_ns)
+                        incoming_worker.allocate(s_id, active_op["unit_id"], op.id, k.current_time_ns)
+                        for alloc in active_op["workers"]:
+                            if alloc["worker_id"] == worker_id:
+                                alloc["worker_id"] = incoming_worker.id
+                    else:
+                        self._interrupt_operation(s_id, k.current_time_ns)
+                else:  # interrupt
+                    self._interrupt_operation(s_id, k.current_time_ns)
+
+        if machine_id and machine_id in self.machines:
+            mach = self.machines[machine_id]
+            mach.update_metrics(k.current_time_ns)
+            active_stations = [
+                s_id for s_id, a_op in list(self.active_operations.items())
+                if machine_id in a_op["machines"]
+            ]
+            for s_id in active_stations:
+                self._interrupt_operation(s_id, k.current_time_ns)
+
+        self._try_allocate_pending_resources(k.current_time_ns)
+
+    def _handle_break_start(self, k: EventKernel, event: ScheduledEvent) -> None:
+        worker_id = event.payload.get("worker_id")
+        machine_id = event.payload.get("machine_id")
+
+        if worker_id and worker_id in self.workers:
+            self.workers[worker_id].update_metrics(k.current_time_ns)
+            active_stations = [
+                s_id for s_id, a_op in list(self.active_operations.items())
+                if any(alloc["worker_id"] == worker_id for alloc in a_op["workers"])
+            ]
+            for s_id in active_stations:
+                self._interrupt_operation(s_id, k.current_time_ns)
+
+        if machine_id and machine_id in self.machines:
+            self.machines[machine_id].update_metrics(k.current_time_ns)
+            active_stations = [
+                s_id for s_id, a_op in list(self.active_operations.items())
+                if machine_id in a_op["machines"]
+            ]
+            for s_id in active_stations:
+                self._interrupt_operation(s_id, k.current_time_ns)
+
+    def _handle_break_end(self, k: EventKernel, event: ScheduledEvent) -> None:
+        worker_id = event.payload.get("worker_id")
+        machine_id = event.payload.get("machine_id")
+        if worker_id and worker_id in self.workers:
+            self.workers[worker_id].update_metrics(k.current_time_ns)
+        if machine_id and machine_id in self.machines:
+            self.machines[machine_id].update_metrics(k.current_time_ns)
+        self._try_allocate_pending_resources(k.current_time_ns)
+
     def _handle_station_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
         st = self.stations[node_id]
         assert st.can_accept(), f"Station {node_id} accepted unit {unit_id} while busy/blocked"
+        st.current_unit_id = unit_id
         op = list(st.operations.values())[0]
-        st.start_operation(unit_id, op.id, k.current_time_ns)
         self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_STATION,
@@ -524,12 +919,35 @@ class EpisodeEngine:
             station_id=node_id,
             operation_id=op.id,
         )
-        k.schedule(
-            time_ns=k.current_time_ns + op.duration_ns,
-            priority=EventPriority.COMPLETION,
-            event_type="COMPLETE_OPERATION",
-            payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0},
-        )
+
+        can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, node_id, k.current_time_ns)
+        if can_acq:
+            token = self._acquire_resources(
+                station_id=node_id,
+                unit_id=unit_id,
+                op=op,
+                op_index=0,
+                remaining_duration_ns=op.duration_ns,
+                mach_ids=mach_ids,
+                worker_allocs=worker_allocs,
+                time_ns=k.current_time_ns,
+            )
+            st.start_operation(unit_id, op.id, k.current_time_ns)
+            k.schedule(
+                time_ns=k.current_time_ns + op.duration_ns,
+                priority=EventPriority.COMPLETION,
+                event_type="COMPLETE_OPERATION",
+                payload={"unit_id": unit_id, "station_id": node_id, "op_index": 0, "token": token},
+            )
+        else:
+            st.start_waiting(k.current_time_ns)
+            self.resource_waiters.append({
+                "station_id": node_id,
+                "unit_id": unit_id,
+                "op_index": 0,
+                "waiting_since_ns": k.current_time_ns,
+                "remaining_duration_ns": op.duration_ns,
+            })
 
     def _handle_arrival_at_node(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
@@ -547,16 +965,24 @@ class EpisodeEngine:
         unit_id = event.payload["unit_id"]
         station_id = event.payload["station_id"]
         op_index = event.payload.get("op_index", 0)
+        expected_token = event.payload.get("token")
+
+        active_op = self.active_operations.get(station_id)
+        if expected_token is not None:
+            if not active_op or active_op.get("token") != expected_token:
+                return
+
         st = self.stations[station_id]
         ops_list = list(st.operations.values())
         current_op = ops_list[op_index]
 
+        self._release_resources(station_id, k.current_time_ns)
         st.complete_operation(current_op.id, k.current_time_ns)
 
         # If station has multiple operations and more remain for this unit:
         if op_index + 1 < len(ops_list):
+            st.current_unit_id = unit_id
             next_op = ops_list[op_index + 1]
-            st.start_operation(unit_id, next_op.id, k.current_time_ns)
             self.units[unit_id].record_transition(
                 time_ns=k.current_time_ns,
                 state=ProductionUnitState.IN_STATION,
@@ -564,12 +990,35 @@ class EpisodeEngine:
                 station_id=station_id,
                 operation_id=next_op.id,
             )
-            k.schedule(
-                time_ns=k.current_time_ns + next_op.duration_ns,
-                priority=EventPriority.COMPLETION,
-                event_type="COMPLETE_OPERATION",
-                payload={"unit_id": unit_id, "station_id": station_id, "op_index": op_index + 1},
-            )
+            can_acq, mach_ids, worker_allocs = self._can_acquire_resources(next_op, station_id, k.current_time_ns)
+            if can_acq:
+                token = self._acquire_resources(
+                    station_id=station_id,
+                    unit_id=unit_id,
+                    op=next_op,
+                    op_index=op_index + 1,
+                    remaining_duration_ns=next_op.duration_ns,
+                    mach_ids=mach_ids,
+                    worker_allocs=worker_allocs,
+                    time_ns=k.current_time_ns,
+                )
+                st.start_operation(unit_id, next_op.id, k.current_time_ns)
+                k.schedule(
+                    time_ns=k.current_time_ns + next_op.duration_ns,
+                    priority=EventPriority.COMPLETION,
+                    event_type="COMPLETE_OPERATION",
+                    payload={"unit_id": unit_id, "station_id": station_id, "op_index": op_index + 1, "token": token},
+                )
+            else:
+                st.start_waiting(k.current_time_ns)
+                self.resource_waiters.append({
+                    "station_id": station_id,
+                    "unit_id": unit_id,
+                    "op_index": op_index + 1,
+                    "waiting_since_ns": k.current_time_ns,
+                    "remaining_duration_ns": next_op.duration_ns,
+                })
+            self._try_allocate_pending_resources(k.current_time_ns)
             return
 
         # Last operation completed for this unit:
@@ -577,10 +1026,12 @@ class EpisodeEngine:
         downstream_can_accept = route is not None and self._can_accept(route.target_node_id)
 
         if downstream_can_accept and route is not None:
+            st.current_unit_id = None
             self._dispatch_unit_to_target(k, unit_id, route)
             self._try_pull_upstream(k, station_id)
         else:
             if st.has_output_space():
+                st.current_unit_id = None
                 st.enqueue_output_unit(unit_id)
                 self.units[unit_id].record_transition(
                     time_ns=k.current_time_ns,
@@ -597,6 +1048,8 @@ class EpisodeEngine:
                     location=station_id,
                     station_id=station_id,
                 )
+
+        self._try_allocate_pending_resources(k.current_time_ns)
 
     def _is_terminal_condition_met(self, k: EventKernel) -> bool:
         if self.cfg.episode.end_condition.type == "all_units_terminal":
@@ -629,7 +1082,13 @@ class EpisodeEngine:
                 stations[n.id] = Station(
                     id=n.id,
                     operations={
-                        op.id: Operation(id=op.id, duration_ns=op.duration_ns)
+                        op.id: Operation(
+                            id=op.id,
+                            duration_ns=op.duration_ns,
+                            required_machines=list(op.required_machines),
+                            required_workers=[req.model_dump() for req in op.required_workers],
+                            interruption_policy=op.interruption_policy,
+                        )
                         for op in n.operations
                     },
                     output_capacity=n.output_capacity,
@@ -663,6 +1122,140 @@ class EpisodeEngine:
                 payload={"unit_id": u_cfg.id, "source_id": source_id},
             )
 
+        machines: dict[str, Machine] = {}
+        for m_cfg in cfg.machines:
+            machines[m_cfg.id] = Machine(
+                id=m_cfg.id,
+                capacity=m_cfg.capacity,
+                shifts=[
+                    Shift(
+                        id=s.id,
+                        start_time_ns=s.start_time_ns,
+                        end_time_ns=s.end_time_ns,
+                        handover_rule=s.handover_rule,
+                        breaks=[Break(b.start_time_ns, b.end_time_ns, b.duration_ns) for b in s.breaks],
+                    )
+                    for s in m_cfg.shifts
+                ],
+                breaks=[
+                    Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
+                    for b in m_cfg.breaks
+                ],
+            )
+            for s in m_cfg.shifts:
+                if s.start_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=s.start_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SHIFT_START",
+                        payload={"machine_id": m_cfg.id, "shift_id": s.id},
+                    )
+                if s.end_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=s.end_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SHIFT_END",
+                        payload={"machine_id": m_cfg.id, "shift_id": s.id, "handover_rule": s.handover_rule},
+                    )
+                for b in s.breaks:
+                    if b.start_time_ns >= cfg.episode.start_time_ns:
+                        kernel.schedule(
+                            time_ns=b.start_time_ns,
+                            priority=EventPriority.RESOURCE,
+                            event_type="BREAK_START",
+                            payload={"machine_id": m_cfg.id},
+                        )
+                    if b.end_time_ns >= cfg.episode.start_time_ns:
+                        kernel.schedule(
+                            time_ns=b.end_time_ns,
+                            priority=EventPriority.RESOURCE,
+                            event_type="BREAK_END",
+                            payload={"machine_id": m_cfg.id},
+                        )
+            for b in m_cfg.breaks:
+                if b.start_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=b.start_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="BREAK_START",
+                        payload={"machine_id": m_cfg.id},
+                    )
+                if b.end_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=b.end_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="BREAK_END",
+                        payload={"machine_id": m_cfg.id},
+                    )
+
+        workers: dict[str, Worker] = {}
+        for w_cfg in cfg.workers:
+            workers[w_cfg.id] = Worker(
+                id=w_cfg.id,
+                kind=w_cfg.kind,
+                capacity=w_cfg.capacity,
+                qualifications=list(w_cfg.qualifications),
+                shifts=[
+                    Shift(
+                        id=s.id,
+                        start_time_ns=s.start_time_ns,
+                        end_time_ns=s.end_time_ns,
+                        handover_rule=s.handover_rule,
+                        breaks=[Break(b.start_time_ns, b.end_time_ns, b.duration_ns) for b in s.breaks],
+                    )
+                    for s in w_cfg.shifts
+                ],
+                breaks=[
+                    Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
+                    for b in w_cfg.breaks
+                ],
+            )
+            for s in w_cfg.shifts:
+                if s.start_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=s.start_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SHIFT_START",
+                        payload={"worker_id": w_cfg.id, "shift_id": s.id},
+                    )
+                if s.end_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=s.end_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SHIFT_END",
+                        payload={"worker_id": w_cfg.id, "shift_id": s.id, "handover_rule": s.handover_rule},
+                    )
+                for b in s.breaks:
+                    if b.start_time_ns >= cfg.episode.start_time_ns:
+                        kernel.schedule(
+                            time_ns=b.start_time_ns,
+                            priority=EventPriority.RESOURCE,
+                            event_type="BREAK_START",
+                            payload={"worker_id": w_cfg.id},
+                        )
+                    if b.end_time_ns >= cfg.episode.start_time_ns:
+                        kernel.schedule(
+                            time_ns=b.end_time_ns,
+                            priority=EventPriority.RESOURCE,
+                            event_type="BREAK_END",
+                            payload={"worker_id": w_cfg.id},
+                        )
+            for b in w_cfg.breaks:
+                if b.start_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=b.start_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="BREAK_START",
+                        payload={"worker_id": w_cfg.id},
+                    )
+                if b.end_time_ns >= cfg.episode.start_time_ns:
+                    kernel.schedule(
+                        time_ns=b.end_time_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="BREAK_END",
+                        payload={"worker_id": w_cfg.id},
+                    )
+
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
             units=units,
@@ -670,6 +1263,8 @@ class EpisodeEngine:
             buffers=buffers,
             in_flight_to=in_flight_to,
             source_pending_units=source_pending_units,
+            machines=machines,
+            workers=workers,
         )
 
         return cls(
@@ -748,7 +1343,13 @@ class EpisodeEngine:
             st = Station(
                 id=st_id,
                 operations={
-                    op.id: Operation(id=op.id, duration_ns=op.duration_ns)
+                    op.id: Operation(
+                        id=op.id,
+                        duration_ns=op.duration_ns,
+                        required_machines=list(op.required_machines),
+                        required_workers=[req.model_dump() for req in op.required_workers],
+                        interruption_policy=op.interruption_policy,
+                    )
                     for op in node.operations
                 },
                 output_capacity=node.output_capacity,
@@ -763,6 +1364,58 @@ class EpisodeEngine:
             buf.restore_state(buf_data)
             buffers[buf_id] = buf
 
+        # Restore machines
+        machines: dict[str, Machine] = {}
+        for m_cfg in cfg.machines:
+            mach = Machine(
+                id=m_cfg.id,
+                capacity=m_cfg.capacity,
+                shifts=[
+                    Shift(
+                        id=s.id,
+                        start_time_ns=s.start_time_ns,
+                        end_time_ns=s.end_time_ns,
+                        handover_rule=s.handover_rule,
+                        breaks=[Break(b.start_time_ns, b.end_time_ns, b.duration_ns) for b in s.breaks],
+                    )
+                    for s in m_cfg.shifts
+                ],
+                breaks=[
+                    Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
+                    for b in m_cfg.breaks
+                ],
+            )
+            if m_cfg.id in domain_state.get("machines", {}):
+                mach.restore_state(domain_state["machines"][m_cfg.id])
+            machines[m_cfg.id] = mach
+
+        # Restore workers
+        workers: dict[str, Worker] = {}
+        for w_cfg in cfg.workers:
+            worker = Worker(
+                id=w_cfg.id,
+                kind=w_cfg.kind,
+                capacity=w_cfg.capacity,
+                qualifications=list(w_cfg.qualifications),
+                shifts=[
+                    Shift(
+                        id=s.id,
+                        start_time_ns=s.start_time_ns,
+                        end_time_ns=s.end_time_ns,
+                        handover_rule=s.handover_rule,
+                        breaks=[Break(b.start_time_ns, b.end_time_ns, b.duration_ns) for b in s.breaks],
+                    )
+                    for s in w_cfg.shifts
+                ],
+                breaks=[
+                    Break(b.start_time_ns, b.end_time_ns, b.duration_ns)
+                    for b in w_cfg.breaks
+                ],
+            )
+            if w_cfg.id in domain_state.get("workers", {}):
+                worker.restore_state(domain_state["workers"][w_cfg.id])
+            workers[w_cfg.id] = worker
+
         in_flight_to = {node.id: 0 for node in mf.nodes}
         in_flight_to.update(domain_state.get("in_flight_to", {}))
 
@@ -771,6 +1424,9 @@ class EpisodeEngine:
             for nid in sources
         }
 
+        resource_waiters = list(domain_state.get("resource_waiters", []))
+        active_operations = {k: dict(v) for k, v in domain_state.get("active_operations", {}).items()}
+
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
             units=units,
@@ -778,6 +1434,10 @@ class EpisodeEngine:
             buffers=buffers,
             in_flight_to=in_flight_to,
             source_pending_units=source_pending_units,
+            machines=machines,
+            workers=workers,
+            resource_waiters=resource_waiters,
+            active_operations=active_operations,
         )
 
         return cls(
@@ -804,8 +1464,18 @@ class EpisodeEngine:
                 b.id: BufferSnapshot.from_dict(b.to_snapshot())
                 for b in self.buffers.values()
             },
+            machines={
+                m.id: MachineSnapshot.from_dict(m.to_snapshot())
+                for m in self.machines.values()
+            },
+            workers={
+                w.id: WorkerSnapshot.from_dict(w.to_snapshot())
+                for w in self.workers.values()
+            },
             in_flight_to=dict(self.in_flight_to),
             source_pending_units={k: list(v) for k, v in self.source_pending_units.items()},
+            resource_waiters=list(self.resource_waiters),
+            active_operations={k: dict(v) for k, v in self.active_operations.items()},
         )
 
         return Checkpoint(
@@ -850,6 +1520,16 @@ class EpisodeEngine:
         all_terminal = self._is_terminal_condition_met(self.kernel)
         status = "completed" if all_terminal else "incomplete"
 
+        # Update resource and station metrics to current time
+        for mach in self.machines.values():
+            mach.update_metrics(self.kernel.current_time_ns)
+        for w in self.workers.values():
+            w.update_metrics(self.kernel.current_time_ns)
+        for s in self.stations.values():
+            if s.waiting_since_ns is not None:
+                s.total_waiting_time_ns += self.kernel.current_time_ns - s.waiting_since_ns
+                s.waiting_since_ns = self.kernel.current_time_ns
+
         unit_summaries = [
             ProductionUnitSummary(
                 id=u.id,
@@ -868,6 +1548,11 @@ class EpisodeEngine:
                 operations_completed=s.operations_completed,
                 total_busy_time_ns=s.total_busy_time_ns,
                 total_blocked_time_ns=s.total_blocked_time_ns,
+                total_waiting_time_ns=s.total_waiting_time_ns,
+                interrupted_count=s.interrupted_count,
+                resumed_count=s.resumed_count,
+                restarted_count=s.restarted_count,
+                scrapped_count=s.scrapped_count,
             )
             for s in self.stations.values()
         ]
@@ -881,6 +1566,36 @@ class EpisodeEngine:
             for b in self.buffers.values()
         ]
 
+        machine_summaries = [
+            MachineSummary(
+                id=m.id,
+                capacity=m.capacity,
+                operations_completed=m.operations_completed,
+                total_busy_time_ns=m.total_busy_time_ns,
+                total_idle_time_ns=m.total_idle_time_ns,
+                total_break_time_ns=m.total_break_time_ns,
+                total_off_shift_time_ns=m.total_off_shift_time_ns,
+                utilization=m.utilization,
+            )
+            for m in self.machines.values()
+        ]
+
+        worker_summaries = [
+            WorkerSummary(
+                id=w.id,
+                kind=w.kind,
+                capacity=w.capacity,
+                qualifications=list(w.qualifications),
+                operations_completed=w.operations_completed,
+                total_busy_time_ns=w.total_busy_time_ns,
+                total_idle_time_ns=w.total_idle_time_ns,
+                total_break_time_ns=w.total_break_time_ns,
+                total_off_shift_time_ns=w.total_off_shift_time_ns,
+                utilization=w.utilization,
+            )
+            for w in self.workers.values()
+        ]
+
         result_hash = _compute_result_hash(
             status=status,
             seed=self.cfg.seed,
@@ -889,6 +1604,8 @@ class EpisodeEngine:
             units=unit_summaries,
             stations=station_summaries,
             buffers=buffer_summaries,
+            machines=machine_summaries,
+            workers=worker_summaries,
         )
 
         return EpisodeSummary(
@@ -899,6 +1616,8 @@ class EpisodeEngine:
             production_units=unit_summaries,
             stations=station_summaries,
             buffers=buffer_summaries,
+            machines=machine_summaries,
+            workers=worker_summaries,
             result_hash=result_hash,
         )
 

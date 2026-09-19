@@ -30,12 +30,20 @@ def compute_model_hash(cfg: Any) -> str:
             "material_flow": cfg.material_flow.model_dump(mode="json") if cfg.material_flow else None,
             "stations": [s.model_dump(mode="json") for s in cfg.stations],
         }
+        if getattr(cfg, "machines", None):
+            model_data["machines"] = [m.model_dump(mode="json") for m in cfg.machines]
+        if getattr(cfg, "workers", None):
+            model_data["workers"] = [w.model_dump(mode="json") for w in cfg.workers]
     elif isinstance(cfg, dict):
         model_data = {
             "plant": cfg.get("plant"),
             "material_flow": cfg.get("material_flow"),
             "stations": cfg.get("stations", []),
         }
+        if cfg.get("machines"):
+            model_data["machines"] = cfg.get("machines")
+        if cfg.get("workers"):
+            model_data["workers"] = cfg.get("workers")
     else:
         raise TypeError(f"Expected SimulationConfig or dict, got {type(cfg).__name__}")
     canonical = json.dumps(model_data, sort_keys=True, separators=(",", ":"))
@@ -130,6 +138,11 @@ class StationSnapshot:
     operations_completed: int
     total_busy_time_ns: int
     total_blocked_time_ns: int = 0
+    total_waiting_time_ns: int = 0
+    interrupted_count: int = 0
+    resumed_count: int = 0
+    restarted_count: int = 0
+    scrapped_count: int = 0
     is_busy: bool = False
     is_blocked: bool = False
     current_unit_id: str | None = None
@@ -137,6 +150,7 @@ class StationSnapshot:
     output_buffer: list[str] = field(default_factory=list)
     busy_start_ns: int | None = None
     blocked_start_ns: int | None = None
+    waiting_since_ns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +158,11 @@ class StationSnapshot:
             "operations_completed": self.operations_completed,
             "total_busy_time_ns": self.total_busy_time_ns,
             "total_blocked_time_ns": self.total_blocked_time_ns,
+            "total_waiting_time_ns": self.total_waiting_time_ns,
+            "interrupted_count": self.interrupted_count,
+            "resumed_count": self.resumed_count,
+            "restarted_count": self.restarted_count,
+            "scrapped_count": self.scrapped_count,
             "is_busy": self.is_busy,
             "is_blocked": self.is_blocked,
             "current_unit_id": self.current_unit_id,
@@ -151,6 +170,7 @@ class StationSnapshot:
             "output_buffer": list(self.output_buffer),
             "busy_start_ns": self.busy_start_ns,
             "blocked_start_ns": self.blocked_start_ns,
+            "waiting_since_ns": self.waiting_since_ns,
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -166,6 +186,11 @@ class StationSnapshot:
             operations_completed=int(data["operations_completed"]),
             total_busy_time_ns=int(data["total_busy_time_ns"]),
             total_blocked_time_ns=int(data.get("total_blocked_time_ns", 0)),
+            total_waiting_time_ns=int(data.get("total_waiting_time_ns", 0)),
+            interrupted_count=int(data.get("interrupted_count", 0)),
+            resumed_count=int(data.get("resumed_count", 0)),
+            restarted_count=int(data.get("restarted_count", 0)),
+            scrapped_count=int(data.get("scrapped_count", 0)),
             is_busy=bool(data.get("is_busy", False)),
             is_blocked=bool(data.get("is_blocked", False)),
             current_unit_id=data.get("current_unit_id"),
@@ -173,6 +198,105 @@ class StationSnapshot:
             output_buffer=list(data.get("output_buffer", [])),
             busy_start_ns=data.get("busy_start_ns"),
             blocked_start_ns=data.get("blocked_start_ns"),
+            waiting_since_ns=data.get("waiting_since_ns"),
+        )
+
+
+@dataclass(frozen=True)
+class MachineSnapshot:
+    id: str
+    capacity: int
+    active_allocations: list[dict[str, Any]] = field(default_factory=list)
+    total_busy_time_ns: int = 0
+    total_idle_time_ns: int = 0
+    total_break_time_ns: int = 0
+    total_off_shift_time_ns: int = 0
+    operations_completed: int = 0
+    last_state_change_ns: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "capacity": self.capacity,
+            "active_allocations": list(self.active_allocations),
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "total_break_time_ns": self.total_break_time_ns,
+            "total_off_shift_time_ns": self.total_off_shift_time_ns,
+            "operations_completed": self.operations_completed,
+            "last_state_change_ns": self.last_state_change_ns,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MachineSnapshot:
+        return cls(
+            id=str(data["id"]),
+            capacity=int(data["capacity"]),
+            active_allocations=list(data.get("active_allocations", [])),
+            total_busy_time_ns=int(data.get("total_busy_time_ns", 0)),
+            total_idle_time_ns=int(data.get("total_idle_time_ns", 0)),
+            total_break_time_ns=int(data.get("total_break_time_ns", 0)),
+            total_off_shift_time_ns=int(data.get("total_off_shift_time_ns", 0)),
+            operations_completed=int(data.get("operations_completed", 0)),
+            last_state_change_ns=int(data.get("last_state_change_ns", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class WorkerSnapshot:
+    id: str
+    kind: str
+    capacity: int
+    active_allocations: list[dict[str, Any]] = field(default_factory=list)
+    total_busy_time_ns: int = 0
+    total_idle_time_ns: int = 0
+    total_break_time_ns: int = 0
+    total_off_shift_time_ns: int = 0
+    operations_completed: int = 0
+    last_state_change_ns: int = 0
+    pending_off_shift: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "capacity": self.capacity,
+            "active_allocations": list(self.active_allocations),
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "total_break_time_ns": self.total_break_time_ns,
+            "total_off_shift_time_ns": self.total_off_shift_time_ns,
+            "operations_completed": self.operations_completed,
+            "last_state_change_ns": self.last_state_change_ns,
+            "pending_off_shift": self.pending_off_shift,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkerSnapshot:
+        return cls(
+            id=str(data["id"]),
+            kind=str(data.get("kind", "individual")),
+            capacity=int(data.get("capacity", 1)),
+            active_allocations=list(data.get("active_allocations", [])),
+            total_busy_time_ns=int(data.get("total_busy_time_ns", 0)),
+            total_idle_time_ns=int(data.get("total_idle_time_ns", 0)),
+            total_break_time_ns=int(data.get("total_break_time_ns", 0)),
+            total_off_shift_time_ns=int(data.get("total_off_shift_time_ns", 0)),
+            operations_completed=int(data.get("operations_completed", 0)),
+            last_state_change_ns=int(data.get("last_state_change_ns", 0)),
+            pending_off_shift=bool(data.get("pending_off_shift", False)),
         )
 
 
@@ -213,16 +337,24 @@ class DomainStateSnapshot:
     production_units: dict[str, ProductionUnitSnapshot]
     stations: dict[str, StationSnapshot]
     buffers: dict[str, BufferSnapshot] = field(default_factory=dict)
+    machines: dict[str, MachineSnapshot] = field(default_factory=dict)
+    workers: dict[str, WorkerSnapshot] = field(default_factory=dict)
     in_flight_to: dict[str, int] = field(default_factory=dict)
     source_pending_units: dict[str, list[str]] = field(default_factory=dict)
+    resource_waiters: list[dict[str, Any]] = field(default_factory=list)
+    active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "production_units": {k: v.to_dict() for k, v in self.production_units.items()},
             "stations": {k: v.to_dict() for k, v in self.stations.items()},
             "buffers": {k: v.to_dict() for k, v in self.buffers.items()},
+            "machines": {k: v.to_dict() for k, v in self.machines.items()},
+            "workers": {k: v.to_dict() for k, v in self.workers.items()},
             "in_flight_to": dict(self.in_flight_to),
             "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
+            "resource_waiters": list(self.resource_waiters),
+            "active_operations": dict(self.active_operations),
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -232,10 +364,18 @@ class DomainStateSnapshot:
             return self.stations
         if key == "buffers":
             return self.buffers
+        if key == "machines":
+            return self.machines
+        if key == "workers":
+            return self.workers
         if key == "in_flight_to":
             return self.in_flight_to
         if key == "source_pending_units":
             return self.source_pending_units
+        if key == "resource_waiters":
+            return self.resource_waiters
+        if key == "active_operations":
+            return self.active_operations
         raise KeyError(key)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -259,10 +399,20 @@ class DomainStateSnapshot:
                 k: BufferSnapshot.from_dict(v) if isinstance(v, dict) else v
                 for k, v in data.get("buffers", {}).items()
             },
+            machines={
+                k: MachineSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("machines", {}).items()
+            },
+            workers={
+                k: WorkerSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("workers", {}).items()
+            },
             in_flight_to=dict(data.get("in_flight_to", {})),
             source_pending_units={
                 k: list(v) for k, v in data.get("source_pending_units", {}).items()
             },
+            resource_waiters=list(data.get("resource_waiters", [])),
+            active_operations=dict(data.get("active_operations", {})),
         )
 
 

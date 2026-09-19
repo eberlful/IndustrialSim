@@ -16,7 +16,7 @@ from industrialsim.material_flow import (
 )
 
 
-_DURATION_PATTERN = re.compile(r"^(\d+)\s*(ns|us|µs|ms|s|m|min|h|d)?$")
+_PART_PATTERN = re.compile(r"(\d+)\s*(ns|us|µs|ms|s|m|min|h|d)?")
 
 _TIME_MULTIPLIERS = {
     "ns": 1,
@@ -38,13 +38,22 @@ def parse_duration_ns(value: int | str) -> int:
         return value
     if isinstance(value, str):
         cleaned = value.strip().lower()
-        match = _DURATION_PATTERN.match(cleaned)
-        if not match:
+        if not cleaned:
+            raise ValueError("Invalid duration string: empty string")
+        parts = _PART_PATTERN.findall(cleaned)
+        if not parts:
             raise ValueError(f"Invalid duration string format: '{value}'")
-        num_str, unit = match.groups()
-        num = int(num_str)
-        multiplier = _TIME_MULTIPLIERS.get(unit or "ns", 1)
-        return num * multiplier
+        reconstructed = "".join(f"{num}{unit}" for num, unit in parts)
+        stripped_cleaned = "".join(cleaned.split())
+        if reconstructed != stripped_cleaned:
+            raise ValueError(f"Invalid duration string format: '{value}'")
+
+        total_ns = 0
+        for num_str, unit in parts:
+            num = int(num_str)
+            multiplier = _TIME_MULTIPLIERS.get(unit or "ns", 1)
+            total_ns += num * multiplier
+        return total_ns
     raise TypeError(f"Expected int or str for duration, got {type(value).__name__}")
 
 
@@ -85,11 +94,126 @@ class PlantConfig(StrictBaseModel):
         return self
 
 
+# Shifts, Breaks, and Resources
+class BreakConfig(StrictBaseModel):
+    start_time: int | str
+    end_time: int | str | None = None
+    duration: int | str | None = None
+    start_time_ns: int = 0
+    end_time_ns: int = 0
+    duration_ns: int = 0
+
+    @model_validator(mode="after")
+    def compute_break_times(self) -> BreakConfig:
+        start_ns = parse_duration_ns(self.start_time)
+        object.__setattr__(self, "start_time_ns", start_ns)
+        if self.end_time is not None and self.duration is not None:
+            end_ns = parse_duration_ns(self.end_time)
+            dur_ns = parse_duration_ns(self.duration)
+            if start_ns + dur_ns != end_ns:
+                raise ValueError(
+                    f"Break end_time ({end_ns}ns) does not match start_time + duration ({start_ns + dur_ns}ns)"
+                )
+            object.__setattr__(self, "end_time_ns", end_ns)
+            object.__setattr__(self, "duration_ns", dur_ns)
+        elif self.end_time is not None:
+            end_ns = parse_duration_ns(self.end_time)
+            if end_ns <= start_ns:
+                raise ValueError(f"Break end_time ({end_ns}ns) must be after start_time ({start_ns}ns)")
+            object.__setattr__(self, "end_time_ns", end_ns)
+            object.__setattr__(self, "duration_ns", end_ns - start_ns)
+        elif self.duration is not None:
+            dur_ns = parse_duration_ns(self.duration)
+            if dur_ns <= 0:
+                raise ValueError(f"Break duration must be positive: {dur_ns}")
+            object.__setattr__(self, "end_time_ns", start_ns + dur_ns)
+            object.__setattr__(self, "duration_ns", dur_ns)
+        else:
+            raise ValueError("Break must specify either 'end_time' or 'duration'")
+        return self
+
+
+class ShiftConfig(StrictBaseModel):
+    id: str
+    start_time: int | str
+    end_time: int | str
+    start_time_ns: int = 0
+    end_time_ns: int = 0
+    handover_rule: Literal["handover", "run_off", "interrupt"] = "handover"
+    breaks: list[BreakConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def compute_shift_times(self) -> ShiftConfig:
+        start_ns = parse_duration_ns(self.start_time)
+        end_ns = parse_duration_ns(self.end_time)
+        if end_ns <= start_ns:
+            raise ValueError(f"Shift '{self.id}' end_time ({end_ns}ns) must be after start_time ({start_ns}ns)")
+        object.__setattr__(self, "start_time_ns", start_ns)
+        object.__setattr__(self, "end_time_ns", end_ns)
+
+        for b in self.breaks:
+            if b.start_time_ns < start_ns or b.end_time_ns > end_ns:
+                raise ValueError(
+                    f"Break in shift '{self.id}' ({b.start_time_ns}..{b.end_time_ns}ns) is outside shift window ({start_ns}..{end_ns}ns)"
+                )
+        return self
+
+
+class MachineConfig(StrictBaseModel):
+    id: str
+    name: str | None = None
+    capacity: int = 1
+    shifts: list[ShiftConfig] = Field(default_factory=list)
+    breaks: list[BreakConfig] = Field(default_factory=list)
+
+    @field_validator("capacity")
+    @classmethod
+    def validate_capacity(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"Machine capacity must be >= 1, got {v}")
+        return v
+
+
+class WorkerConfig(StrictBaseModel):
+    id: str
+    name: str | None = None
+    kind: Literal["individual", "pool"] = "individual"
+    capacity: int = 1
+    qualifications: list[str] = Field(default_factory=list)
+    shifts: list[ShiftConfig] = Field(default_factory=list)
+    breaks: list[BreakConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_worker(self) -> WorkerConfig:
+        if self.kind == "individual" and self.capacity != 1:
+            raise ValueError(f"Individual worker '{self.id}' must have capacity == 1, got {self.capacity}")
+        if self.capacity < 1:
+            raise ValueError(f"Worker capacity must be >= 1, got {self.capacity}")
+        return self
+
+
+class WorkerRequirementConfig(StrictBaseModel):
+    qualification: str | None = None
+    worker_id: str | None = None
+    count: int = 1
+
+    @model_validator(mode="after")
+    def validate_worker_requirement(self) -> WorkerRequirementConfig:
+        if self.qualification is None and self.worker_id is None:
+            raise ValueError("Worker requirement must specify at least 'qualification' or 'worker_id'")
+        if self.count < 1:
+            raise ValueError(f"Worker requirement count must be >= 1, got {self.count}")
+        return self
+
+
 # Operations & Stations
 class OperationConfig(StrictBaseModel):
     id: str
     duration: int | str
     duration_ns: int = 0
+    required_machines: list[str] = Field(default_factory=list)
+    required_workers: list[WorkerRequirementConfig] = Field(default_factory=list)
+    interruption_policy: Literal["resume", "restart", "scrap"] = "resume"
 
     @model_validator(mode="after")
     def compute_duration_ns(self) -> OperationConfig:
@@ -292,6 +416,8 @@ class SimulationConfig(StrictBaseModel):
     episode: EpisodeConfig
     plant: PlantConfig | None = None
     material_flow: MaterialFlowConfig | None = None
+    machines: list[MachineConfig] = Field(default_factory=list)
+    workers: list[WorkerConfig] = Field(default_factory=list)
     production_units: list[ProductionUnitConfig] = Field(min_length=1)
     stations: list[StationConfig] = Field(default_factory=list)
 
@@ -300,6 +426,35 @@ class SimulationConfig(StrictBaseModel):
         unit_ids = [u.id for u in self.production_units]
         if len(unit_ids) != len(set(unit_ids)):
             raise ValueError(f"Duplicate production unit IDs found: {unit_ids}")
+
+        # Validate unique machine and worker IDs
+        mach_ids = [m.id for m in self.machines]
+        if len(mach_ids) != len(set(mach_ids)):
+            raise ValueError(f"Duplicate machine IDs found: {mach_ids}")
+        worker_ids = [w.id for w in self.workers]
+        if len(worker_ids) != len(set(worker_ids)):
+            raise ValueError(f"Duplicate worker IDs found: {worker_ids}")
+
+        valid_mach_set = set(mach_ids)
+        valid_worker_set = set(worker_ids)
+        valid_qual_set = {q for w in self.workers for q in w.qualifications}
+
+        all_operations: list[OperationConfig] = []
+        for s_cfg in self.stations:
+            all_operations.extend(s_cfg.operations)
+        if self.material_flow is not None:
+            for node in self.material_flow.nodes:
+                all_operations.extend(node.operations)
+
+        for op in all_operations:
+            for m_id in op.required_machines:
+                if m_id not in valid_mach_set:
+                    raise ValueError(f"Operation '{op.id}' references unknown machine '{m_id}'")
+            for req in op.required_workers:
+                if req.worker_id is not None and req.worker_id not in valid_worker_set:
+                    raise ValueError(f"Operation '{op.id}' references unknown worker '{req.worker_id}'")
+                if req.qualification is not None and req.qualification not in valid_qual_set:
+                    raise ValueError(f"Operation '{op.id}' references unknown qualification '{req.qualification}'")
 
         if self.material_flow is None and not self.stations:
             raise ValueError("Either 'material_flow' or 'stations' must be defined")
