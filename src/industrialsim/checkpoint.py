@@ -512,10 +512,14 @@ def load_checkpoint(path: str | Path) -> Checkpoint:
 def inspect_checkpoint(source: str | Path | dict[str, Any] | Checkpoint) -> CheckpointInspection:
     if isinstance(source, Checkpoint):
         cp = source
-    elif isinstance(source, (str, Path)) and Path(source).is_file():
+    elif isinstance(source, Path):
         cp = load_checkpoint(source)
+    elif isinstance(source, str) and not source.strip().startswith("{"):
+        cp = load_checkpoint(source)
+    elif isinstance(source, (str, dict)):
+        cp = deserialize_checkpoint(source)
     else:
-        cp = deserialize_checkpoint(source)  # type: ignore[arg-type]
+        raise InvalidCheckpointError(f"Unsupported checkpoint inspection source: {type(source).__name__}")
 
     return CheckpointInspection(
         schema_version=cp.schema_version,

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 import pytest
 
 from industrialsim.application import (
@@ -232,3 +233,31 @@ def test_continue_checkpoint_intermediate_and_completion(tmp_path: Path) -> None
     final_summary = continue_checkpoint(cp1)
     assert final_summary.status == "completed"
     assert final_summary.simulated_time_ns == 10_000_000_000
+
+
+def test_observable_interleaved_event_order_equivalence(tmp_path: Path) -> None:
+    # 1. Uninterrupted run
+    uninterrupted_summary = run_episode(BLOCKING_SCENARIO_YAML)
+
+    # 2. Checkpoint mid-run at 6s
+    cp = create_checkpoint(BLOCKING_SCENARIO_YAML, at_time_ns=6_000_000_000)
+    cp_file = tmp_path / "interleaved_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    # 3. Resume from checkpoint
+    resumed_summary = resume_episode(cp_file)
+
+    # 4. Extract interleaved observable event stream across all units
+    def extract_interleaved_events(summary: Any) -> list[tuple[int, str, str, str]]:
+        events = []
+        for u in summary.production_units:
+            for h in u.history:
+                events.append((h["time_ns"], u.id, h["state"], h["location"]))
+        events.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        return events
+
+    uninterrupted_events = extract_interleaved_events(uninterrupted_summary)
+    resumed_events = extract_interleaved_events(resumed_summary)
+
+    assert len(uninterrupted_events) > 0
+    assert resumed_events == uninterrupted_events

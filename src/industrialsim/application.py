@@ -295,6 +295,23 @@ class SimulationDomainState:
     source_pending_units: dict[str, list[str]]
 
 
+def _verify_checkpoint_compatibility(
+    checkpoint: Checkpoint,
+    cfg: SimulationConfig,
+    source_label: str,
+) -> None:
+    model_hash = compute_model_hash(cfg)
+    if model_hash != checkpoint.model_hash:
+        raise IncompatibleCheckpointError(
+            f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but {source_label} model has '{model_hash}'"
+        )
+    config_hash = compute_config_hash(cfg)
+    if config_hash != checkpoint.config_hash:
+        raise IncompatibleCheckpointError(
+            f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but {source_label} config has '{config_hash}'"
+        )
+
+
 class EpisodeEngine:
     def __init__(
         self,
@@ -684,33 +701,15 @@ class EpisodeEngine:
 
         # Resolve and validate configuration: prioritize model hash diagnostic over config hash
         if config is not None:
-            provided_model_hash = compute_model_hash(config)
-            if provided_model_hash != checkpoint.model_hash:
-                raise IncompatibleCheckpointError(
-                    f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but provided model has '{provided_model_hash}'"
-                )
-            provided_config_hash = compute_config_hash(config)
-            if provided_config_hash != checkpoint.config_hash:
-                raise IncompatibleCheckpointError(
-                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but provided config has '{provided_config_hash}'"
-                )
             cfg = config
+            _verify_checkpoint_compatibility(checkpoint, cfg, source_label="provided")
         else:
             if not checkpoint.configuration:
                 raise IncompatibleCheckpointError(
                     "Checkpoint contains no embedded configuration, and no configuration was provided"
                 )
             cfg = SimulationConfig.model_validate(checkpoint.configuration)
-            embedded_model_hash = compute_model_hash(cfg)
-            if embedded_model_hash != checkpoint.model_hash:
-                raise IncompatibleCheckpointError(
-                    f"Model hash mismatch: checkpoint requires '{checkpoint.model_hash}', but embedded model has '{embedded_model_hash}'"
-                )
-            embedded_config_hash = compute_config_hash(cfg)
-            if embedded_config_hash != checkpoint.config_hash:
-                raise IncompatibleCheckpointError(
-                    f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but embedded config has '{embedded_config_hash}'"
-                )
+            _verify_checkpoint_compatibility(checkpoint, cfg, source_label="embedded")
 
         mf: MaterialFlowConfig = (
             cfg.material_flow
@@ -910,8 +909,13 @@ def create_checkpoint(
 ) -> Checkpoint:
     if isinstance(source, EpisodeEngine):
         engine = source
-        if at_time_ns is not None and at_time_ns > engine.kernel.current_time_ns:
-            engine.run(pause_at_ns=at_time_ns)
+        if at_time_ns is not None:
+            if at_time_ns < engine.kernel.current_time_ns:
+                raise ValueError(
+                    f"Cannot create checkpoint at {at_time_ns} ns: engine has already advanced past this time to {engine.kernel.current_time_ns} ns"
+                )
+            if at_time_ns > engine.kernel.current_time_ns:
+                engine.run(pause_at_ns=at_time_ns)
         return engine.create_checkpoint()
 
     if isinstance(source, SimulationConfig):
@@ -923,8 +927,13 @@ def create_checkpoint(
         cfg = validation.config
 
     engine = EpisodeEngine.create(cfg)
-    if at_time_ns is not None and at_time_ns > cfg.episode.start_time_ns:
-        engine.run(pause_at_ns=at_time_ns)
+    if at_time_ns is not None:
+        if at_time_ns < cfg.episode.start_time_ns:
+            raise ValueError(
+                f"Cannot create checkpoint at {at_time_ns} ns: start time is {cfg.episode.start_time_ns} ns"
+            )
+        if at_time_ns > cfg.episode.start_time_ns:
+            engine.run(pause_at_ns=at_time_ns)
     return engine.create_checkpoint()
 
 
@@ -970,23 +979,12 @@ def resume_episode(
     return continue_checkpoint(checkpoint, config_source=config_source)
 
 
-def run_episode(
-    source: str | Path | dict[str, Any],
-    checkpoint_at_ns: int | None = None,
-    checkpoint_path: str | Path | None = None,
-) -> EpisodeSummary:
+def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
     validation = validate_config(source)
     if not validation.is_valid or validation.config is None:
         raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
 
     cfg = validation.config
     engine = EpisodeEngine.create(cfg)
-
-    if checkpoint_at_ns is not None:
-        engine.run(pause_at_ns=checkpoint_at_ns)
-        if checkpoint_path is not None:
-            cp = engine.create_checkpoint()
-            save_checkpoint(cp, checkpoint_path)
-
     return engine.run()
 

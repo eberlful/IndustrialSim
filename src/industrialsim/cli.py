@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 from industrialsim.application import (
     inspect_checkpoint,
@@ -65,6 +65,16 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _execute_cli_action(action: Any) -> int:
+    try:
+        result = action()
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+    except Exception as e:
+        print(json.dumps({"status": "error", "error": str(e)}, indent=2))
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
@@ -75,33 +85,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.is_valid else 1
 
     if args.command == "run":
-        try:
-            summary = run_episode(args.config_path)
-            print(json.dumps(summary.to_dict(), indent=2))
-            return 0
-        except Exception as e:
-            print(json.dumps({"status": "error", "error": str(e)}, indent=2))
-            return 1
+        return _execute_cli_action(lambda: run_episode(args.config_path))
 
     if args.command == "inspect":
-        try:
-            inspection = inspect_checkpoint(args.checkpoint_path)
-            print(json.dumps(inspection.to_dict(), indent=2))
-            return 0
-        except Exception as e:
-            print(json.dumps({"status": "error", "error": str(e)}, indent=2))
-            return 1
+        return _execute_cli_action(lambda: inspect_checkpoint(args.checkpoint_path))
 
     if args.command == "resume":
-        try:
-            summary = resume_episode(args.checkpoint_path, config_source=args.config_path)
-            print(json.dumps(summary.to_dict(), indent=2))
-            return 0
-        except Exception as e:
-            print(json.dumps({"status": "error", "error": str(e)}, indent=2))
-            return 1
+        return _execute_cli_action(lambda: resume_episode(args.checkpoint_path, config_source=args.config_path))
 
-    return 0
+    return 1
 
 
 if __name__ == "__main__":

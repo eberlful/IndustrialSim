@@ -164,3 +164,47 @@ def test_checkpoint_atomic_write_leaves_no_partial_file_on_error(tmp_path: Path,
     temp_files = list((tmp_path / "checkpoints").glob(".*.tmp"))
     assert len(temp_files) == 0
 
+
+def test_checkpoint_inspect_nonexistent_file_raises_error(tmp_path: Path) -> None:
+    nonexistent = tmp_path / "does_not_exist.json"
+    with pytest.raises(InvalidCheckpointError, match="file not found"):
+        inspect_checkpoint(nonexistent)
+
+    with pytest.raises(InvalidCheckpointError, match="file not found"):
+        inspect_checkpoint("also_does_not_exist.json")
+
+
+def test_create_checkpoint_past_time_rejected() -> None:
+    from industrialsim.application import EpisodeEngine, create_checkpoint, validate_config
+
+    cfg_yaml = """
+schema_version: "1.0"
+seed: 42
+episode:
+  start_time: "10s"
+  end_condition:
+    type: "max_time"
+    max_time: "30s"
+stations:
+  - id: station-1
+    operations:
+      - id: op-1
+        duration: "5s"
+production_units:
+  - id: u-1
+    variant: "widget"
+    release_time: "10s"
+"""
+    # Requesting a checkpoint before episode start time (10s)
+    with pytest.raises(ValueError, match=r"start time is 10000000000 ns"):
+        create_checkpoint(cfg_yaml, at_time_ns=5_000_000_000)
+
+    # Running an engine to 20s and requesting checkpoint at 15s
+    validation = validate_config(cfg_yaml)
+    assert validation.config is not None
+    engine = EpisodeEngine.create(validation.config)
+    engine.run(pause_at_ns=20_000_000_000)
+    with pytest.raises(ValueError, match=r"already advanced past this time"):
+        create_checkpoint(engine, at_time_ns=15_000_000_000)
+
+
