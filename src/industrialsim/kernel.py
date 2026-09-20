@@ -57,6 +57,11 @@ class EventKernel:
     def sequence_counter(self) -> int:
         return self._sequence_counter
 
+    def peek_next_time(self) -> int | None:
+        if not self._queue:
+            return None
+        return self._queue[0][0]
+
     def register_handler(self, event_type: str, handler: EventHandler) -> None:
         self._handlers[event_type] = handler
 

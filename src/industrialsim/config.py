@@ -707,7 +707,6 @@ class SimulationConfig(StrictBaseModel):
     process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
     stations: list[StationConfig] = Field(default_factory=list)
     decision_triggers: list[BufferThresholdTriggerConfig] = Field(default_factory=list)
-    max_batches_per_timestamp: int = 10
 
     @model_validator(mode="after")
     def validate_simulation_config(self) -> SimulationConfig:

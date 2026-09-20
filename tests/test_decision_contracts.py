@@ -237,3 +237,48 @@ def test_fifo_buffer_fallback_policy() -> None:
     assert actions[0].new_order == ["u-1", "u-2", "u-3"]
 
 
+def test_validate_decision_unrequested_target_and_immutability() -> None:
+    obs = BufferObservation(
+        schema_version="1.0",
+        buffer_id="buf-1",
+        capacity=5,
+        occupancy=1,
+        occupants=[BufferOccupantSummary(unit_id="u-1", variant="sedan")],
+    )
+    # Test frozen/immutability
+    with pytest.raises(Exception):
+        obs.occupancy = 10  # type: ignore
+
+    req = DecisionRequest(
+        request_id="req-1",
+        time_ns=1000,
+        target_id="buf-1",
+        trigger_id="trig-1",
+        observation=obs,
+    )
+    assert req.schema_version == "1.0"
+    assert req.trigger_id == "trig-1"
+
+    batch = DecisionBatch(
+        batch_id="b-1",
+        episode_id="ep-1",
+        branch_id="counterfactual-1",
+        time_ns=1000,
+        requests=[req],
+    )
+    assert batch.branch_id == "counterfactual-1"
+
+    # Response with an unrequested target (e.g. buf-unrequested)
+    resp = DecisionBatchResponse(
+        batch_id="b-1",
+        provenance=DecisionProvenance(episode_id="ep-1", branch_id="counterfactual-1", batch_id="b-1"),
+        actions=[
+            BufferReorderAction(target_id="buf-1", new_order=["u-1"]),
+            BufferReorderAction(target_id="buf-unrequested", new_order=["u-99"]),
+        ],
+    )
+    valid, diags = validate_decision_batch_response(batch, resp)
+    assert valid is False
+    assert any(d.code == "UNREQUESTED_TARGET" for d in diags)
+
+

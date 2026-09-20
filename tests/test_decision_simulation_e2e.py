@@ -409,3 +409,33 @@ def test_decision_time_invariance_and_rearm() -> None:
     assert len(provider.decision_times) == 1
     # Exactly at 2 seconds (2_000_000_000 ns)
     assert provider.decision_times[0] == 2_000_000_000
+
+
+def test_decision_unrequested_target_triggers_fallback_and_diagnostic() -> None:
+    class UnrequestedTargetProvider(DecisionProvider):
+        def decide(self, batch: DecisionBatch) -> DecisionBatchResponse:
+            return DecisionBatchResponse(
+                batch_id=batch.batch_id,
+                provenance=DecisionProvenance(
+                    episode_id=batch.episode_id,
+                    batch_id=batch.batch_id,
+                    provider_id="unrequested-provider",
+                ),
+                actions=[
+                    BufferReorderAction(target_id="buf-1", new_order=["u-2", "u-1"]),
+                    BufferReorderAction(target_id="buf-fake", new_order=["u-fake"]),
+                ],
+            )
+
+    provider = UnrequestedTargetProvider()
+    summary = run_episode(BASE_DECISION_YAML, decision_provider=provider)
+    assert summary.status == "completed"
+    assert len(summary.decision_batches) == 1
+    assert summary.decision_batches[0]["status"] == "fallback"
+
+    codes = [d["code"] for d in summary.decision_diagnostics]
+    assert "UNREQUESTED_TARGET" in codes
+    # FIFO fallback applied (u-1 finishes before u-2)
+    u1 = next(u for u in summary.production_units if u.id == "u-1")
+    u2 = next(u for u in summary.production_units if u.id == "u-2")
+    assert u1.history[-1]["time_ns"] < u2.history[-1]["time_ns"]

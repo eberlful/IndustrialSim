@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from industrialsim.config import BufferThresholdTriggerConfig
@@ -19,7 +19,7 @@ class DecisionProvenance(BaseModel):
 
 
 class BufferOccupantSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     unit_id: str
     variant: str
@@ -29,7 +29,7 @@ class BufferOccupantSummary(BaseModel):
 
 
 class BufferObservation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: str = "1.0"
     buffer_id: str
@@ -44,7 +44,7 @@ class BufferObservation(BaseModel):
 
 
 class BufferReorderAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     action_type: str = "buffer_reorder"
     target_id: str
@@ -52,21 +52,24 @@ class BufferReorderAction(BaseModel):
 
 
 class DecisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
+    schema_version: str = "1.0"
     request_id: str
     request_type: str = "buffer_threshold"
     time_ns: int
     target_id: str
+    trigger_id: str | None = None
     observation: BufferObservation
     action_schema: str = "buffer_reorder"
 
 
 class DecisionBatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     batch_id: str
     episode_id: str
+    branch_id: str = "main"
     time_ns: int
     requests: list[DecisionRequest] = Field(default_factory=list)
 
@@ -117,6 +120,18 @@ def validate_decision_batch_response(
                 )
             )
         targets_seen.add(action.target_id)
+
+    requested_target_ids = {req.target_id for req in batch.requests}
+    for action in response.actions:
+        if action.target_id not in requested_target_ids:
+            diagnostics.append(
+                DecisionDiagnosticRecord(
+                    code="UNREQUESTED_TARGET",
+                    message=f"Action proposed for target '{action.target_id}' which was not requested in batch '{batch.batch_id}'",
+                    target_id=action.target_id,
+                    batch_id=batch.batch_id,
+                )
+            )
 
     actions_by_target = {action.target_id: action for action in response.actions}
 
@@ -212,10 +227,8 @@ class FifoBufferFallbackPolicy:
 @dataclass
 class BufferTriggerRuntime:
     config: BufferThresholdTriggerConfig
-    max_batches_per_timestamp: int = 10
     is_armed: bool = True
     last_dedup_key: str | None = None
-    triggers_fired_at_timestamp: dict[int, int] = field(default_factory=dict)
 
     def check_transition(
         self,
@@ -255,19 +268,13 @@ class BufferTriggerRuntime:
             return False
 
         # 3. Check deduplication key (cannot loop indefinitely on unchanged state or identical transition)
-        dedup_key = f"{self.config.id}:{buffer_id}:{current_time_ns}:{new_occupancy}"
+        dedup_key = f"{self.config.id}:{buffer_id}:{current_time_ns}:{old_occupancy}->{new_occupancy}"
         if self.last_dedup_key == dedup_key:
             return False
 
-        # 4. Check timestamp batch limit
-        count_at_t = self.triggers_fired_at_timestamp.get(current_time_ns, 0)
-        if count_at_t >= self.max_batches_per_timestamp:
-            return False
-
-        # Arm state and counters update
+        # Arm state update
         self.last_dedup_key = dedup_key
         self.is_armed = False
-        self.triggers_fired_at_timestamp[current_time_ns] = count_at_t + 1
         return True
 
     def to_snapshot(self) -> dict[str, Any]:
@@ -275,15 +282,11 @@ class BufferTriggerRuntime:
             "id": self.config.id,
             "is_armed": self.is_armed,
             "last_dedup_key": self.last_dedup_key,
-            "triggers_fired_at_timestamp": dict(self.triggers_fired_at_timestamp),
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
         self.is_armed = state.get("is_armed", True)
         self.last_dedup_key = state.get("last_dedup_key")
-        self.triggers_fired_at_timestamp = {
-            int(k): v for k, v in state.get("triggers_fired_at_timestamp", {}).items()
-        }
 
 
 @dataclass
@@ -299,16 +302,27 @@ class DecisionBatchCoordinator:
     def has_pending(self) -> bool:
         return len(self.pending_requests) > 0
 
-    def form_batch(self, time_ns: int) -> DecisionBatch | None:
+    def form_batch(
+        self,
+        time_ns: int,
+        observation_builder: Callable[[str], BufferObservation] | None = None,
+    ) -> DecisionBatch | None:
         if not self.pending_requests:
             return None
         self.batch_counter += 1
         batch_id = f"batch-{self.batch_counter:04d}"
+        requests = []
+        for req in self.pending_requests:
+            if observation_builder is not None:
+                obs = observation_builder(req.target_id)
+                req = req.model_copy(update={"observation": obs})
+            requests.append(req)
         batch = DecisionBatch(
             batch_id=batch_id,
             episode_id=self.episode_id,
+            branch_id=self.branch_id,
             time_ns=time_ns,
-            requests=list(self.pending_requests),
+            requests=requests,
         )
         self.pending_requests.clear()
         return batch

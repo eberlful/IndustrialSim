@@ -622,10 +622,7 @@ class EpisodeEngine:
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=f"ep-{self.cfg.seed}")
         self.decision_triggers: dict[str, list[BufferTriggerRuntime]] = {}
         for t in self.cfg.decision_triggers:
-            runtime = BufferTriggerRuntime(
-                config=t,
-                max_batches_per_timestamp=self.cfg.max_batches_per_timestamp,
-            )
+            runtime = BufferTriggerRuntime(config=t)
             self.decision_triggers.setdefault(t.buffer_id, []).append(runtime)
         self.decision_diagnostics: list[dict[str, Any]] = []
         self.decision_batches: list[dict[str, Any]] = []
@@ -833,13 +830,17 @@ class EpisodeEngine:
                     request_type="buffer_threshold",
                     time_ns=time_ns,
                     target_id=buffer_id,
+                    trigger_id=trig.config.id,
                     observation=obs,
                     action_schema="buffer_reorder",
                 )
                 self.decision_coordinator.add_request(req)
 
     def _process_decision_batch(self) -> None:
-        batch = self.decision_coordinator.form_batch(time_ns=self.kernel.current_time_ns)
+        batch = self.decision_coordinator.form_batch(
+            time_ns=self.kernel.current_time_ns,
+            observation_builder=lambda tid: self._build_buffer_observation(tid, self.kernel.current_time_ns),
+        )
         if batch is None:
             return
 
@@ -882,13 +883,24 @@ class EpisodeEngine:
         else:
             self._handle_decision_failure(batch, diagnostics)
 
-    def _apply_decision_actions(
-        self, batch: DecisionBatch, response: DecisionBatchResponse
+    def _commit_buffer_actions(
+        self, batch: DecisionBatch, actions: list[BufferReorderAction]
     ) -> None:
-        for action in response.actions:
+        for action in actions:
             buf = self.buffers.get(action.target_id)
             if buf is not None:
                 buf.occupants = list(action.new_order)
+
+        for req in batch.requests:
+            self._try_pull_upstream(self.kernel, req.target_id)
+            for r in self.routes_from.get(req.target_id, []):
+                self._try_pull_upstream(self.kernel, r.target_node_id)
+        self._try_dispatch_pending_orders(self.kernel)
+
+    def _apply_decision_actions(
+        self, batch: DecisionBatch, response: DecisionBatchResponse
+    ) -> None:
+        self._commit_buffer_actions(batch, response.actions)
 
         self.decision_batches.append(
             {
@@ -900,12 +912,6 @@ class EpisodeEngine:
             }
         )
 
-        for req in batch.requests:
-            self._try_pull_upstream(self.kernel, req.target_id)
-            for r in self.routes_from.get(req.target_id, []):
-                self._try_pull_upstream(self.kernel, r.target_node_id)
-        self._try_dispatch_pending_orders(self.kernel)
-
     def _handle_decision_failure(
         self,
         batch: DecisionBatch,
@@ -915,14 +921,26 @@ class EpisodeEngine:
 
         should_abort = False
         abort_trigger_id = None
+        fallback_policy_name = "fifo"
+
         for req in batch.requests:
-            for trig in self.decision_triggers.get(req.target_id, []):
-                if trig.config.on_failure == "abort":
+            matched_trig = None
+            if req.trigger_id:
+                for trig in self.decision_triggers.get(req.target_id, []):
+                    if trig.config.id == req.trigger_id:
+                        matched_trig = trig
+                        break
+            if matched_trig is None:
+                trigs = self.decision_triggers.get(req.target_id, [])
+                if trigs:
+                    matched_trig = trigs[0]
+
+            if matched_trig is not None:
+                if matched_trig.config.on_failure == "abort":
                     should_abort = True
-                    abort_trigger_id = trig.config.id
+                    abort_trigger_id = matched_trig.config.id
                     break
-            if should_abort:
-                break
+                fallback_policy_name = matched_trig.config.fallback_policy
 
         if should_abort:
             self.is_aborted = True
@@ -940,12 +958,13 @@ class EpisodeEngine:
             )
             return
 
-        fallback_policy = FifoBufferFallbackPolicy()
+        if fallback_policy_name == "fifo":
+            fallback_policy = FifoBufferFallbackPolicy()
+        else:
+            raise ValueError(f"Unsupported fallback policy: '{fallback_policy_name}'")
+
         fallback_actions = fallback_policy.generate_fallback_actions(batch)
-        for action in fallback_actions:
-            buf = self.buffers.get(action.target_id)
-            if buf is not None:
-                buf.occupants = list(action.new_order)
+        self._commit_buffer_actions(batch, fallback_actions)
 
         self.decision_batches.append(
             {
@@ -956,12 +975,6 @@ class EpisodeEngine:
                 "actions": [a.model_dump() for a in fallback_actions],
             }
         )
-
-        for req in batch.requests:
-            self._try_pull_upstream(self.kernel, req.target_id)
-            for r in self.routes_from.get(req.target_id, []):
-                self._try_pull_upstream(self.kernel, r.target_node_id)
-        self._try_dispatch_pending_orders(self.kernel)
 
     def _can_accept(self, node_id: str) -> bool:
         kind = self.nodes_by_id[node_id].kind
@@ -2862,8 +2875,8 @@ class EpisodeEngine:
         while self.kernel.queue_size > 0 and not self.is_aborted:
             if self._is_terminal_condition_met(self.kernel):
                 break
-            next_time = self.kernel._queue[0][0]
-            if max_t is not None and next_time > max_t:
+            next_time = self.kernel.peek_next_time()
+            if next_time is None or (max_t is not None and next_time > max_t):
                 break
 
             self.kernel.step()
@@ -2872,7 +2885,7 @@ class EpisodeEngine:
                 break
 
             has_more_events_at_same_time = (
-                self.kernel.queue_size > 0 and self.kernel._queue[0][0] == self.kernel.current_time_ns
+                self.kernel.peek_next_time() == self.kernel.current_time_ns
             )
             if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
                 self._process_decision_batch()

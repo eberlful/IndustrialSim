@@ -33,7 +33,7 @@ def test_buffer_trigger_rising_threshold_and_rearm_hysteresis() -> None:
     assert runtime.check_transition(buffer_id="buf-1", old_occupancy=1, new_occupancy=2, current_time_ns=6000) is True
 
 
-def test_buffer_trigger_deduplication_and_timestamp_limit() -> None:
+def test_buffer_trigger_deduplication_key_prevents_looping() -> None:
     cfg = BufferThresholdTriggerConfig(
         id="trig-1",
         buffer_id="buf-1",
@@ -41,23 +41,14 @@ def test_buffer_trigger_deduplication_and_timestamp_limit() -> None:
         direction="rising",
         rearm_threshold=0,
     )
-    runtime = BufferTriggerRuntime(config=cfg, max_batches_per_timestamp=2)
+    runtime = BufferTriggerRuntime(config=cfg)
 
     # Fire at t=1000
     assert runtime.check_transition(buffer_id="buf-1", old_occupancy=0, new_occupancy=1, current_time_ns=1000) is True
 
     # Unchanged state or identical transition at same timestamp cannot loop indefinitely
     assert runtime.check_transition(buffer_id="buf-1", old_occupancy=0, new_occupancy=1, current_time_ns=1000) is False
-
-    # Rearm at t=1000
-    runtime.check_transition(buffer_id="buf-1", old_occupancy=1, new_occupancy=0, current_time_ns=1000)
-    # Fire second time at t=1000
-    assert runtime.check_transition(buffer_id="buf-1", old_occupancy=0, new_occupancy=1, current_time_ns=1000) is True
-
-    # Rearm at t=1000
-    runtime.check_transition(buffer_id="buf-1", old_occupancy=1, new_occupancy=0, current_time_ns=1000)
-    # Third time at t=1000 exceeds max_batches_per_timestamp (2)
-    assert runtime.check_transition(buffer_id="buf-1", old_occupancy=0, new_occupancy=1, current_time_ns=1000) is False
+    assert runtime.check_transition(buffer_id="buf-1", old_occupancy=1, new_occupancy=1, current_time_ns=1000) is False
 
 
 def test_batch_coordination_groups_multiple_requests_at_same_timestamp() -> None:
