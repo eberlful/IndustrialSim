@@ -25,7 +25,11 @@ from industrialsim.config import (
     SafePointTriggerConfig,
     SimulationConfig,
     StationConfig,
+    RewardPolicyConfig,
+    HardConstraintsConfig,
+    TelemetryConfig,
 )
+from industrialsim.telemetry import TelemetryManager
 from industrialsim.dispatch import (
     BaselineDispatchPolicy,
     DispatchContext,
@@ -320,6 +324,10 @@ class EpisodeSummary:
     abort_reason: str | None = None
     total_cost: float = 0.0
     total_strategic_cost: float = 0.0
+    raw_metrics: dict[str, Any] = field(default_factory=dict)
+    reward: float | None = None
+    reward_breakdown: dict[str, float] = field(default_factory=dict)
+    hard_constraints: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         res = {
@@ -338,6 +346,10 @@ class EpisodeSummary:
             "decision_diagnostics": list(self.decision_diagnostics),
             "total_cost": self.total_cost,
             "total_strategic_cost": self.total_strategic_cost,
+            "raw_metrics": dict(self.raw_metrics),
+            "reward": self.reward,
+            "reward_breakdown": dict(self.reward_breakdown),
+            "hard_constraints": dict(self.hard_constraints),
             "result_hash": self.result_hash,
         }
         if self.is_aborted:
@@ -657,6 +669,7 @@ class EpisodeEngine:
         dispatch_policy: BaselineDispatchPolicy | None = None,
         decision_provider: DecisionProvider | None = None,
         audit_logger: AuditLogger | None = None,
+        telemetry_manager: TelemetryManager | None = None,
     ) -> None:
         self.cfg = config
         self.kernel = kernel
@@ -668,6 +681,15 @@ class EpisodeEngine:
         self.episode_id = f"ep-{self.cfg.seed}"
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=self.episode_id)
         self.audit_logger = audit_logger or AuditLogger()
+        self.telemetry_manager = (
+            telemetry_manager
+            if telemetry_manager is not None
+            else TelemetryManager(
+                output_dir=None,
+                config=self.cfg.telemetry,
+                episode_id=self.episode_id,
+            )
+        )
         self.total_strategic_cost: float = 0.0
         self.decision_triggers: dict[str, list[Any]] = {}
         for t in self.cfg.decision_triggers:
@@ -701,6 +723,16 @@ class EpisodeEngine:
         self.dispatch_policy = dispatch_policy or BaselineDispatchPolicy()
 
         self._setup_handlers()
+
+    @property
+    def is_telemetry_enabled(self) -> bool:
+        return self.telemetry_manager.is_enabled
+
+    def enable_telemetry(self) -> None:
+        self.telemetry_manager.enable()
+
+    def disable_telemetry(self) -> None:
+        self.telemetry_manager.disable()
 
     def _record_unit_transition(
         self,
@@ -896,6 +928,8 @@ class EpisodeEngine:
         self.kernel.register_handler("SAFE_POINT_TRIGGER", self._handle_safe_point_trigger)
         self.kernel.register_handler("COMPLETE_RECONFIGURATION", self._handle_complete_reconfiguration)
 
+        self.kernel.register_handler("TELEMETRY_INTERVAL", self._handle_telemetry_interval)
+
         for t in self.cfg.decision_triggers:
             if isinstance(t, SafePointTriggerConfig):
                 for time_val in t.times_ns:
@@ -912,6 +946,146 @@ class EpisodeEngine:
                         event_type="SAFE_POINT_TRIGGER",
                         payload={"trigger_id": t.id, "target_id": t.target_id, "interval_ns": t.interval_ns},
                     )
+
+        if (
+            self.cfg.telemetry
+            and self.cfg.telemetry.enabled
+            and self.cfg.telemetry.sample_interval_ns
+            and self.cfg.telemetry.sample_interval_ns > 0
+        ):
+            self.kernel.schedule(
+                time_ns=self.cfg.episode.start_time_ns + self.cfg.telemetry.sample_interval_ns,
+                priority=EventPriority.TELEMETRY,
+                event_type="TELEMETRY_INTERVAL",
+                payload={"interval_ns": self.cfg.telemetry.sample_interval_ns},
+            )
+
+    def _handle_telemetry_interval(self, k: EventKernel, event: ScheduledEvent) -> None:
+        self._sample_telemetry(sample_type="interval")
+        interval_ns = event.payload.get("interval_ns")
+        if interval_ns and interval_ns > 0:
+            next_t = k.current_time_ns + interval_ns
+            max_t = self.cfg.episode.end_condition.max_time_ns
+            if max_t is None or next_t <= max_t:
+                k.schedule(
+                    time_ns=next_t,
+                    priority=EventPriority.TELEMETRY,
+                    event_type="TELEMETRY_INTERVAL",
+                    payload={"interval_ns": interval_ns},
+                )
+
+    def _emit_domain_event(self, event_name: str) -> None:
+        if not self.is_telemetry_enabled or not self.cfg.telemetry:
+            return
+        domain_events = self.cfg.telemetry.domain_events
+        if "all" in domain_events or event_name in domain_events:
+            self._sample_telemetry(sample_type="domain_event", event_name=event_name)
+
+    def _compute_current_metrics(self) -> dict[str, Any]:
+        warm_up_time_ns = self.cfg.episode.warm_up_time_ns or 0
+        good_completed = [
+            u
+            for u in self.units.values()
+            if u.state == ProductionUnitState.TERMINAL
+            and u.location != "scrapped"
+            and u.quality_state != "scrapped"
+            and (not u.history or u.history[-1].time_ns >= warm_up_time_ns)
+            and u.history
+        ]
+        good_output = len(good_completed)
+        scrap = sum(
+            1
+            for u in self.units.values()
+            if u.state == ProductionUnitState.TERMINAL
+            and (u.location == "scrapped" or u.quality_state == "scrapped")
+            and (not u.history or u.history[-1].time_ns >= warm_up_time_ns)
+        )
+        wip = sum(
+            1
+            for u in self.units.values()
+            if u.state not in (ProductionUnitState.CREATED, ProductionUnitState.TERMINAL)
+        )
+        if good_completed:
+            lead_time_ns = int(
+                round(
+                    sum(u.history[-1].time_ns - u.history[0].time_ns for u in good_completed)
+                    / len(good_completed)
+                )
+            )
+            lateness_ns = sum(
+                max(0, u.history[-1].time_ns - u.due_date_ns)
+                for u in good_completed
+                if u.due_date_ns is not None
+            )
+        else:
+            lead_time_ns = 0
+            lateness_ns = 0
+
+        downtime_ns = sum(
+            m.total_failed_time_ns + m.total_maintenance_time_ns for m in self.machines.values()
+        )
+        return {
+            "good_output": good_output,
+            "scrap": scrap,
+            "wip": wip,
+            "lead_time_ns": lead_time_ns,
+            "downtime_ns": downtime_ns,
+            "lateness_ns": lateness_ns,
+            "resource_utilization": {
+                "machines": {m.id: m.utilization for m in self.machines.values()},
+                "workers": {w.id: w.utilization for w in self.workers.values()},
+                "vehicles": {v.id: v.utilization for v in self.vehicles.values()},
+            },
+            "total_strategic_cost": self.total_strategic_cost,
+        }
+
+    def _sample_telemetry(self, sample_type: str = "interval", event_name: str | None = None) -> None:
+        if not self.is_telemetry_enabled:
+            return
+
+        raw_metrics = self._compute_current_metrics()
+        machines_busy = sum(1 for m in self.machines.values() if len(m.active_allocations) > 0)
+        machines_idle = sum(
+            1
+            for m in self.machines.values()
+            if not m.is_failed and not m.is_in_maintenance and len(m.active_allocations) == 0
+        )
+        machines_failed = sum(1 for m in self.machines.values() if m.is_failed)
+        workers_busy = sum(1 for w in self.workers.values() if len(w.active_allocations) > 0)
+        workers_idle = sum(
+            1 for w in self.workers.values() if len(w.active_allocations) == 0
+        )
+        vehicles_busy = sum(
+            1 for v in self.vehicles.values() if v.current_order_id is not None
+        )
+        vehicles_idle = sum(
+            1 for v in self.vehicles.values() if v.current_order_id is None
+        )
+
+        current_reward = None
+        if self.cfg.reward_policy:
+            current_reward, _ = _compute_reward(raw_metrics, self.cfg.reward_policy)
+
+        sample = {
+            "simulated_time_ns": self.kernel.current_time_ns,
+            "sample_type": sample_type,
+            "event_name": event_name,
+            "good_output": raw_metrics["good_output"],
+            "scrap": raw_metrics["scrap"],
+            "wip": raw_metrics["wip"],
+            "lead_time_ns": raw_metrics["lead_time_ns"],
+            "downtime_ns": raw_metrics["downtime_ns"],
+            "lateness_ns": raw_metrics["lateness_ns"],
+            "machines_busy": machines_busy,
+            "machines_idle": machines_idle,
+            "machines_failed": machines_failed,
+            "workers_busy": workers_busy,
+            "workers_idle": workers_idle,
+            "vehicles_busy": vehicles_busy,
+            "vehicles_idle": vehicles_idle,
+            "current_reward": current_reward,
+        }
+        self.telemetry_manager.record_metrics_sample(sample)
 
     def _build_buffer_observation(self, buffer_id: str, time_ns: int) -> BufferObservation:
         buf = self.buffers[buffer_id]
@@ -1358,6 +1532,31 @@ class EpisodeEngine:
             }
         )
 
+        current_reward = None
+        if self.cfg.reward_policy:
+            current_reward, _ = _compute_reward(self._compute_current_metrics(), self.cfg.reward_policy)
+
+        for req in batch.requests:
+            matching_act = next(
+                (a for a in response.actions if getattr(a, "target_id", None) == req.target_id),
+                response.actions[0] if response.actions else None,
+            )
+            self.telemetry_manager.record_training_record(
+                {
+                    "simulated_time_ns": self.kernel.current_time_ns,
+                    "batch_id": batch.batch_id,
+                    "request_id": req.request_id,
+                    "request_type": req.request_type,
+                    "target_id": req.target_id,
+                    "action_type": matching_act.action_type if matching_act else None,
+                    "action_payload_json": json.dumps(matching_act.model_dump()) if matching_act else None,
+                    "provider_id": response.provenance.provider_id,
+                    "reward": current_reward,
+                    "is_terminal": self._is_terminal_condition_met(self.kernel),
+                }
+            )
+        self._emit_domain_event("decision_batch")
+
     def _handle_safe_point_trigger(self, k: EventKernel, event: ScheduledEvent) -> None:
         target_id = event.payload.get("target_id", "")
         trigger_id = event.payload.get("trigger_id", "")
@@ -1506,6 +1705,31 @@ class EpisodeEngine:
                 "actions": [a.model_dump() for a in fallback_actions],
             }
         )
+
+        current_reward = None
+        if self.cfg.reward_policy:
+            current_reward, _ = _compute_reward(self._compute_current_metrics(), self.cfg.reward_policy)
+
+        for req in batch.requests:
+            matching_act = next(
+                (a for a in fallback_actions if getattr(a, "target_id", None) == req.target_id),
+                fallback_actions[0] if fallback_actions else None,
+            )
+            self.telemetry_manager.record_training_record(
+                {
+                    "simulated_time_ns": self.kernel.current_time_ns,
+                    "batch_id": batch.batch_id,
+                    "request_id": req.request_id,
+                    "request_type": req.request_type,
+                    "target_id": req.target_id,
+                    "action_type": matching_act.action_type if matching_act else None,
+                    "action_payload_json": json.dumps(matching_act.model_dump()) if matching_act else None,
+                    "provider_id": f"fallback-{fallback_policy_name}",
+                    "reward": current_reward,
+                    "is_terminal": self._is_terminal_condition_met(self.kernel),
+                }
+            )
+        self._emit_domain_event("decision_batch")
 
     def _can_accept(self, node_id: str) -> bool:
         if any(req.target_id == node_id for req in self.decision_coordinator.pending_requests):
@@ -1879,6 +2103,7 @@ class EpisodeEngine:
             time_ns=k.current_time_ns,
             details={"sink_id": node_id},
         )
+        self._emit_domain_event("sink_arrival")
         self._try_pull_upstream(k, node_id)
 
     def _handle_buffer_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
@@ -2705,6 +2930,7 @@ class EpisodeEngine:
         self._release_resources(station_id, k.current_time_ns, completed=True)
         st.complete_operation(current_op.id, k.current_time_ns)
         self._record_operation_completed(unit_id, station_id, current_op.id, k.current_time_ns)
+        self._emit_domain_event("operation_completed")
 
         was_in_rework = unit.is_in_rework
 
@@ -2877,6 +3103,7 @@ class EpisodeEngine:
         cfg: SimulationConfig,
         decision_provider: DecisionProvider | None = None,
         audit_logger: AuditLogger | None = None,
+        telemetry_manager: TelemetryManager | None = None,
     ) -> EpisodeEngine:
         units: dict[str, ProductionUnit] = {
             u_cfg.id: ProductionUnit(
@@ -3148,6 +3375,7 @@ class EpisodeEngine:
             domain=domain,
             decision_provider=decision_provider,
             audit_logger=audit_logger,
+            telemetry_manager=telemetry_manager,
         )
 
         for m in machines.values():
@@ -3163,6 +3391,7 @@ class EpisodeEngine:
         config: SimulationConfig | None = None,
         decision_provider: DecisionProvider | None = None,
         audit_logger: AuditLogger | None = None,
+        telemetry_manager: TelemetryManager | None = None,
     ) -> EpisodeEngine:
         # Schema and kernel version compatibility checks
         if checkpoint.schema_version != "1.0":
@@ -3381,6 +3610,7 @@ class EpisodeEngine:
             plugin_metadata=checkpoint.plugin_metadata,
             decision_provider=decision_provider,
             audit_logger=audit_logger,
+            telemetry_manager=telemetry_manager,
         )
         if checkpoint.domain_state.get("decision_coordinator"):
             engine.decision_coordinator.restore_state(checkpoint.domain_state.get("decision_coordinator"))
@@ -3464,6 +3694,106 @@ class EpisodeEngine:
             configuration=self.cfg.model_dump(mode="json"),
         )
 
+    def _check_runtime_hard_constraints(self) -> None:
+        if self.is_aborted or not self.cfg.hard_constraints:
+            return
+
+        hc = self.cfg.hard_constraints
+        curr_metrics = self._compute_current_metrics()
+
+        # 1. Scrap check (respecting warm-up exclusion)
+        if hc.max_scrap is not None:
+            actual_scrap = curr_metrics["scrap"]
+            if actual_scrap > hc.max_scrap:
+                self.audit_logger.record(
+                    event_type="hard_constraint_violation",
+                    simulated_time_ns=self.kernel.current_time_ns,
+                    episode_id=self.episode_id,
+                    branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                    details={
+                        "code": "MAX_SCRAP_EXCEEDED",
+                        "max_scrap": hc.max_scrap,
+                        "actual_scrap": actual_scrap,
+                    },
+                )
+                if hc.terminate_on_violation:
+                    self.is_aborted = True
+                    self.abort_reason = (
+                        f"HARD_CONSTRAINT_VIOLATION: max_scrap limit exceeded "
+                        f"({actual_scrap} > {hc.max_scrap})"
+                    )
+                    return
+
+        # 2. Downtime check
+        if hc.max_downtime_ns is not None:
+            actual_downtime = curr_metrics["downtime_ns"]
+            if actual_downtime > hc.max_downtime_ns:
+                self.audit_logger.record(
+                    event_type="hard_constraint_violation",
+                    simulated_time_ns=self.kernel.current_time_ns,
+                    episode_id=self.episode_id,
+                    branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                    details={
+                        "code": "MAX_DOWNTIME_EXCEEDED",
+                        "max_downtime_ns": hc.max_downtime_ns,
+                        "actual_downtime_ns": actual_downtime,
+                    },
+                )
+                if hc.terminate_on_violation:
+                    self.is_aborted = True
+                    self.abort_reason = (
+                        f"HARD_CONSTRAINT_VIOLATION: max_downtime limit exceeded "
+                        f"({actual_downtime} > {hc.max_downtime_ns})"
+                    )
+                    return
+
+        # 3. Lead time check
+        if hc.max_lead_time_ns is not None:
+            actual_lead_time = curr_metrics["lead_time_ns"]
+            if actual_lead_time > hc.max_lead_time_ns:
+                self.audit_logger.record(
+                    event_type="hard_constraint_violation",
+                    simulated_time_ns=self.kernel.current_time_ns,
+                    episode_id=self.episode_id,
+                    branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                    details={
+                        "code": "MAX_LEAD_TIME_EXCEEDED",
+                        "max_lead_time_ns": hc.max_lead_time_ns,
+                        "actual_lead_time_ns": actual_lead_time,
+                    },
+                )
+                if hc.terminate_on_violation:
+                    self.is_aborted = True
+                    self.abort_reason = (
+                        f"HARD_CONSTRAINT_VIOLATION: max_lead_time limit exceeded "
+                        f"({actual_lead_time} > {hc.max_lead_time_ns})"
+                    )
+                    return
+
+        # 4. Buffer capacity check
+        if hc.enforce_buffer_capacity:
+            for b in self.buffers.values():
+                if len(b.occupants) > b.capacity:
+                    self.audit_logger.record(
+                        event_type="hard_constraint_violation",
+                        simulated_time_ns=self.kernel.current_time_ns,
+                        episode_id=self.episode_id,
+                        branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                        details={
+                            "code": "BUFFER_CAPACITY_VIOLATION",
+                            "buffer_id": b.id,
+                            "capacity": b.capacity,
+                            "occupancy": len(b.occupants),
+                        },
+                    )
+                    if hc.terminate_on_violation:
+                        self.is_aborted = True
+                        self.abort_reason = (
+                            f"HARD_CONSTRAINT_VIOLATION: buffer capacity exceeded on {b.id} "
+                            f"({len(b.occupants)} > {b.capacity})"
+                        )
+                        return
+
     def run(
         self,
         pause_at_ns: int | None = None,
@@ -3476,6 +3806,7 @@ class EpisodeEngine:
             else:
                 max_t = min(max_t, self.cfg.episode.end_condition.max_time_ns)
 
+        self._check_runtime_hard_constraints()
         while self.kernel.queue_size > 0 and not self.is_aborted:
             if self._is_terminal_condition_met(self.kernel):
                 break
@@ -3487,6 +3818,7 @@ class EpisodeEngine:
                 if pause_at_decision_batch:
                     return self.to_summary()
                 self._process_decision_batch()
+                self._check_runtime_hard_constraints()
                 if self.is_aborted:
                     break
 
@@ -3495,6 +3827,7 @@ class EpisodeEngine:
                 break
 
             self.kernel.step()
+            self._check_runtime_hard_constraints()
 
             if self.is_aborted:
                 break
@@ -3506,6 +3839,7 @@ class EpisodeEngine:
                 if pause_at_decision_batch:
                     return self.to_summary()
                 self._process_decision_batch()
+                self._check_runtime_hard_constraints()
                 if self.is_aborted:
                     break
 
@@ -3521,19 +3855,24 @@ class EpisodeEngine:
                 if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                     self.kernel.advance_to(pause_at_ns)
 
+        summary = self.to_summary()
         if not pause_at_decision_batch:
+            if self.is_telemetry_enabled:
+                self._sample_telemetry(sample_type="terminal", event_name="episode_end")
             self.audit_logger.record(
                 event_type="reward",
                 simulated_time_ns=self.kernel.current_time_ns,
                 episode_id=self.episode_id,
                 branch_id=getattr(self.decision_coordinator, "branch_id", None),
                 details={
+                    "reward": summary.reward,
+                    "reward_breakdown": summary.reward_breakdown,
                     "total_strategic_cost": self.total_strategic_cost,
                     "events_processed": self.kernel.events_processed,
                 },
             )
 
-        return self.to_summary()
+        return summary
 
     def to_summary(self) -> EpisodeSummary:
         all_terminal = self._is_terminal_condition_met(self.kernel)
@@ -3682,7 +4021,7 @@ class EpisodeEngine:
             decision_diagnostics=self.decision_diagnostics,
         )
 
-        return EpisodeSummary(
+        summary_obj = EpisodeSummary(
             status=status,
             seed=self.cfg.seed,
             simulated_time_ns=self.kernel.current_time_ns,
@@ -3702,6 +4041,16 @@ class EpisodeEngine:
             total_strategic_cost=self.total_strategic_cost,
             result_hash=result_hash,
         )
+        raw_metrics = _compute_raw_metrics(summary_obj, warm_up_time_ns=self.cfg.episode.warm_up_time_ns)
+        reward, reward_breakdown = _compute_reward(raw_metrics, self.cfg.reward_policy)
+        hard_constraints = _compute_hard_constraints(
+            summary_obj, self.cfg.hard_constraints, raw_metrics=raw_metrics
+        )
+        object.__setattr__(summary_obj, "raw_metrics", raw_metrics)
+        object.__setattr__(summary_obj, "reward", reward)
+        object.__setattr__(summary_obj, "reward_breakdown", reward_breakdown)
+        object.__setattr__(summary_obj, "hard_constraints", hard_constraints)
+        return summary_obj
 
 
 def create_checkpoint(
@@ -3812,6 +4161,7 @@ def run_episode(
         cfg,
         decision_provider=decision_provider,
         audit_logger=audit_logger,
+        telemetry_manager=writer.telemetry_manager if writer is not None else None,
     )
     summary = engine.run()
 
@@ -3928,19 +4278,28 @@ def _derive_branch_id(
     return f"branch-{digest}"
 
 
-def _compute_raw_metrics(summary: EpisodeSummary) -> dict[str, Any]:
-    # Good output: completed units at sink with quality_state != 'scrapped'
-    good_output = sum(
-        1
+def _compute_raw_metrics(summary: EpisodeSummary, warm_up_time_ns: int = 0) -> dict[str, Any]:
+    # Good output: completed units at sink with quality_state != 'scrapped' and terminal >= warm_up_time_ns
+    good_completed_units = [
+        u
         for u in summary.production_units
-        if u.state == "terminal" and u.location != "scrapped" and u.quality_state != "scrapped"
-    )
-    # Scrap: units in terminal state marked as scrapped
-    scrap = sum(
-        1
+        if u.state == "terminal"
+        and u.location != "scrapped"
+        and u.quality_state != "scrapped"
+        and (not u.history or u.history[-1]["time_ns"] >= warm_up_time_ns)
+    ]
+    good_output = len(good_completed_units)
+
+    # Scrap: units in terminal state marked as scrapped with terminal transition >= warm_up_time_ns
+    scrap_units = [
+        u
         for u in summary.production_units
-        if u.state == "terminal" and (u.location == "scrapped" or u.quality_state == "scrapped")
-    )
+        if u.state == "terminal"
+        and (u.location == "scrapped" or u.quality_state == "scrapped")
+        and (not u.history or u.history[-1]["time_ns"] >= warm_up_time_ns)
+    ]
+    scrap = len(scrap_units)
+
     # WIP: units released but not terminal
     wip = sum(
         1
@@ -3948,15 +4307,11 @@ def _compute_raw_metrics(summary: EpisodeSummary) -> dict[str, Any]:
         if u.state not in ("created", "terminal")
     )
     # Good completed units for lead time and lateness (exclude scrapped units!)
-    good_completed_units = [
-        u
-        for u in summary.production_units
-        if u.state == "terminal" and u.location != "scrapped" and u.quality_state != "scrapped" and u.history
-    ]
     if good_completed_units:
         total_lead_time_ns = sum(
             u.history[-1]["time_ns"] - u.history[0]["time_ns"]
             for u in good_completed_units
+            if u.history
         )
         lead_time_ns = int(round(total_lead_time_ns / len(good_completed_units)))
     else:
@@ -3972,7 +4327,7 @@ def _compute_raw_metrics(summary: EpisodeSummary) -> dict[str, Any]:
     lateness_ns = sum(
         max(0, u.history[-1]["time_ns"] - u.due_date_ns)
         for u in good_completed_units
-        if u.due_date_ns is not None
+        if u.due_date_ns is not None and u.history
     )
 
     # Resource utilization
@@ -3994,7 +4349,45 @@ def _compute_raw_metrics(summary: EpisodeSummary) -> dict[str, Any]:
     }
 
 
-def _compute_hard_constraints(summary: EpisodeSummary) -> dict[str, Any]:
+def _compute_reward(
+    raw_metrics: dict[str, Any], policy: RewardPolicyConfig | None
+) -> tuple[float | None, dict[str, float]]:
+    if policy is None or not policy.components:
+        return None, {}
+    breakdown: dict[str, float] = {}
+    total = 0.0
+    for comp in policy.components:
+        val = raw_metrics.get(comp.name)
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            flat_vals: list[float] = []
+            for sub in val.values():
+                if isinstance(sub, dict):
+                    flat_vals.extend(float(x) for x in sub.values())
+                elif isinstance(sub, (int, float)):
+                    flat_vals.append(float(sub))
+            val = sum(flat_vals) / len(flat_vals) if flat_vals else 0.0
+        num_val = float(val)
+        scale = comp.scale if comp.scale != 0 else 1.0
+        if comp.target is not None:
+            norm_val = -abs(num_val - comp.target) / scale
+        else:
+            norm_val = (num_val - comp.offset) / scale
+            if comp.direction == "minimize":
+                norm_val = -norm_val
+        c_reward = comp.weight * norm_val
+        breakdown[comp.name] = c_reward
+        total += c_reward
+    return total, breakdown
+
+
+
+def _compute_hard_constraints(
+    summary: EpisodeSummary,
+    config: HardConstraintsConfig | None = None,
+    raw_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     violations: list[dict[str, Any]] = []
     if summary.is_aborted:
         violations.append(
@@ -4013,6 +4406,39 @@ def _compute_hard_constraints(summary: EpisodeSummary) -> dict[str, Any]:
                     "peak_occupancy": b.peak_occupancy,
                 }
             )
+
+    metrics = raw_metrics or summary.raw_metrics
+    if config is not None:
+        if config.max_scrap is not None:
+            actual_scrap = metrics.get("scrap", 0)
+            if actual_scrap > config.max_scrap:
+                violations.append(
+                    {
+                        "code": "MAX_SCRAP_EXCEEDED",
+                        "max_scrap": config.max_scrap,
+                        "actual_scrap": actual_scrap,
+                    }
+                )
+        if config.max_downtime_ns is not None:
+            actual_downtime = metrics.get("downtime_ns", 0)
+            if actual_downtime > config.max_downtime_ns:
+                violations.append(
+                    {
+                        "code": "MAX_DOWNTIME_EXCEEDED",
+                        "max_downtime_ns": config.max_downtime_ns,
+                        "actual_downtime_ns": actual_downtime,
+                    }
+                )
+        if config.max_lead_time_ns is not None:
+            actual_lead_time = metrics.get("lead_time_ns", 0)
+            if actual_lead_time > config.max_lead_time_ns:
+                violations.append(
+                    {
+                        "code": "MAX_LEAD_TIME_EXCEEDED",
+                        "max_lead_time_ns": config.max_lead_time_ns,
+                        "actual_lead_time_ns": actual_lead_time,
+                    }
+                )
 
     satisfied = (len(violations) == 0) and not summary.is_aborted
     return {
@@ -4124,7 +4550,12 @@ def branch_checkpoint(
             branch_audit_logger = branch_writer.audit_logger
 
         # Restore isolated engine for this branch
-        engine = EpisodeEngine.restore(cp, config=cfg, audit_logger=branch_audit_logger)
+        engine = EpisodeEngine.restore(
+            cp,
+            config=cfg,
+            audit_logger=branch_audit_logger,
+            telemetry_manager=branch_writer.telemetry_manager if branch_writer is not None else None,
+        )
         engine.decision_coordinator.branch_id = branch_id
         engine.random_occurrence_counters = dict(cp.random_occurrence_counters)
         engine.random_stream = SemanticRandomStream(

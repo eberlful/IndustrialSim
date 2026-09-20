@@ -644,11 +644,14 @@ class EndConditionConfig(StrictBaseModel):
 class EpisodeConfig(StrictBaseModel):
     start_time: int | str = 0
     start_time_ns: int = 0
+    warm_up_time: int | str = 0
+    warm_up_time_ns: int = 0
     end_condition: EndConditionConfig
 
     @model_validator(mode="after")
     def compute_start_time_ns(self) -> EpisodeConfig:
         object.__setattr__(self, "start_time_ns", parse_duration_ns(self.start_time))
+        object.__setattr__(self, "warm_up_time_ns", parse_duration_ns(self.warm_up_time))
         return self
 
 
@@ -756,6 +759,64 @@ DecisionTriggerConfig = Annotated[
 ]
 
 
+class RewardComponentConfig(StrictBaseModel):
+    name: str
+    weight: float = 1.0
+    scale: float = 1.0
+    offset: float = 0.0
+    target: float | None = None
+    direction: Literal["maximize", "minimize"] = "maximize"
+
+
+class RewardPolicyConfig(StrictBaseModel):
+    id: str = "default"
+    components: list[RewardComponentConfig] = Field(default_factory=list)
+    weights: dict[str, float] = Field(default_factory=dict)
+    scales: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _resolve_components(self) -> RewardPolicyConfig:
+        existing_names = {c.name for c in self.components}
+        new_comps = list(self.components)
+        for name, w in self.weights.items():
+            if name not in existing_names:
+                s = self.scales.get(name, 1.0)
+                new_comps.append(RewardComponentConfig(name=name, weight=w, scale=s))
+        object.__setattr__(self, "components", new_comps)
+        all_weights = {c.name: c.weight for c in self.components}
+        object.__setattr__(self, "weights", all_weights)
+        return self
+
+
+class HardConstraintsConfig(StrictBaseModel):
+    terminate_on_violation: bool = True
+    max_scrap: int | None = None
+    max_downtime_ns: int | None = None
+    max_lead_time_ns: int | None = None
+    enforce_buffer_capacity: bool = True
+
+
+class BackpressureConfig(StrictBaseModel):
+    policy: Literal["thin", "drop_newest", "drop_oldest"] = "thin"
+    max_queue_size: int = 100
+    thin_factor: int = 2
+
+
+class TelemetryConfig(StrictBaseModel):
+    enabled: bool = True
+    sample_interval: int | str | None = None
+    sample_interval_ns: int | None = None
+    domain_events: list[str] = Field(default_factory=list)
+    batch_size: int = 100
+    backpressure: BackpressureConfig = Field(default_factory=BackpressureConfig)
+
+    @model_validator(mode="after")
+    def compute_sample_interval_ns(self) -> TelemetryConfig:
+        if self.sample_interval is not None and self.sample_interval_ns is None:
+            object.__setattr__(self, "sample_interval_ns", parse_duration_ns(self.sample_interval))
+        return self
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
@@ -770,6 +831,9 @@ class SimulationConfig(StrictBaseModel):
     production_plan: list[ProductionPlanEntryConfig] = Field(default_factory=list)
     process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
     stations: list[StationConfig] = Field(default_factory=list)
+    reward_policy: RewardPolicyConfig | None = None
+    hard_constraints: HardConstraintsConfig | None = None
+    telemetry: TelemetryConfig | None = None
     decision_triggers: list[DecisionTriggerConfig] = Field(default_factory=list)
 
     @field_validator("decision_triggers", mode="before")

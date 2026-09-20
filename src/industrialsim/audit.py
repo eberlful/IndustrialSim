@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from industrialsim.config import SimulationConfig
 from industrialsim.checkpoint import compute_config_hash, compute_model_hash
+from industrialsim.telemetry import TelemetryManager
 
 
 class RunArtifactExistsError(FileExistsError):
@@ -104,7 +105,7 @@ def collect_runtime_metadata() -> dict[str, Any]:
 
 def collect_library_metadata() -> dict[str, str]:
     libs: dict[str, str] = {}
-    for pkg in ("pydantic", "ruamel-yaml", "pytest"):
+    for pkg in ("pydantic", "ruamel-yaml", "pytest", "pyarrow"):
         try:
             libs[pkg] = importlib.metadata.version(pkg)
         except Exception:
@@ -148,6 +149,11 @@ class RunArtifactWriter:
         self._check_for_existing_completed_run()
         self._initialize_run_dir()
         self.audit_logger = AuditLogger(self.audit_path)
+        self.telemetry_manager = TelemetryManager(
+            output_dir=self.output_dir,
+            config=self.config.telemetry,
+            episode_id=self.episode_id,
+        )
 
     def _check_for_existing_completed_run(self) -> None:
         if self.manifest_path.exists():
@@ -202,8 +208,9 @@ class RunArtifactWriter:
         # Write summary
         self.summary_path.write_text(json.dumps(summary_dict, indent=2), encoding="utf-8")
 
-        # Close audit logger
+        # Close audit logger and telemetry manager
         self.audit_logger.close()
+        self.telemetry_manager.close()
 
         # Update manifest
         manifest_data: dict[str, Any] = {}
@@ -215,6 +222,15 @@ class RunArtifactWriter:
         manifest_data["events_recorded"] = len(self.audit_logger.records)
         manifest_data["result_hash"] = summary_dict.get("result_hash")
         manifest_data["simulated_time_ns"] = summary_dict.get("simulated_time_ns")
+        manifest_data["telemetry_fragments"] = (
+            self.telemetry_manager.metrics_fragment_paths
+            + self.telemetry_manager.training_fragment_paths
+        )
+        manifest_data["telemetry_record_count"] = (
+            self.telemetry_manager.metrics_records_written
+            + self.telemetry_manager.training_records_written
+        )
+        manifest_data["thinned_samples_count"] = self.telemetry_manager.thinned_samples_count
 
         self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
@@ -268,6 +284,12 @@ class RunInspection:
     branch_id: str | None = None
     summary: dict[str, Any] | None = None
     branches: list[str] = field(default_factory=list)
+    telemetry_fragments: list[str] = field(default_factory=list)
+    telemetry_record_count: int = 0
+    thinned_samples_count: int = 0
+    raw_metrics: dict[str, Any] | None = None
+    reward: float | None = None
+    hard_constraints: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -297,6 +319,12 @@ class RunInspection:
             "plugin_metadata": self.plugin_metadata,
             "summary": self.summary,
             "branches": self.branches,
+            "telemetry_fragments": self.telemetry_fragments,
+            "telemetry_record_count": self.telemetry_record_count,
+            "thinned_samples_count": self.thinned_samples_count,
+            "raw_metrics": self.raw_metrics,
+            "reward": self.reward,
+            "hard_constraints": self.hard_constraints,
         }
 
 
@@ -366,6 +394,13 @@ def inspect_run(path: str | Path) -> RunInspection:
     if simulated_time_ns is None:
         simulated_time_ns = 0
 
+    raw_metrics = summary_data.get("raw_metrics") if summary_data else None
+    reward = summary_data.get("reward") if summary_data else None
+    hard_constraints = summary_data.get("hard_constraints") if summary_data else None
+    telemetry_fragments = list(manifest_data.get("telemetry_fragments", []))
+    telemetry_record_count = int(manifest_data.get("telemetry_record_count", 0))
+    thinned_samples_count = int(manifest_data.get("thinned_samples_count", 0))
+
     return RunInspection(
         run_id=manifest_data.get("run_id", run_dir.name),
         status=status,
@@ -393,6 +428,12 @@ def inspect_run(path: str | Path) -> RunInspection:
         branch_id=manifest_data.get("branch_id"),
         summary=summary_data,
         branches=branches,
+        telemetry_fragments=telemetry_fragments,
+        telemetry_record_count=telemetry_record_count,
+        thinned_samples_count=thinned_samples_count,
+        raw_metrics=raw_metrics,
+        reward=reward,
+        hard_constraints=hard_constraints,
     )
 
 
