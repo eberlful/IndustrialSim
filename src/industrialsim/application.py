@@ -11,11 +11,16 @@ from pydantic import ValidationError
 from ruamel.yaml import YAML
 
 from industrialsim.config import (
+    BufferThresholdTriggerConfig,
+    DispatchDecisionTriggerConfig,
+    MachineDecisionTriggerConfig,
     MaterialFlowConfig,
     NodeConfig,
     PortConfig,
     ProcessPlanConfig,
     RouteConfig,
+    RoutingDecisionTriggerConfig,
+    SafePointTriggerConfig,
     SimulationConfig,
     StationConfig,
 )
@@ -41,17 +46,37 @@ from industrialsim.domain import (
     Worker,
 )
 from industrialsim.decisions import (
+    BaselineFallbackPolicy,
     BufferObservation,
     BufferOccupantSummary,
     BufferReorderAction,
     BufferTriggerRuntime,
+    DecisionAction,
     DecisionBatch,
     DecisionBatchCoordinator,
     DecisionBatchResponse,
     DecisionDiagnosticRecord,
     DecisionProvider,
     DecisionRequest,
+    DispatchAction,
+    DispatchObservation,
+    DispatchTriggerRuntime,
     FifoBufferFallbackPolicy,
+    MachineModeAction,
+    MachineObservation,
+    MachineTriggerRuntime,
+    MaintenanceAction,
+    QualityControlAction,
+    QualityControlBounds,
+    ReconfigurationAction,
+    RouteSummaryObservation,
+    RoutingAction,
+    RoutingObservation,
+    RoutingTriggerRuntime,
+    SafePointTriggerRuntime,
+    StrategicObservation,
+    VehicleSummaryObservation,
+    WorkerReassignmentAction,
     validate_decision_batch_response,
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
@@ -277,6 +302,8 @@ class EpisodeSummary:
     decision_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     is_aborted: bool = False
     abort_reason: str | None = None
+    total_cost: float = 0.0
+    total_strategic_cost: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         res = {
@@ -293,6 +320,8 @@ class EpisodeSummary:
             "transport_orders": [t.to_dict() for t in self.transport_orders],
             "decision_batches": list(self.decision_batches),
             "decision_diagnostics": list(self.decision_diagnostics),
+            "total_cost": self.total_cost,
+            "total_strategic_cost": self.total_strategic_cost,
             "result_hash": self.result_hash,
         }
         if self.is_aborted:
@@ -620,10 +649,24 @@ class EpisodeEngine:
         self.plugin_metadata = plugin_metadata or {}
         self.decision_provider = decision_provider
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=f"ep-{self.cfg.seed}")
-        self.decision_triggers: dict[str, list[BufferTriggerRuntime]] = {}
+        self.total_strategic_cost: float = 0.0
+        self.decision_triggers: dict[str, list[Any]] = {}
         for t in self.cfg.decision_triggers:
-            runtime = BufferTriggerRuntime(config=t)
-            self.decision_triggers.setdefault(t.buffer_id, []).append(runtime)
+            if isinstance(t, BufferThresholdTriggerConfig):
+                runtime = BufferTriggerRuntime(config=t)
+                self.decision_triggers.setdefault(t.buffer_id, []).append(runtime)
+            elif isinstance(t, MachineDecisionTriggerConfig):
+                m_runtime = MachineTriggerRuntime(config=t)
+                self.decision_triggers.setdefault(t.machine_id, []).append(m_runtime)
+            elif isinstance(t, SafePointTriggerConfig):
+                s_runtime = SafePointTriggerRuntime(config=t)
+                self.decision_triggers.setdefault(t.target_id, []).append(s_runtime)
+            elif isinstance(t, RoutingDecisionTriggerConfig):
+                r_runtime = RoutingTriggerRuntime(config=t)
+                self.decision_triggers.setdefault(t.node_id, []).append(r_runtime)
+            elif isinstance(t, DispatchDecisionTriggerConfig):
+                d_runtime = DispatchTriggerRuntime(config=t)
+                self.decision_triggers.setdefault("dispatch", []).append(d_runtime)
         self.decision_diagnostics: list[dict[str, Any]] = []
         self.decision_batches: list[dict[str, Any]] = []
         self.is_aborted: bool = False
@@ -746,6 +789,25 @@ class EpisodeEngine:
         self.kernel.register_handler("COMPLETE_REPAIR", self._handle_complete_repair)
         self.kernel.register_handler("MAINTENANCE_TRIGGER", self._handle_maintenance_trigger)
         self.kernel.register_handler("COMPLETE_MAINTENANCE", self._handle_complete_maintenance)
+        self.kernel.register_handler("SAFE_POINT_TRIGGER", self._handle_safe_point_trigger)
+        self.kernel.register_handler("COMPLETE_RECONFIGURATION", self._handle_complete_reconfiguration)
+
+        for t in self.cfg.decision_triggers:
+            if isinstance(t, SafePointTriggerConfig):
+                for time_val in t.times_ns:
+                    self.kernel.schedule(
+                        time_ns=time_val,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SAFE_POINT_TRIGGER",
+                        payload={"trigger_id": t.id, "target_id": t.target_id},
+                    )
+                if t.interval_ns and t.interval_ns > 0:
+                    self.kernel.schedule(
+                        time_ns=t.interval_ns,
+                        priority=EventPriority.RESOURCE,
+                        event_type="SAFE_POINT_TRIGGER",
+                        payload={"trigger_id": t.id, "target_id": t.target_id, "interval_ns": t.interval_ns},
+                    )
 
     def _build_buffer_observation(self, buffer_id: str, time_ns: int) -> BufferObservation:
         buf = self.buffers[buffer_id]
@@ -836,10 +898,177 @@ class EpisodeEngine:
                 )
                 self.decision_coordinator.add_request(req)
 
+    def _build_machine_observation(self, machine_id: str, time_ns: int) -> MachineObservation:
+        mach = self.machines[machine_id]
+        policy_summary = dict(mach.maintenance_policy) if mach.maintenance_policy else {}
+        return MachineObservation(
+            schema_version="1.0",
+            machine_id=machine_id,
+            health=mach.health,
+            operating_mode=mach.operating_mode,
+            available_modes=["nominal", "eco", "boost", "maintenance"],
+            is_in_maintenance=mach.is_in_maintenance,
+            is_failed=mach.is_failed,
+            physical_state={"health": mach.health},
+            maintenance_policy_summary=policy_summary,
+            aggregate_metrics={
+                "simulation_time_ns": time_ns,
+                "operations_completed": mach.operations_completed,
+                "total_busy_time_ns": mach.total_busy_time_ns,
+                "total_maintenance_time_ns": mach.total_maintenance_time_ns,
+                "failure_count": mach.failure_count,
+            },
+        )
+
+    def _build_strategic_observation(self, target_id: str, time_ns: int) -> StrategicObservation:
+        bounds: QualityControlBounds | None = None
+        for t in self.cfg.decision_triggers:
+            if isinstance(t, SafePointTriggerConfig) and t.target_id == target_id:
+                if t.quality_bounds is not None:
+                    bounds = QualityControlBounds(
+                        min_inspection_intensity=t.quality_bounds.min_inspection_intensity,
+                        max_inspection_intensity=t.quality_bounds.max_inspection_intensity,
+                        min_sampling_rate=t.quality_bounds.min_sampling_rate,
+                        max_sampling_rate=t.quality_bounds.max_sampling_rate,
+                        min_release_threshold=t.quality_bounds.min_release_threshold,
+                        max_release_threshold=t.quality_bounds.max_release_threshold,
+                    )
+        avail_workers = [
+            w.id for w in self.workers.values() if w.is_available(time_ns)
+        ]
+        is_safe = True
+        if target_id in self.stations:
+            st = self.stations[target_id]
+            if st.is_busy:
+                is_safe = False
+        return StrategicObservation(
+            schema_version="1.0",
+            target_id=target_id,
+            is_safe_point=is_safe,
+            allowed_actions=["reconfiguration", "worker_reassignment", "quality_control"],
+            current_configuration={},
+            quality_control_bounds=bounds,
+            available_workers=avail_workers,
+            aggregate_metrics={"simulation_time_ns": time_ns},
+        )
+
+    def _build_route_summary(self, route: RouteConfig) -> RouteSummaryObservation:
+        cur_occ = self.active_route_occupancy.get(route.id, 0) + self.reserved_route_occupancy.get(route.id, 0)
+        is_adm = self._can_accept(route.target_node_id)
+        if route.capacity is not None and cur_occ >= route.capacity:
+            is_adm = False
+        return RouteSummaryObservation(
+            route_id=route.id,
+            source_node_id=route.source_node_id,
+            target_node_id=route.target_node_id,
+            capacity=route.capacity,
+            current_occupancy=cur_occ,
+            transit_time_ns=route.transit_time_ns,
+            is_admissible=is_adm,
+        )
+
+    def _build_routing_observation(
+        self, node_id: str, time_ns: int, unit_id: str | None = None
+    ) -> RoutingObservation:
+        target_unit_id = unit_id
+        if target_unit_id is None:
+            if node_id in self.buffers and self.buffers[node_id].occupants:
+                target_unit_id = self.buffers[node_id].occupants[0]
+            elif node_id in self.source_pending_units and self.source_pending_units[node_id]:
+                target_unit_id = self.source_pending_units[node_id][0]
+
+        unit = self.units.get(target_unit_id) if target_unit_id else None
+        variant = unit.variant if unit else "standard"
+        due_date_ns = unit.due_date_ns if unit else None
+        findings_count = len(unit.findings) if unit else 0
+
+        c_routes = [self._build_route_summary(r) for r in self.routes_from.get(node_id, [])]
+
+        return RoutingObservation(
+            schema_version="1.0",
+            unit_id=target_unit_id or "",
+            variant=variant,
+            current_node_id=node_id,
+            due_date_ns=due_date_ns,
+            findings_count=findings_count,
+            candidate_routes=c_routes,
+            aggregate_metrics={"simulation_time_ns": time_ns},
+        )
+
+    def _build_dispatch_observation(
+        self, time_ns: int, order_id: str | None = None
+    ) -> DispatchObservation:
+        target_order_id = order_id
+        if target_order_id is None and self.pending_transport_orders:
+            target_order_id = self.pending_transport_orders[0]
+
+        order = self.transport_orders.get(target_order_id) if target_order_id else None
+        unit_id = order.unit_id if order else ""
+        unit = self.units.get(unit_id)
+        variant = unit.variant if unit else "standard"
+        source_node_id = order.source_node_id if order else ""
+        target_node_id = order.target_node_id if order else ""
+        created_time_ns = order.created_time_ns if order else time_ns
+        due_date_ns = unit.due_date_ns if unit else None
+        findings_count = len(unit.findings) if unit else 0
+
+        c_routes = [self._build_route_summary(r) for r in self.routes_from.get(source_node_id, [])]
+
+        avail_vehs: list[VehicleSummaryObservation] = []
+        for v in self.vehicles.values():
+            if v.is_available():
+                dist = self._compute_node_distance(v.location, source_node_id) or 0
+                avail_vehs.append(
+                    VehicleSummaryObservation(
+                        vehicle_id=v.id,
+                        location=v.location,
+                        distance_to_pickup_ns=dist,
+                        speed_multiplier=v.speed_multiplier,
+                    )
+                )
+
+        return DispatchObservation(
+            schema_version="1.0",
+            order_id=target_order_id or "",
+            unit_id=unit_id,
+            variant=variant,
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            created_time_ns=created_time_ns,
+            due_date_ns=due_date_ns,
+            findings_count=findings_count,
+            candidate_routes=c_routes,
+            available_vehicles=avail_vehs,
+            aggregate_metrics={"simulation_time_ns": time_ns},
+        )
+
+    def _build_observation_for_request(self, req_or_target: Any, time_ns: int) -> Any:
+        if isinstance(req_or_target, DecisionRequest):
+            req_type = req_or_target.request_type
+            target_id = req_or_target.target_id
+        else:
+            req_type = "buffer_threshold"
+            target_id = str(req_or_target)
+
+        if req_type == "buffer_threshold" or target_id in self.buffers:
+            return self._build_buffer_observation(target_id, time_ns)
+        elif req_type == "machine" or target_id in self.machines:
+            return self._build_machine_observation(target_id, time_ns)
+        elif req_type == "strategic":
+            return self._build_strategic_observation(target_id, time_ns)
+        elif req_type == "routing":
+            return self._build_routing_observation(target_id, time_ns)
+        elif req_type == "dispatch":
+            return self._build_dispatch_observation(time_ns)
+        else:
+            if target_id in self.buffers:
+                return self._build_buffer_observation(target_id, time_ns)
+            return self._build_strategic_observation(target_id, time_ns)
+
     def _process_decision_batch(self) -> None:
         batch = self.decision_coordinator.form_batch(
             time_ns=self.kernel.current_time_ns,
-            observation_builder=lambda tid: self._build_buffer_observation(tid, self.kernel.current_time_ns),
+            observation_builder=lambda req: self._build_observation_for_request(req, self.kernel.current_time_ns),
         )
         if batch is None:
             return
@@ -883,24 +1112,70 @@ class EpisodeEngine:
         else:
             self._handle_decision_failure(batch, diagnostics)
 
-    def _commit_buffer_actions(
-        self, batch: DecisionBatch, actions: list[BufferReorderAction]
+    def _apply_actions_list(
+        self, batch: DecisionBatch, actions: Sequence[DecisionAction]
     ) -> None:
         for action in actions:
-            buf = self.buffers.get(action.target_id)
-            if buf is not None:
-                buf.occupants = list(action.new_order)
+            if isinstance(action, BufferReorderAction):
+                buf = self.buffers.get(action.target_id)
+                if buf is not None:
+                    buf.occupants = list(action.new_order)
+                self._try_pull_upstream(self.kernel, action.target_id)
+                for r in self.routes_from.get(action.target_id, []):
+                    self._try_pull_upstream(self.kernel, r.target_node_id)
+            elif isinstance(action, MachineModeAction):
+                mach = self.machines.get(action.target_id)
+                if mach is not None:
+                    mach.operating_mode = action.mode
+            elif isinstance(action, MaintenanceAction):
+                if action.trigger_maintenance:
+                    mach = self.machines.get(action.target_id)
+                    if mach is not None:
+                        self._trigger_maintenance(self.kernel, mach)
+            elif isinstance(action, ReconfigurationAction):
+                if action.cost > 0:
+                    self.total_strategic_cost += action.cost
+                st = self.stations.get(action.target_id)
+                if st is not None and action.duration_ns > 0:
+                    st.start_reconfiguration(action.configuration, self.kernel.current_time_ns)
+                    self.kernel.schedule(
+                        time_ns=self.kernel.current_time_ns + action.duration_ns,
+                        priority=EventPriority.COMPLETION,
+                        event_type="COMPLETE_RECONFIGURATION",
+                        payload={"station_id": action.target_id},
+                    )
+            elif isinstance(action, WorkerReassignmentAction):
+                if action.cost > 0:
+                    self.total_strategic_cost += action.cost
+            elif isinstance(action, QualityControlAction):
+                if action.cost > 0:
+                    self.total_strategic_cost += action.cost
+                st = self.stations.get(action.target_id)
+                if st is not None:
+                    for op in st.operations.values():
+                        if op.inspection is not None:
+                            if action.inspection_intensity is not None:
+                                op.inspection["sensitivity"] = action.inspection_intensity
+                            if action.sampling_rate is not None:
+                                op.inspection["sampling_rate"] = action.sampling_rate
+                            if action.release_threshold is not None:
+                                op.inspection["release_threshold"] = action.release_threshold
+            elif isinstance(action, RoutingAction):
+                pass
+            elif isinstance(action, DispatchAction):
+                pass
 
         for req in batch.requests:
-            self._try_pull_upstream(self.kernel, req.target_id)
-            for r in self.routes_from.get(req.target_id, []):
-                self._try_pull_upstream(self.kernel, r.target_node_id)
+            if req.target_id in self.buffers:
+                self._try_pull_upstream(self.kernel, req.target_id)
+                for r in self.routes_from.get(req.target_id, []):
+                    self._try_pull_upstream(self.kernel, r.target_node_id)
         self._try_dispatch_pending_orders(self.kernel)
 
     def _apply_decision_actions(
         self, batch: DecisionBatch, response: DecisionBatchResponse
     ) -> None:
-        self._commit_buffer_actions(batch, response.actions)
+        self._apply_actions_list(batch, response.actions)
 
         self.decision_batches.append(
             {
@@ -911,6 +1186,44 @@ class EpisodeEngine:
                 "actions": [a.model_dump() for a in response.actions],
             }
         )
+
+    def _handle_safe_point_trigger(self, k: EventKernel, event: ScheduledEvent) -> None:
+        target_id = event.payload.get("target_id", "")
+        trigger_id = event.payload.get("trigger_id", "")
+        interval_ns = event.payload.get("interval_ns")
+        st = self.stations.get(target_id)
+        is_safe = True
+        if st is not None and st.is_busy:
+            is_safe = False
+        obs = self._build_strategic_observation(target_id, k.current_time_ns)
+        req = DecisionRequest(
+            request_id=f"req-strat-{target_id}-{k.current_time_ns}",
+            request_type="strategic",
+            time_ns=k.current_time_ns,
+            target_id=target_id,
+            trigger_id=trigger_id,
+            observation=obs,
+            action_schema="strategic",
+            is_safe_point=is_safe,
+        )
+        self.decision_coordinator.add_request(req)
+        if interval_ns and interval_ns > 0:
+            k.schedule(
+                time_ns=k.current_time_ns + interval_ns,
+                priority=EventPriority.RESOURCE,
+                event_type="SAFE_POINT_TRIGGER",
+                payload={"trigger_id": trigger_id, "target_id": target_id, "interval_ns": interval_ns},
+            )
+
+    def _handle_complete_reconfiguration(self, k: EventKernel, event: ScheduledEvent) -> None:
+        station_id = event.payload.get("station_id", "")
+        st = self.stations.get(station_id)
+        if st is not None:
+            st.complete_reconfiguration(k.current_time_ns)
+            self._try_pull_upstream(k, station_id)
+            for r in self.routes_from.get(station_id, []):
+                self._try_pull_upstream(k, r.target_node_id)
+            self._try_dispatch_pending_orders(k)
 
     def _handle_decision_failure(
         self,
@@ -958,13 +1271,13 @@ class EpisodeEngine:
             )
             return
 
-        if fallback_policy_name == "fifo":
-            fallback_policy = FifoBufferFallbackPolicy()
+        if fallback_policy_name in ("fifo", "baseline"):
+            fallback_policy = BaselineFallbackPolicy()
         else:
             raise ValueError(f"Unsupported fallback policy: '{fallback_policy_name}'")
 
         fallback_actions = fallback_policy.generate_fallback_actions(batch)
-        self._commit_buffer_actions(batch, fallback_actions)
+        self._apply_actions_list(batch, fallback_actions)
 
         self.decision_batches.append(
             {
@@ -977,6 +1290,8 @@ class EpisodeEngine:
         )
 
     def _can_accept(self, node_id: str) -> bool:
+        if any(req.target_id == node_id for req in self.decision_coordinator.pending_requests):
+            return False
         kind = self.nodes_by_id[node_id].kind
         if kind == "sink":
             return True
@@ -1108,6 +1423,18 @@ class EpisodeEngine:
             return
 
         dispatched_order_ids: list[str] = []
+
+        self.pending_transport_orders.sort(
+            key=lambda oid: (
+                self.transport_orders[oid].created_time_ns,
+                (
+                    (0, self.units[self.transport_orders[oid].unit_id].due_date_ns)
+                    if self.units[self.transport_orders[oid].unit_id].due_date_ns is not None
+                    else (1, 0)
+                ),
+                oid,
+            )
+        )
 
         for order_id in list(self.pending_transport_orders):
             order = self.transport_orders[order_id]
@@ -3067,6 +3394,8 @@ class EpisodeEngine:
             decision_diagnostics=list(self.decision_diagnostics),
             is_aborted=self.is_aborted,
             abort_reason=self.abort_reason,
+            total_cost=self.total_strategic_cost,
+            total_strategic_cost=self.total_strategic_cost,
             result_hash=result_hash,
         )
 

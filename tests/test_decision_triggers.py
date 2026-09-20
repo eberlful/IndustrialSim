@@ -84,3 +84,59 @@ def test_batch_coordination_groups_multiple_requests_at_same_timestamp() -> None
     # Once formed, coordinator clears pending requests for that batch
     assert coord.has_pending() is False
 
+
+def test_machine_trigger_runtime_hysteresis_and_dedup() -> None:
+    from industrialsim.config import MachineDecisionTriggerConfig
+    from industrialsim.decisions import MachineTriggerRuntime
+
+    cfg = MachineDecisionTriggerConfig(
+        id="trig-m1",
+        machine_id="mach-1",
+        health_threshold=0.3,
+        rearm_threshold=0.7,
+    )
+    runtime = MachineTriggerRuntime(config=cfg)
+
+    # 1. Health drops from 0.8 to 0.4 -> above threshold (0.3), does not fire
+    assert runtime.check_condition(machine_id="mach-1", health=0.4, current_time_ns=1000) is False
+
+    # 2. Health drops to 0.25 -> <= 0.3 -> FIRES
+    assert runtime.check_condition(machine_id="mach-1", health=0.25, current_time_ns=2000) is True
+
+    # 3. Disarmed: does not fire repeatedly on same/lower health
+    assert runtime.check_condition(machine_id="mach-1", health=0.20, current_time_ns=3000) is False
+
+    # 4. Dedup key prevents firing at same timestamp even if re-evaluated
+    assert runtime.check_condition(machine_id="mach-1", health=0.20, current_time_ns=2000) is False
+
+    # 5. Maintenance completed, health restored to 0.9 -> re-arms!
+    assert runtime.check_condition(machine_id="mach-1", health=0.9, current_time_ns=4000) is False
+    assert runtime.is_armed is True
+
+    # 6. Health drops again to 0.28 -> FIRES again
+    assert runtime.check_condition(machine_id="mach-1", health=0.28, current_time_ns=5000) is True
+
+
+def test_safe_point_trigger_runtime() -> None:
+    from industrialsim.config import SafePointTriggerConfig
+    from industrialsim.decisions import SafePointTriggerRuntime
+
+    cfg = SafePointTriggerConfig(
+        id="trig-safe-1",
+        target_id="st-1",
+        times_ns=[10_000_000, 20_000_000],
+    )
+    runtime = SafePointTriggerRuntime(config=cfg)
+
+    # At t=5_000_000, not a scheduled time
+    assert runtime.check_time(current_time_ns=5_000_000) is False
+
+    # At t=10_000_000, matches scheduled safe point -> FIRES
+    assert runtime.check_time(current_time_ns=10_000_000) is True
+
+    # Dedup check: same time cannot fire again
+    assert runtime.check_time(current_time_ns=10_000_000) is False
+
+    # Next scheduled safe point at t=20_000_000 -> FIRES
+    assert runtime.check_time(current_time_ns=20_000_000) is True
+

@@ -548,14 +548,31 @@ class Station:
     busy_start_ns: int | None = None
     blocked_start_ns: int | None = None
     waiting_since_ns: int | None = None
+    configuration: dict[str, Any] = field(default_factory=dict)
+    is_reconfiguring: bool = False
 
     def can_accept(self, reserved: int = 0) -> bool:
         return (
             (not self.is_busy)
             and (not self.is_blocked)
+            and (not self.is_reconfiguring)
             and (self.current_unit_id is None)
             and reserved == 0
         )
+
+    def start_reconfiguration(self, configuration: dict[str, Any], time_ns: int) -> None:
+        self.end_waiting(time_ns)
+        self.is_busy = True
+        self.is_reconfiguring = True
+        self.busy_start_ns = time_ns
+        self.configuration.update(configuration)
+
+    def complete_reconfiguration(self, completion_time_ns: int) -> None:
+        self.is_busy = False
+        self.is_reconfiguring = False
+        if self.busy_start_ns is not None:
+            self.total_busy_time_ns += completion_time_ns - self.busy_start_ns
+            self.busy_start_ns = None
 
     def has_output_space(self) -> bool:
         return len(self.output_buffer) < self.output_capacity

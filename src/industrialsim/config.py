@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from industrialsim.material_flow import (
@@ -663,8 +663,18 @@ class ProcessPlanConfig(StrictBaseModel):
     steps: list[ProcessPlanStepConfig] = Field(min_length=1)
 
 
+class QualityControlBoundsConfig(StrictBaseModel):
+    min_inspection_intensity: float = 0.0
+    max_inspection_intensity: float = 1.0
+    min_sampling_rate: float = 0.0
+    max_sampling_rate: float = 1.0
+    min_release_threshold: float = 0.0
+    max_release_threshold: float = 1.0
+
+
 class BufferThresholdTriggerConfig(StrictBaseModel):
     id: str
+    trigger_type: Literal["buffer_threshold"] = "buffer_threshold"
     buffer_id: str
     threshold: int
     direction: Literal["rising", "falling"] = "rising"
@@ -692,6 +702,60 @@ class BufferThresholdTriggerConfig(StrictBaseModel):
         return self
 
 
+class RoutingDecisionTriggerConfig(StrictBaseModel):
+    id: str
+    trigger_type: Literal["routing_decision"] = "routing_decision"
+    node_id: str
+    on_failure: Literal["fallback", "abort"] = "fallback"
+    fallback_policy: str = "baseline"
+
+
+class DispatchDecisionTriggerConfig(StrictBaseModel):
+    id: str
+    trigger_type: Literal["dispatch_decision"] = "dispatch_decision"
+    on_failure: Literal["fallback", "abort"] = "fallback"
+    fallback_policy: str = "baseline"
+
+
+class MachineDecisionTriggerConfig(StrictBaseModel):
+    id: str
+    trigger_type: Literal["machine_decision"] = "machine_decision"
+    machine_id: str
+    health_threshold: float = 0.3
+    rearm_threshold: float | None = None
+    on_failure: Literal["fallback", "abort"] = "fallback"
+    fallback_policy: str = "baseline"
+
+    @model_validator(mode="after")
+    def validate_machine_trigger(self) -> MachineDecisionTriggerConfig:
+        if self.rearm_threshold is None:
+            object.__setattr__(self, "rearm_threshold", min(1.0, self.health_threshold + 0.2))
+        return self
+
+
+class SafePointTriggerConfig(StrictBaseModel):
+    id: str
+    trigger_type: Literal["safe_point"] = "safe_point"
+    target_id: str
+    times_ns: list[int] = Field(default_factory=list)
+    interval_ns: int | None = None
+    quality_bounds: QualityControlBoundsConfig | None = None
+    on_failure: Literal["fallback", "abort"] = "fallback"
+    fallback_policy: str = "baseline"
+
+
+DecisionTriggerConfig = Annotated[
+    Union[
+        BufferThresholdTriggerConfig,
+        RoutingDecisionTriggerConfig,
+        DispatchDecisionTriggerConfig,
+        MachineDecisionTriggerConfig,
+        SafePointTriggerConfig,
+    ],
+    Field(discriminator="trigger_type"),
+]
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
@@ -706,7 +770,28 @@ class SimulationConfig(StrictBaseModel):
     production_plan: list[ProductionPlanEntryConfig] = Field(default_factory=list)
     process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
     stations: list[StationConfig] = Field(default_factory=list)
-    decision_triggers: list[BufferThresholdTriggerConfig] = Field(default_factory=list)
+    decision_triggers: list[DecisionTriggerConfig] = Field(default_factory=list)
+
+    @field_validator("decision_triggers", mode="before")
+    @classmethod
+    def _parse_triggers(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            res = []
+            for item in v:
+                if isinstance(item, dict) and "trigger_type" not in item:
+                    if "buffer_id" in item:
+                        item = dict(item, trigger_type="buffer_threshold")
+                    elif "machine_id" in item:
+                        item = dict(item, trigger_type="machine_decision")
+                    elif "node_id" in item:
+                        item = dict(item, trigger_type="routing_decision")
+                    elif "times_ns" in item:
+                        item = dict(item, trigger_type="safe_point")
+                    else:
+                        item = dict(item, trigger_type="dispatch_decision")
+                res.append(item)
+            return res
+        return v
 
     @model_validator(mode="after")
     def validate_simulation_config(self) -> SimulationConfig:
@@ -890,10 +975,11 @@ class SimulationConfig(StrictBaseModel):
             if self.material_flow is not None:
                 buffer_ids = {node.id for node in self.material_flow.nodes if node.kind == "buffer"}
                 for t in self.decision_triggers:
-                    if t.buffer_id not in buffer_ids:
-                        raise ValueError(
-                            f"Decision trigger '{t.id}' references unknown buffer '{t.buffer_id}'"
-                        )
+                    if isinstance(t, BufferThresholdTriggerConfig):
+                        if t.buffer_id not in buffer_ids:
+                            raise ValueError(
+                                f"Decision trigger '{t.id}' references unknown buffer '{t.buffer_id}'"
+                            )
 
         return self
 
