@@ -7,6 +7,7 @@ from typing import Any, Callable, Sequence
 
 from industrialsim.application import (
     branch_checkpoint,
+    inspect,
     inspect_checkpoint,
     resume_episode,
     run_episode,
@@ -38,14 +39,20 @@ def create_parser() -> argparse.ArgumentParser:
         "config_path",
         help="Path to the YAML configuration file",
     )
+    run_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        default=None,
+        help="Optional path to directory where run artifacts should be written",
+    )
 
     inspect_parser = subparsers.add_parser(
         "inspect",
-        help="Inspect a simulation checkpoint file",
+        help="Inspect a simulation checkpoint file or run artifact directory",
     )
     inspect_parser.add_argument(
-        "checkpoint_path",
-        help="Path to the checkpoint file",
+        "path",
+        help="Path to the checkpoint file or run artifact directory",
     )
 
     resume_parser = subparsers.add_parser(
@@ -82,6 +89,12 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to the YAML configuration file to validate against checkpoint",
     )
+    branch_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        default=None,
+        help="Optional path to directory where branch artifacts should be written",
+    )
 
     return parser
 
@@ -106,10 +119,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.is_valid else 1
 
     if args.command == "run":
-        return _execute_cli_action(lambda: run_episode(args.config_path))
+        return _execute_cli_action(lambda: run_episode(args.config_path, output_dir=args.output_dir))
 
     if args.command == "inspect":
-        return _execute_cli_action(lambda: inspect_checkpoint(args.checkpoint_path))
+        return _execute_cli_action(lambda: inspect(args.path))
 
     if args.command == "resume":
         return _execute_cli_action(lambda: resume_episode(args.checkpoint_path, config_source=args.config_path))
@@ -132,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.checkpoint_path,
                 alternative_actions=alternatives,
                 config_source=args.config_path,
+                output_dir=args.output_dir,
             )
 
         return _execute_cli_action(run_branch)

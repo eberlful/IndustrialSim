@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import heapq
 import json
+from io import StringIO
 from pathlib import Path
 from typing import Any, Sequence
 from pydantic import TypeAdapter, ValidationError
@@ -82,6 +84,19 @@ from industrialsim.decisions import (
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
 from industrialsim.random import SemanticRandomStream
+from industrialsim.audit import (
+    AuditLogger,
+    AuditRecord,
+    RunArtifactExistsError,
+    RunArtifactWriter,
+    RunInspection,
+    inspect,
+    inspect_run,
+    load_audit_log,
+    collect_runtime_metadata,
+    collect_library_metadata,
+    collect_calibration_metadata,
+)
 
 
 _yaml = YAML(typ="safe", pure=True)
@@ -641,6 +656,7 @@ class EpisodeEngine:
         plugin_metadata: dict[str, str] | None = None,
         dispatch_policy: BaselineDispatchPolicy | None = None,
         decision_provider: DecisionProvider | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self.cfg = config
         self.kernel = kernel
@@ -649,7 +665,9 @@ class EpisodeEngine:
         self.random_occurrence_counters = dict(random_occurrence_counters or {})
         self.plugin_metadata = plugin_metadata or {}
         self.decision_provider = decision_provider
-        self.decision_coordinator = DecisionBatchCoordinator(episode_id=f"ep-{self.cfg.seed}")
+        self.episode_id = f"ep-{self.cfg.seed}"
+        self.decision_coordinator = DecisionBatchCoordinator(episode_id=self.episode_id)
+        self.audit_logger = audit_logger or AuditLogger()
         self.total_strategic_cost: float = 0.0
         self.decision_triggers: dict[str, list[Any]] = {}
         for t in self.cfg.decision_triggers:
@@ -683,6 +701,91 @@ class EpisodeEngine:
         self.dispatch_policy = dispatch_policy or BaselineDispatchPolicy()
 
         self._setup_handlers()
+
+    def _record_unit_transition(
+        self,
+        unit: ProductionUnit,
+        state: ProductionUnitState,
+        location: str,
+        time_ns: int,
+        details: dict[str, Any] | None = None,
+        station_id: str | None = None,
+        operation_id: str | None = None,
+    ) -> None:
+        st_id = station_id or (details.get("station_id") if details else None)
+        op_id = operation_id or (details.get("operation_id") if details else None)
+        unit.record_transition(
+            time_ns=time_ns,
+            state=state,
+            location=location,
+            station_id=st_id,
+            operation_id=op_id,
+        )
+        audit_details: dict[str, Any] = {
+            "transition": state.value,
+            "location": location,
+            "quality_state": unit.quality_state,
+        }
+        if details:
+            audit_details.update(details)
+        if st_id and "station_id" not in audit_details:
+            audit_details["station_id"] = st_id
+        if op_id and "operation_id" not in audit_details:
+            audit_details["operation_id"] = op_id
+        self.audit_logger.record(
+            event_type="unit_lifecycle",
+            simulated_time_ns=time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=[unit.id, location],
+            details=audit_details,
+        )
+
+    def _record_operation_started(
+        self,
+        unit_id: str,
+        station_id: str,
+        op_id: str,
+        time_ns: int,
+    ) -> None:
+        unit = self.units.get(unit_id)
+        quality_state = unit.quality_state if unit else "unknown"
+        self.audit_logger.record(
+            event_type="unit_lifecycle",
+            simulated_time_ns=time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=[unit_id, station_id],
+            details={
+                "transition": "operation_started",
+                "operation_id": op_id,
+                "station_id": station_id,
+                "quality_state": quality_state,
+            },
+        )
+
+    def _record_operation_completed(
+        self,
+        unit_id: str,
+        station_id: str,
+        op_id: str,
+        time_ns: int,
+    ) -> None:
+        unit = self.units.get(unit_id)
+        quality_state = unit.quality_state if unit else "unknown"
+        self.audit_logger.record(
+            event_type="unit_lifecycle",
+            simulated_time_ns=time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=[unit_id, station_id],
+            details={
+                "transition": "operation_completed",
+                "operation_id": op_id,
+                "station_id": station_id,
+                "quality_state": quality_state,
+            },
+        )
 
     @property
     def units(self) -> dict[str, ProductionUnit]:
@@ -1074,6 +1177,23 @@ class EpisodeEngine:
         if batch is None:
             return
 
+        for req in batch.requests:
+            self.audit_logger.record(
+                event_type="decision_request",
+                simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=batch.branch_id,
+                batch_id=batch.batch_id,
+                entity_ids=[req.target_id],
+                details={
+                    "request_id": req.request_id,
+                    "request_type": req.request_type,
+                    "target_id": req.target_id,
+                    "trigger_id": req.trigger_id,
+                    "action_schema": req.action_schema,
+                },
+            )
+
         response: DecisionBatchResponse | None = None
         diagnostics: list[DecisionDiagnosticRecord] = []
 
@@ -1108,10 +1228,60 @@ class EpisodeEngine:
                 )
             )
 
-        if response is not None and len(diagnostics) == 0:
+        if response is not None:
+            for action in response.actions:
+                target_id = (
+                    getattr(action, "buffer_id", None)
+                    or getattr(action, "target_id", None)
+                    or getattr(action, "machine_id", None)
+                    or getattr(action, "node_id", None)
+                    or getattr(action, "unit_id", None)
+                )
+                entity_ids = [target_id] if target_id else []
+                self.audit_logger.record(
+                    event_type="decision_action",
+                    simulated_time_ns=self.kernel.current_time_ns,
+                    episode_id=batch.episode_id,
+                    branch_id=batch.branch_id,
+                    batch_id=batch.batch_id,
+                    entity_ids=entity_ids,
+                    provenance=response.provenance.model_dump(mode="json") if response.provenance else None,
+                    details={
+                        "action_type": action.action_type,
+                        "action": action.model_dump(mode="json"),
+                    },
+                )
+
+        is_valid_resp = (response is not None and len(diagnostics) == 0)
+        self.audit_logger.record(
+            event_type="validation_outcome",
+            simulated_time_ns=self.kernel.current_time_ns,
+            episode_id=batch.episode_id,
+            branch_id=batch.branch_id,
+            batch_id=batch.batch_id,
+            details={
+                "is_valid": is_valid_resp,
+                "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
+            },
+        )
+
+        if is_valid_resp and response is not None:
             self._apply_decision_actions(batch, response)
         else:
             self._handle_decision_failure(batch, diagnostics)
+
+        self.audit_logger.record(
+            event_type="reward",
+            simulated_time_ns=self.kernel.current_time_ns,
+            episode_id=batch.episode_id,
+            branch_id=batch.branch_id,
+            batch_id=batch.batch_id,
+            details={
+                "batch_id": batch.batch_id,
+                "total_strategic_cost": self.total_strategic_cost,
+                "events_processed": self.kernel.events_processed,
+            },
+        )
 
     def _apply_actions_list(
         self, batch: DecisionBatch, actions: Sequence[DecisionAction]
@@ -1262,6 +1432,18 @@ class EpisodeEngine:
             self.abort_reason = (
                 f"Trigger '{abort_trigger_id}' aborted episode due to decision failure: {reasons}"
             )
+            self.audit_logger.record(
+                event_type="failure",
+                simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=batch.branch_id,
+                batch_id=batch.batch_id,
+                details={
+                    "failure_type": "decision_abort",
+                    "abort_trigger_id": abort_trigger_id,
+                    "abort_reason": self.abort_reason,
+                },
+            )
             self.decision_batches.append(
                 {
                     "batch_id": batch.batch_id,
@@ -1278,6 +1460,41 @@ class EpisodeEngine:
             raise ValueError(f"Unsupported fallback policy: '{fallback_policy_name}'")
 
         fallback_actions = fallback_policy.generate_fallback_actions(batch)
+        self.audit_logger.record(
+            event_type="fallback",
+            simulated_time_ns=self.kernel.current_time_ns,
+            episode_id=batch.episode_id,
+            branch_id=batch.branch_id,
+            batch_id=batch.batch_id,
+            details={
+                "reason": "; ".join(d.message for d in diagnostics),
+                "fallback_policy": fallback_policy_name,
+                "fallback_actions": [a.model_dump(mode="json") for a in fallback_actions],
+            },
+        )
+        for f_action in fallback_actions:
+            target_id = (
+                getattr(f_action, "buffer_id", None)
+                or getattr(f_action, "target_id", None)
+                or getattr(f_action, "machine_id", None)
+                or getattr(f_action, "node_id", None)
+                or getattr(f_action, "unit_id", None)
+            )
+            entity_ids = [target_id] if target_id else []
+            self.audit_logger.record(
+                event_type="decision_action",
+                simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=batch.branch_id,
+                batch_id=batch.batch_id,
+                entity_ids=entity_ids,
+                provenance={"provider_id": f"fallback-{fallback_policy_name}"},
+                details={
+                    "action_type": f_action.action_type,
+                    "action": f_action.model_dump(mode="json"),
+                },
+            )
+
         self._apply_actions_list(batch, fallback_actions)
 
         self.decision_batches.append(
@@ -1540,10 +1757,12 @@ class EpisodeEngine:
         unit = self.units[order.unit_id]
         self._remove_unit_from_node(order.source_node_id, unit.id, k.current_time_ns)
         order.pickup(k.current_time_ns)
-        unit.record_transition(
-            time_ns=k.current_time_ns,
+        self._record_unit_transition(
+            unit,
             state=ProductionUnitState.IN_TRANSPORT,
             location=route.id,
+            time_ns=k.current_time_ns,
+            details={"route_id": route.id, "vehicle_id": vehicle.id if vehicle else None},
         )
 
         if vehicle is None:
@@ -1613,11 +1832,12 @@ class EpisodeEngine:
                     assert blocked_uid is not None
                     st.end_blocking(time_ns)
                     st.enqueue_output_unit(blocked_uid)
-                    self.units[blocked_uid].record_transition(
-                        time_ns=time_ns,
+                    self._record_unit_transition(
+                        self.units[blocked_uid],
                         state=ProductionUnitState.IN_STATION,
                         location=node_id,
-                        station_id=node_id,
+                        time_ns=time_ns,
+                        details={"station_id": node_id},
                     )
             elif st.is_blocked and st.blocked_unit_id == unit_id:
                 st.end_blocking(time_ns)
@@ -1641,20 +1861,23 @@ class EpisodeEngine:
         unit_id = event.payload["unit_id"]
         source_id = event.payload["source_id"]
         unit = self.units[unit_id]
-        unit.record_transition(
-            time_ns=k.current_time_ns,
+        self._record_unit_transition(
+            unit,
             state=ProductionUnitState.RELEASED,
             location=source_id,
+            time_ns=k.current_time_ns,
         )
         self.source_pending_units[source_id].append(unit_id)
         self._create_transport_order(unit_id, source_id, k.current_time_ns)
         self._try_dispatch_pending_orders(k)
 
     def _handle_sink_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
-        self.units[unit_id].record_transition(
-            time_ns=k.current_time_ns,
+        self._record_unit_transition(
+            self.units[unit_id],
             state=ProductionUnitState.TERMINAL,
             location="terminal",
+            time_ns=k.current_time_ns,
+            details={"sink_id": node_id},
         )
         self._try_pull_upstream(k, node_id)
 
@@ -1663,10 +1886,12 @@ class EpisodeEngine:
         old_occ = len(buf.occupants)
         buf.add_unit(unit_id)
         new_occ = len(buf.occupants)
-        self.units[unit_id].record_transition(
-            time_ns=k.current_time_ns,
+        self._record_unit_transition(
+            self.units[unit_id],
             state=ProductionUnitState.IN_BUFFER,
             location=node_id,
+            time_ns=k.current_time_ns,
+            details={"buffer_id": node_id, "occupancy": new_occ},
         )
         self.buffer_history.setdefault(node_id, []).append(
             {
@@ -1874,6 +2099,7 @@ class EpisodeEngine:
                     time_ns=time_ns,
                 )
                 st.start_operation(unit_id, op.id, time_ns)
+                self._record_operation_started(unit_id, station_id, op.id, time_ns)
                 self.kernel.schedule(
                     time_ns=time_ns + rem_dur,
                     priority=EventPriority.COMPLETION,
@@ -1927,7 +2153,13 @@ class EpisodeEngine:
             st.scrap_operation(time_ns)
             u = self.units[unit_id]
             u.quality_state = "scrapped"
-            u.record_transition(time_ns, ProductionUnitState.TERMINAL, location="terminal")
+            self._record_unit_transition(
+                u,
+                state=ProductionUnitState.TERMINAL,
+                location="terminal",
+                time_ns=time_ns,
+                details={"reason": "interrupted_scrap", "station_id": station_id},
+            )
             self._release_resources(station_id, time_ns, completed=False)
             self._try_pull_upstream(self.kernel, station_id)
 
@@ -2061,6 +2293,14 @@ class EpisodeEngine:
         req_workers = disruption.get("required_workers", event.payload.get("required_workers", []))
 
         mach.start_failure(k.current_time_ns)
+        self.audit_logger.record(
+            event_type="failure",
+            simulated_time_ns=k.current_time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=[mach_id],
+            details={"failure_type": "disruption", "machine_id": mach_id, "duration_ns": dur_ns},
+        )
         active_stations = [
             s_id for s_id, a_op in list(self.active_operations.items())
             if mach_id in a_op["machines"]
@@ -2104,6 +2344,14 @@ class EpisodeEngine:
             return
 
         mach.start_failure(k.current_time_ns)
+        self.audit_logger.record(
+            event_type="failure",
+            simulated_time_ns=k.current_time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=[mach_id],
+            details={"failure_type": "machine_failure", "machine_id": mach_id, "health": mach.health},
+        )
         active_stations = [
             s_id for s_id, a_op in list(self.active_operations.items())
             if mach_id in a_op["machines"]
@@ -2342,12 +2590,12 @@ class EpisodeEngine:
             op = list(st.operations.values())[0]
             op_index = 0
 
-        self.units[unit_id].record_transition(
-            time_ns=k.current_time_ns,
+        self._record_unit_transition(
+            self.units[unit_id],
             state=ProductionUnitState.IN_STATION,
             location=node_id,
-            station_id=node_id,
-            operation_id=op.id,
+            time_ns=k.current_time_ns,
+            details={"station_id": node_id, "operation_id": op.id},
         )
 
         can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, node_id, k.current_time_ns)
@@ -2364,6 +2612,7 @@ class EpisodeEngine:
                 time_ns=k.current_time_ns,
             )
             st.start_operation(unit_id, op.id, k.current_time_ns)
+            self._record_operation_started(unit_id, node_id, op.id, k.current_time_ns)
             k.schedule(
                 time_ns=k.current_time_ns + eff_dur,
                 priority=EventPriority.COMPLETION,
@@ -2415,19 +2664,21 @@ class EpisodeEngine:
         if st.has_output_space():
             st.current_unit_id = None
             st.enqueue_output_unit(unit_id)
-            unit.record_transition(
-                time_ns=k.current_time_ns,
+            self._record_unit_transition(
+                unit,
                 state=ProductionUnitState.IN_STATION,
                 location=station_id,
-                station_id=station_id,
+                time_ns=k.current_time_ns,
+                details={"station_id": station_id, "sub_state": "output_queue"},
             )
         else:
             st.start_blocking(unit_id, k.current_time_ns)
-            unit.record_transition(
-                time_ns=k.current_time_ns,
+            self._record_unit_transition(
+                unit,
                 state=ProductionUnitState.BLOCKED,
                 location=station_id,
-                station_id=station_id,
+                time_ns=k.current_time_ns,
+                details={"station_id": station_id},
             )
 
         self._create_transport_order(unit_id, station_id, k.current_time_ns)
@@ -2453,6 +2704,7 @@ class EpisodeEngine:
 
         self._release_resources(station_id, k.current_time_ns, completed=True)
         st.complete_operation(current_op.id, k.current_time_ns)
+        self._record_operation_completed(unit_id, station_id, current_op.id, k.current_time_ns)
 
         was_in_rework = unit.is_in_rework
 
@@ -2523,14 +2775,29 @@ class EpisodeEngine:
                 disposition=disposition,
             )
             unit.findings.append(finding)
+            self.audit_logger.record(
+                event_type="unit_lifecycle",
+                simulated_time_ns=k.current_time_ns,
+                episode_id=self.episode_id,
+                branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                entity_ids=[unit.id, station_id],
+                details={
+                    "transition": "quality_inspected",
+                    "station_id": station_id,
+                    "operation_id": current_op.id,
+                    "result": result,
+                    "disposition": disposition,
+                    "quality_state": unit.quality_state,
+                },
+            )
 
             if disposition == "scrap":
-                unit.record_transition(
-                    time_ns=k.current_time_ns,
+                self._record_unit_transition(
+                    unit,
                     state=ProductionUnitState.TERMINAL,
                     location="terminal",
-                    station_id=station_id,
-                    operation_id=current_op.id,
+                    time_ns=k.current_time_ns,
+                    details={"station_id": station_id, "operation_id": current_op.id, "reason": "quality_inspection_scrap"},
                 )
                 st.scrapped_count += 1
                 st.current_unit_id = None
@@ -2556,12 +2823,12 @@ class EpisodeEngine:
         if op_index + 1 < len(ops_list):
             st.current_unit_id = unit_id
             next_op = ops_list[op_index + 1]
-            self.units[unit_id].record_transition(
-                time_ns=k.current_time_ns,
+            self._record_unit_transition(
+                self.units[unit_id],
                 state=ProductionUnitState.IN_STATION,
                 location=station_id,
-                station_id=station_id,
-                operation_id=next_op.id,
+                time_ns=k.current_time_ns,
+                details={"station_id": station_id, "operation_id": next_op.id},
             )
             can_acq, mach_ids, worker_allocs = self._can_acquire_resources(next_op, station_id, k.current_time_ns)
             eff_dur = self._compute_effective_operation_duration(next_op, k.current_time_ns)
@@ -2577,6 +2844,7 @@ class EpisodeEngine:
                     time_ns=k.current_time_ns,
                 )
                 st.start_operation(unit_id, next_op.id, k.current_time_ns)
+                self._record_operation_started(unit_id, station_id, next_op.id, k.current_time_ns)
                 k.schedule(
                     time_ns=k.current_time_ns + eff_dur,
                     priority=EventPriority.COMPLETION,
@@ -2608,6 +2876,7 @@ class EpisodeEngine:
         cls,
         cfg: SimulationConfig,
         decision_provider: DecisionProvider | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> EpisodeEngine:
         units: dict[str, ProductionUnit] = {
             u_cfg.id: ProductionUnit(
@@ -2878,6 +3147,7 @@ class EpisodeEngine:
             topology=topology,
             domain=domain,
             decision_provider=decision_provider,
+            audit_logger=audit_logger,
         )
 
         for m in machines.values():
@@ -2892,6 +3162,7 @@ class EpisodeEngine:
         checkpoint: Checkpoint,
         config: SimulationConfig | None = None,
         decision_provider: DecisionProvider | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> EpisodeEngine:
         # Schema and kernel version compatibility checks
         if checkpoint.schema_version != "1.0":
@@ -3109,6 +3380,7 @@ class EpisodeEngine:
             random_occurrence_counters=checkpoint.random_occurrence_counters,
             plugin_metadata=checkpoint.plugin_metadata,
             decision_provider=decision_provider,
+            audit_logger=audit_logger,
         )
         if checkpoint.domain_state.get("decision_coordinator"):
             engine.decision_coordinator.restore_state(checkpoint.domain_state.get("decision_coordinator"))
@@ -3248,6 +3520,18 @@ class EpisodeEngine:
             if not (pause_at_decision_batch and self.decision_coordinator.has_pending()):
                 if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                     self.kernel.advance_to(pause_at_ns)
+
+        if not pause_at_decision_batch:
+            self.audit_logger.record(
+                event_type="reward",
+                simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=self.episode_id,
+                branch_id=getattr(self.decision_coordinator, "branch_id", None),
+                details={
+                    "total_strategic_cost": self.total_strategic_cost,
+                    "events_processed": self.kernel.events_processed,
+                },
+            )
 
         return self.to_summary()
 
@@ -3505,14 +3789,38 @@ def resume_episode(
 def run_episode(
     source: str | Path | dict[str, Any],
     decision_provider: DecisionProvider | None = None,
+    output_dir: str | Path | None = None,
 ) -> EpisodeSummary:
     validation = validate_config(source)
     if not validation.is_valid or validation.config is None:
         raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
 
     cfg = validation.config
-    engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
-    return engine.run()
+    writer: RunArtifactWriter | None = None
+    audit_logger: AuditLogger | None = None
+
+    if output_dir is not None:
+        episode_id = f"ep-{cfg.seed}"
+        writer = RunArtifactWriter(
+            output_dir=output_dir,
+            config=cfg,
+            episode_id=episode_id,
+        )
+        audit_logger = writer.audit_logger
+
+    engine = EpisodeEngine.create(
+        cfg,
+        decision_provider=decision_provider,
+        audit_logger=audit_logger,
+    )
+    summary = engine.run()
+
+    if writer is not None:
+        final_cp = engine.create_checkpoint()
+        save_checkpoint(final_cp, writer.checkpoints_dir / "final_checkpoint.json")
+        writer.finalize(summary.to_dict(), status="aborted" if summary.is_aborted else "completed")
+
+    return summary
 
 
 @dataclass(frozen=True)
@@ -3719,11 +4027,29 @@ def branch_checkpoint(
     checkpoint: str | Path | dict[str, Any] | Checkpoint,
     alternative_actions: Sequence[Any],
     config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+    output_dir: str | Path | None = None,
 ) -> BranchComparisonResult:
     if len(alternative_actions) < 2:
         raise ValueError(
             f"Counterfactual branching requires at least two alternative Action sets, got {len(alternative_actions)}"
         )
+
+    out_p: Path | None = Path(output_dir) if output_dir is not None else None
+    root_created_at = datetime.now(timezone.utc).isoformat()
+
+    if out_p is not None:
+        manifest_p = out_p / "manifest.json"
+        if manifest_p.exists():
+            try:
+                m_data = json.loads(manifest_p.read_text(encoding="utf-8"))
+                if m_data.get("status") == "completed":
+                    raise RunArtifactExistsError(
+                        f"Run directory '{output_dir}' already exists and is completed"
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+        out_p.mkdir(parents=True, exist_ok=True)
+        (out_p / ".incomplete").write_text("in_progress\n", encoding="utf-8")
 
     if isinstance(checkpoint, (str, Path)):
         cp = load_checkpoint(checkpoint)
@@ -3733,6 +4059,11 @@ def branch_checkpoint(
         cp = checkpoint
     else:
         raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    if out_p is not None:
+        cp_dir = out_p / "checkpoints"
+        cp_dir.mkdir(exist_ok=True)
+        save_checkpoint(cp, cp_dir / "parent_checkpoint.json")
 
     cfg: SimulationConfig | None = None
     if config_source is not None:
@@ -3774,8 +4105,26 @@ def branch_checkpoint(
             actions=actions,
         )
 
+        branch_writer: RunArtifactWriter | None = None
+        branch_audit_logger: AuditLogger | None = None
+
+        if out_p is not None:
+            branch_dir = out_p / "branches" / branch_id
+            eff_cfg = cfg
+            if eff_cfg is None:
+                eff_cfg = SimulationConfig.model_validate(cp.configuration)
+            branch_writer = RunArtifactWriter(
+                output_dir=branch_dir,
+                config=eff_cfg,
+                episode_id=f"ep-{cp.root_seed}-{branch_id}",
+                branch_id=branch_id,
+                parent_run_id=f"ep-{cp.root_seed}",
+                checkpoint_hash=cp.config_hash,
+            )
+            branch_audit_logger = branch_writer.audit_logger
+
         # Restore isolated engine for this branch
-        engine = EpisodeEngine.restore(cp, config=cfg)
+        engine = EpisodeEngine.restore(cp, config=cfg, audit_logger=branch_audit_logger)
         engine.decision_coordinator.branch_id = branch_id
         engine.random_occurrence_counters = dict(cp.random_occurrence_counters)
         engine.random_stream = SemanticRandomStream(
@@ -3812,6 +4161,60 @@ def branch_checkpoint(
         )
 
         is_valid, diagnostics = validate_decision_batch_response(batch, response)
+
+        # Log decision requests, proposed actions, and validation outcome into branch audit log
+        for req in batch.requests:
+            engine.audit_logger.record(
+                event_type="decision_request",
+                simulated_time_ns=engine.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=branch_id,
+                batch_id=batch.batch_id,
+                entity_ids=[req.target_id],
+                details={
+                    "request_id": req.request_id,
+                    "request_type": req.request_type,
+                    "target_id": req.target_id,
+                    "trigger_id": req.trigger_id,
+                    "action_schema": req.action_schema,
+                },
+            )
+
+        for act in actions:
+            t_id = (
+                getattr(act, "buffer_id", None)
+                or getattr(act, "target_id", None)
+                or getattr(act, "machine_id", None)
+                or getattr(act, "node_id", None)
+                or getattr(act, "unit_id", None)
+            )
+            entity_ids = [t_id] if t_id else []
+            engine.audit_logger.record(
+                event_type="decision_action",
+                simulated_time_ns=engine.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=branch_id,
+                batch_id=batch.batch_id,
+                entity_ids=entity_ids,
+                provenance=provenance.model_dump(mode="json"),
+                details={
+                    "action_type": act.action_type,
+                    "action": act.model_dump(mode="json"),
+                },
+            )
+
+        engine.audit_logger.record(
+            event_type="validation_outcome",
+            simulated_time_ns=engine.kernel.current_time_ns,
+            episode_id=batch.episode_id,
+            branch_id=branch_id,
+            batch_id=batch.batch_id,
+            details={
+                "is_valid": is_valid,
+                "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
+            },
+        )
+
         if is_valid:
             engine._apply_decision_actions(batch, response)
         else:
@@ -3819,6 +4222,14 @@ def branch_checkpoint(
 
         # Continue branch execution to episode completion
         summary = engine.run()
+
+        if branch_writer is not None:
+            branch_cp = engine.create_checkpoint()
+            save_checkpoint(branch_cp, branch_writer.checkpoints_dir / "final_checkpoint.json")
+            branch_writer.finalize(
+                summary.to_dict(),
+                status="aborted" if summary.is_aborted else "completed",
+            )
 
         # The actions actually applied in this branch
         applied_actions = (
@@ -3842,12 +4253,54 @@ def branch_checkpoint(
             )
         )
 
-    return BranchComparisonResult(
+    comp_result = BranchComparisonResult(
         checkpoint_config_hash=cp.config_hash,
         checkpoint_time_ns=cp.simulated_time_ns,
         decision_batch_id=batch_id,
         branches=branch_results,
     )
+
+    if out_p is not None:
+        (out_p / "comparison_summary.json").write_text(
+            json.dumps(comp_result.to_dict(), indent=2), encoding="utf-8"
+        )
+        eff_cfg = cfg or SimulationConfig.model_validate(cp.configuration)
+        buf = StringIO()
+        _yaml.dump(eff_cfg.model_dump(mode="json"), buf)
+        (out_p / "resolved_config.yaml").write_text(buf.getvalue(), encoding="utf-8")
+
+        root_manifest = {
+            "schema_version": cp.schema_version,
+            "kernel_version": cp.kernel_version,
+            "run_id": f"branch-comp-{cp.config_hash[:8]}-{cp.simulated_time_ns}",
+            "type": "branch_comparison",
+            "status": "completed",
+            "created_at": root_created_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "decision_batch_id": batch_id,
+            "checkpoint_config_hash": cp.config_hash,
+            "config_hash": cp.config_hash,
+            "model_hash": cp.model_hash,
+            "checkpoint_time_ns": cp.simulated_time_ns,
+            "branches": [
+                {
+                    "branch_id": b.branch_id,
+                    "result_hash": b.result_hash,
+                    "path": f"branches/{b.branch_id}",
+                }
+                for b in branch_results
+            ],
+            "runtime": collect_runtime_metadata(),
+            "libraries": collect_library_metadata(),
+            "seed": cp.root_seed,
+            "calibration": collect_calibration_metadata(),
+            "plugin_metadata": cp.plugin_metadata,
+        }
+        (out_p / "manifest.json").write_text(json.dumps(root_manifest, indent=2), encoding="utf-8")
+        if (out_p / ".incomplete").exists():
+            (out_p / ".incomplete").unlink()
+
+    return comp_result
 
 
 
