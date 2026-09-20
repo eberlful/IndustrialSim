@@ -18,6 +18,7 @@ from industrialsim.config import (
     SimulationConfig,
     StationConfig,
 )
+from industrialsim.dispatch import BaselineDispatchPolicy, DispatchDecision
 from industrialsim.domain import (
     Break,
     Buffer,
@@ -28,6 +29,10 @@ from industrialsim.domain import (
     QualityFinding,
     Shift,
     Station,
+    TransportOrder,
+    TransportOrderState,
+    Vehicle,
+    VehicleState,
     Worker,
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
@@ -184,6 +189,58 @@ class BufferSummary:
 
 
 @dataclass(frozen=True)
+class VehicleSummary:
+    id: str
+    location: str
+    transports_completed: int
+    total_busy_time_ns: int
+    total_idle_time_ns: int
+    utilization: float
+    pool_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "location": self.location,
+            "transports_completed": self.transports_completed,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "utilization": self.utilization,
+            "pool_id": self.pool_id,
+        }
+
+
+@dataclass(frozen=True)
+class TransportOrderSummary:
+    id: str
+    unit_id: str
+    source_node_id: str
+    target_node_id: str
+    route_id: str | None
+    vehicle_id: str | None
+    state: str
+    created_time_ns: int
+    dispatched_time_ns: int | None = None
+    pickup_time_ns: int | None = None
+    completed_time_ns: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "unit_id": self.unit_id,
+            "source_node_id": self.source_node_id,
+            "target_node_id": self.target_node_id,
+            "route_id": self.route_id,
+            "vehicle_id": self.vehicle_id,
+            "state": self.state,
+            "created_time_ns": self.created_time_ns,
+            "dispatched_time_ns": self.dispatched_time_ns,
+            "pickup_time_ns": self.pickup_time_ns,
+            "completed_time_ns": self.completed_time_ns,
+        }
+
+
+@dataclass(frozen=True)
 class EpisodeSummary:
     status: str
     seed: int
@@ -195,6 +252,8 @@ class EpisodeSummary:
     buffers: list[BufferSummary] = field(default_factory=list)
     machines: list[MachineSummary] = field(default_factory=list)
     workers: list[WorkerSummary] = field(default_factory=list)
+    vehicles: list[VehicleSummary] = field(default_factory=list)
+    transport_orders: list[TransportOrderSummary] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -207,6 +266,8 @@ class EpisodeSummary:
             "buffers": [b.to_dict() for b in self.buffers],
             "machines": [m.to_dict() for m in self.machines],
             "workers": [w.to_dict() for w in self.workers],
+            "vehicles": [v.to_dict() for v in self.vehicles],
+            "transport_orders": [t.to_dict() for t in self.transport_orders],
             "result_hash": self.result_hash,
         }
 
@@ -262,6 +323,8 @@ def _compute_result_hash(
     buffers: list[BufferSummary] | None = None,
     machines: list[MachineSummary] | None = None,
     workers: list[WorkerSummary] | None = None,
+    vehicles: list[VehicleSummary] | None = None,
+    transport_orders: list[TransportOrderSummary] | None = None,
 ) -> str:
     data: dict[str, Any] = {
         "status": status,
@@ -276,6 +339,10 @@ def _compute_result_hash(
         data["machines"] = [m.to_dict() for m in machines]
     if workers:
         data["workers"] = [w.to_dict() for w in workers]
+    if vehicles:
+        data["vehicles"] = [v.to_dict() for v in vehicles]
+    if transport_orders:
+        data["transport_orders"] = [t.to_dict() for t in transport_orders]
     canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -345,6 +412,8 @@ from industrialsim.checkpoint import (
     MachineSnapshot,
     ProductionUnitSnapshot,
     StationSnapshot,
+    TransportOrderSnapshot,
+    VehicleSnapshot,
     WorkerSnapshot,
     compute_config_hash,
     compute_model_hash,
@@ -370,22 +439,90 @@ class MaterialFlowTopology:
     nodes_by_id: dict[str, NodeConfig]
     sources: dict[str, NodeConfig]
     sinks: dict[str, NodeConfig]
+    routes: list[RouteConfig]
+    routes_by_id: dict[str, RouteConfig]
     routes_from: dict[str, list[RouteConfig]]
     routes_to: dict[str, list[RouteConfig]]
+
+    def find_shortest_path_distance(self, from_node: str, to_node: str, directed: bool = True) -> int | None:
+        import heapq
+
+        if from_node == to_node:
+            return 0
+        adj: dict[str, list[tuple[str, int]]] = {}
+        for r in self.routes:
+            adj.setdefault(r.source_node_id, []).append((r.target_node_id, r.transit_time_ns))
+            if not directed:
+                adj.setdefault(r.target_node_id, []).append((r.source_node_id, r.transit_time_ns))
+
+        distances: dict[str, int] = {from_node: 0}
+        pq: list[tuple[int, str]] = [(0, from_node)]
+
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > distances.get(u, float("inf")):
+                continue
+            if u == to_node:
+                return d
+            for v, weight in adj.get(u, []):
+                new_d = d + weight
+                if new_d < distances.get(v, float("inf")):
+                    distances[v] = new_d
+                    heapq.heappush(pq, (new_d, v))
+
+        return distances.get(to_node)
+
+    def compute_distance(self, from_node: str, to_node: str) -> int | None:
+        if from_node == to_node:
+            return 0
+        dist = self.find_shortest_path_distance(from_node, to_node, directed=True)
+        if dist is not None:
+            return dist
+        return self.find_shortest_path_distance(from_node, to_node, directed=False)
 
     @classmethod
     def from_material_flow(cls, mf: MaterialFlowConfig) -> MaterialFlowTopology:
         nodes_by_id = {n.id: n for n in mf.nodes}
         sources = {n.id: n for n in mf.nodes if n.kind == "source"}
         sinks = {n.id: n for n in mf.nodes if n.kind == "sink"}
+        routes = list(mf.routes)
+        routes_by_id = {r.id: r for r in mf.routes}
         routes_from, routes_to = _index_routes(mf.routes)
         return cls(
             nodes_by_id=nodes_by_id,
             sources=sources,
             sinks=sinks,
+            routes=routes,
+            routes_by_id=routes_by_id,
             routes_from=routes_from,
             routes_to=routes_to,
         )
+
+
+def _create_vehicles_from_config(cfg: SimulationConfig) -> dict[str, Vehicle]:
+    pools_by_id = {p.id: p for p in cfg.vehicle_pools}
+    vehicles: dict[str, Vehicle] = {}
+    for v_cfg in cfg.vehicles:
+        pool = pools_by_id.get(v_cfg.pool_id) if v_cfg.pool_id else None
+        capabilities = list(v_cfg.capabilities)
+        if pool:
+            for c in pool.capabilities:
+                if c not in capabilities:
+                    capabilities.append(c)
+        speed = (
+            v_cfg.speed_multiplier
+            if v_cfg.speed_multiplier is not None
+            else (pool.speed_multiplier if pool else 1.0)
+        )
+        vehicles[v_cfg.id] = Vehicle(
+            id=v_cfg.id,
+            initial_location=v_cfg.initial_location,
+            location=v_cfg.initial_location,
+            pool_id=v_cfg.pool_id,
+            capabilities=capabilities,
+            speed_multiplier=speed,
+        )
+    return vehicles
 
 
 @dataclass
@@ -397,6 +534,10 @@ class SimulationDomainState:
     source_pending_units: dict[str, list[str]]
     machines: dict[str, Machine] = field(default_factory=dict)
     workers: dict[str, Worker] = field(default_factory=dict)
+    vehicles: dict[str, Vehicle] = field(default_factory=dict)
+    transport_orders: dict[str, TransportOrder] = field(default_factory=dict)
+    pending_transport_orders: list[str] = field(default_factory=list)
+    active_route_occupancy: dict[str, int] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
     active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     maintenance_waiters: list[dict[str, Any]] = field(default_factory=list)
@@ -429,6 +570,7 @@ class EpisodeEngine:
         domain: SimulationDomainState,
         random_occurrence_counters: dict[str, int] | None = None,
         plugin_metadata: dict[str, str] | None = None,
+        dispatch_policy: BaselineDispatchPolicy | None = None,
     ) -> None:
         self.cfg = config
         self.kernel = kernel
@@ -443,6 +585,7 @@ class EpisodeEngine:
             root_seed=self.cfg.seed,
             occurrence_counters=self.random_occurrence_counters,
         )
+        self.dispatch_policy = dispatch_policy or BaselineDispatchPolicy()
 
         self._setup_handlers()
 
@@ -487,12 +630,36 @@ class EpisodeEngine:
         return self.topology.routes_to
 
     @property
+    def routes(self) -> list[RouteConfig]:
+        return self.topology.routes
+
+    @property
+    def routes_by_id(self) -> dict[str, RouteConfig]:
+        return self.topology.routes_by_id
+
+    @property
     def machines(self) -> dict[str, Machine]:
         return self.domain.machines
 
     @property
     def workers(self) -> dict[str, Worker]:
         return self.domain.workers
+
+    @property
+    def vehicles(self) -> dict[str, Vehicle]:
+        return self.domain.vehicles
+
+    @property
+    def transport_orders(self) -> dict[str, TransportOrder]:
+        return self.domain.transport_orders
+
+    @property
+    def pending_transport_orders(self) -> list[str]:
+        return self.domain.pending_transport_orders
+
+    @property
+    def active_route_occupancy(self) -> dict[str, int]:
+        return self.domain.active_route_occupancy
 
     @property
     def resource_waiters(self) -> list[dict[str, Any]]:
@@ -513,6 +680,7 @@ class EpisodeEngine:
     def _setup_handlers(self) -> None:
         self.kernel.register_handler("RELEASE_UNIT", self._handle_release)
         self.kernel.register_handler("ARRIVAL_AT_NODE", self._handle_arrival_at_node)
+        self.kernel.register_handler("VEHICLE_ARRIVED_AT_PICKUP", self._handle_vehicle_arrived_at_pickup)
         self.kernel.register_handler("COMPLETE_OPERATION", self._handle_complete_operation)
         self.kernel.register_handler("SHIFT_START", self._handle_shift_start)
         self.kernel.register_handler("SHIFT_END", self._handle_shift_end)
@@ -573,159 +741,267 @@ class EpisodeEngine:
             return set(self.sinks.keys())
         return set(self.nodes_by_id.keys())
 
-    def _select_route_for_unit(self, from_node_id: str, unit: ProductionUnit) -> RouteConfig | None:
+    def _compute_node_distance(self, from_node: str, to_node: str) -> int | None:
+        return self.topology.compute_distance(from_node, to_node)
+
+    def _get_candidate_routes_for_unit(self, from_node_id: str, unit: ProductionUnit) -> list[RouteConfig]:
         routes = self.routes_from.get(from_node_id, [])
         if not routes:
-            return None
+            return []
 
         if unit.variant not in self.process_plans and not unit.is_in_rework:
-            for r in routes:
-                if self._can_accept(r.target_node_id):
-                    return r
-            return routes[0] if routes else None
+            return list(routes)
 
         target_nodes = self._get_target_nodes_for_unit(unit)
-        candidates: list[tuple[int, int, int, int, int, str, str, RouteConfig]] = []
-
+        candidates: list[RouteConfig] = []
         for r in routes:
             for target_id in target_nodes:
                 d = self._find_path_to_target(r.target_node_id, target_id)
                 if d is not None:
-                    total_dist = r.transit_time_ns + d
-                    can_accept = 1 if self._can_accept(r.target_node_id) else 0
-                    is_direct = 1 if r.target_node_id == target_id else 0
-                    target_st = self.stations.get(target_id)
-                    target_avail = 1 if (target_st and target_st.can_accept(reserved=self.in_flight_to[target_id])) else 0
-                    target_load = (
-                        (1 if target_st.is_busy else 0)
-                        + (1 if target_st.is_blocked else 0)
-                        + len(target_st.output_buffer)
-                        + self.in_flight_to[target_id]
-                    ) if target_st else 0
-                    candidates.append((
-                        -can_accept,
-                        -is_direct,
-                        -target_avail,
-                        target_load,
-                        total_dist,
-                        target_id,
-                        r.id,
-                        r,
-                    ))
+                    candidates.append(r)
+                    break
+        return candidates if candidates else list(routes)
 
-        if not candidates:
-            for r in routes:
-                if self._can_accept(r.target_node_id):
-                    return r
-            return routes[0] if routes else None
+    def _create_transport_order(self, unit_id: str, source_node_id: str, time_ns: int) -> TransportOrder:
+        for o in self.transport_orders.values():
+            if o.unit_id == unit_id and o.state in (
+                TransportOrderState.PENDING,
+                TransportOrderState.DISPATCHED,
+                TransportOrderState.IN_TRANSIT,
+            ):
+                return o
 
-        candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
-        return candidates[0][7]
+        unit = self.units[unit_id]
+        candidates = self._get_candidate_routes_for_unit(source_node_id, unit)
+        target_node_id = candidates[0].target_node_id if candidates else ""
 
-    def _get_available_route(self, from_node_id: str) -> RouteConfig | None:
-        routes = self.routes_from.get(from_node_id, [])
-        for r in routes:
-            if self._can_accept(r.target_node_id):
-                return r
-        return routes[0] if routes else None
+        order_id = f"to-{len(self.transport_orders) + 1:06d}"
+        order = TransportOrder(
+            id=order_id,
+            unit_id=unit_id,
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            created_time_ns=time_ns,
+        )
+        self.transport_orders[order.id] = order
+        self.pending_transport_orders.append(order.id)
+        return order
 
-    def _dispatch_unit_to_target(self, k: EventKernel, unit_id: str, route: RouteConfig) -> None:
+    def _can_unit_depart(self, node_id: str, unit_id: str) -> bool:
+        kind = self.nodes_by_id[node_id].kind
+        if kind == "source":
+            pending = self.source_pending_units.get(node_id, [])
+            if pending:
+                return pending[0] == unit_id
+            return True
+        elif kind == "buffer":
+            buf = self.buffers.get(node_id)
+            if not buf or not buf.occupants:
+                return False
+            return buf.occupants[0] == unit_id
+        elif kind == "station":
+            st = self.stations.get(node_id)
+            if not st:
+                return False
+            if st.has_output_units():
+                return st.output_buffer[0] == unit_id
+            if st.is_blocked:
+                return st.blocked_unit_id == unit_id
+            if st.current_unit_id == unit_id and not st.is_busy:
+                return True
+            return False
+        return True
+
+    def _try_dispatch_pending_orders(self, k: EventKernel) -> None:
+        if not self.pending_transport_orders:
+            return
+
+        unconstrained = len(self.vehicles) == 0
+        available_vehicles = [v for v in self.vehicles.values() if v.is_available()]
+        if not unconstrained and not available_vehicles:
+            return
+
+        dispatched_order_ids: list[str] = []
+
+        for order_id in list(self.pending_transport_orders):
+            order = self.transport_orders[order_id]
+            if order.state != TransportOrderState.PENDING:
+                dispatched_order_ids.append(order_id)
+                continue
+
+            unit = self.units[order.unit_id]
+
+            if not self._can_unit_depart(order.source_node_id, unit.id):
+                continue
+
+            candidates = self._get_candidate_routes_for_unit(order.source_node_id, unit)
+            if not candidates:
+                continue
+
+            decision = self.dispatch_policy.select_dispatch(
+                order=order,
+                unit=unit,
+                candidate_routes=candidates,
+                available_vehicles=available_vehicles,
+                active_route_occupancy=self.active_route_occupancy,
+                node_distance_fn=self._compute_node_distance,
+                can_accept_fn=self._can_accept,
+                unconstrained=unconstrained,
+            )
+
+            if decision is None:
+                continue
+
+            dispatched_order_ids.append(order_id)
+            if decision.vehicle is not None:
+                available_vehicles.remove(decision.vehicle)
+
+            self._execute_dispatch_decision(k, decision)
+
+            if not unconstrained and not available_vehicles:
+                break
+
+        for oid in dispatched_order_ids:
+            if oid in self.pending_transport_orders:
+                self.pending_transport_orders.remove(oid)
+
+    def _execute_dispatch_decision(self, k: EventKernel, decision: DispatchDecision) -> None:
+        order = decision.order
+        route = decision.route
+        vehicle = decision.vehicle
         target_id = route.target_node_id
+
+        order.target_node_id = target_id
         self.in_flight_to[target_id] += 1
-        self.units[unit_id].record_transition(
+        self.active_route_occupancy[route.id] = self.active_route_occupancy.get(route.id, 0) + 1
+
+        order.dispatch(
+            vehicle_id=vehicle.id if vehicle else None,
+            route_id=route.id,
+            time_ns=k.current_time_ns,
+        )
+
+        if vehicle is None:
+            self._begin_transport(k, order, route, None)
+        else:
+            reposition_time_ns = decision.pickup_distance_ns
+            if vehicle.speed_multiplier > 0:
+                reposition_time_ns = max(0, int(round(reposition_time_ns / vehicle.speed_multiplier)))
+
+            if reposition_time_ns == 0:
+                self._begin_transport(k, order, route, vehicle)
+            else:
+                vehicle.start_repositioning(
+                    order_id=order.id,
+                    target_node_id=order.source_node_id,
+                    time_ns=k.current_time_ns,
+                )
+                k.schedule(
+                    time_ns=k.current_time_ns + reposition_time_ns,
+                    priority=EventPriority.COMPLETION,
+                    event_type="VEHICLE_ARRIVED_AT_PICKUP",
+                    payload={
+                        "vehicle_id": vehicle.id,
+                        "order_id": order.id,
+                        "route_id": route.id,
+                    },
+                )
+
+    def _begin_transport(
+        self,
+        k: EventKernel,
+        order: TransportOrder,
+        route: RouteConfig,
+        vehicle: Vehicle | None,
+    ) -> None:
+        unit = self.units[order.unit_id]
+        self._remove_unit_from_node(order.source_node_id, unit.id, k.current_time_ns)
+        order.pickup(k.current_time_ns)
+        unit.record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_TRANSPORT,
             location=route.id,
         )
-        k.schedule(
-            time_ns=k.current_time_ns + route.transit_time_ns,
-            priority=EventPriority.COMPLETION,
-            event_type="ARRIVAL_AT_NODE",
-            payload={"unit_id": unit_id, "node_id": target_id},
-        )
 
-    def _pull_from_station(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        st = self.stations[upstream_id]
-        if st.has_output_units():
-            out_uid = st.output_buffer[0]
-            u = self.units[out_uid]
-            selected_route = self._select_route_for_unit(upstream_id, u)
-            if selected_route and selected_route.id == route.id and self._can_accept(route.target_node_id):
+        if vehicle is None:
+            k.schedule(
+                time_ns=k.current_time_ns + route.transit_time_ns,
+                priority=EventPriority.COMPLETION,
+                event_type="ARRIVAL_AT_NODE",
+                payload={
+                    "unit_id": unit.id,
+                    "node_id": route.target_node_id,
+                    "order_id": order.id,
+                    "route_id": route.id,
+                },
+            )
+        else:
+            effective_transit = route.transit_time_ns
+            if vehicle.speed_multiplier > 0:
+                effective_transit = max(1, int(round(effective_transit / vehicle.speed_multiplier)))
+
+            vehicle.start_transport(
+                order_id=order.id,
+                unit_id=unit.id,
+                route_id=route.id,
+                time_ns=k.current_time_ns,
+            )
+            k.schedule(
+                time_ns=k.current_time_ns + effective_transit,
+                priority=EventPriority.COMPLETION,
+                event_type="ARRIVAL_AT_NODE",
+                payload={
+                    "unit_id": unit.id,
+                    "node_id": route.target_node_id,
+                    "order_id": order.id,
+                    "route_id": route.id,
+                    "vehicle_id": vehicle.id,
+                },
+            )
+
+    def _remove_unit_from_node(self, node_id: str, unit_id: str, time_ns: int) -> None:
+        kind = self.nodes_by_id[node_id].kind
+        if kind == "source":
+            if unit_id in self.source_pending_units.get(node_id, []):
+                self.source_pending_units[node_id].remove(unit_id)
+        elif kind == "buffer":
+            buf = self.buffers[node_id]
+            if buf.occupants and buf.occupants[0] == unit_id:
+                buf.pop_unit()
+            elif unit_id in buf.occupants:
+                buf.occupants.remove(unit_id)
+        elif kind == "station":
+            st = self.stations[node_id]
+            if st.has_output_units() and st.output_buffer[0] == unit_id:
                 st.pop_output_unit()
-                self._dispatch_unit_to_target(k, out_uid, route)
                 if st.is_blocked:
                     blocked_uid = st.blocked_unit_id
                     assert blocked_uid is not None
-                    st.end_blocking(k.current_time_ns)
+                    st.end_blocking(time_ns)
                     st.enqueue_output_unit(blocked_uid)
                     self.units[blocked_uid].record_transition(
-                        time_ns=k.current_time_ns,
+                        time_ns=time_ns,
                         state=ProductionUnitState.IN_STATION,
-                        location=upstream_id,
-                        station_id=upstream_id,
+                        location=node_id,
+                        station_id=node_id,
                     )
-                    self._try_pull_upstream(k, upstream_id, visited)
-                return True
-        elif st.is_blocked:
-            blocked_uid = st.blocked_unit_id
-            assert blocked_uid is not None
-            u = self.units[blocked_uid]
-            selected_route = self._select_route_for_unit(upstream_id, u)
-            if selected_route and selected_route.id == route.id and self._can_accept(route.target_node_id):
-                st.end_blocking(k.current_time_ns)
-                self._dispatch_unit_to_target(k, blocked_uid, route)
-                self._try_pull_upstream(k, upstream_id, visited)
-                return True
-        return False
+            elif st.is_blocked and st.blocked_unit_id == unit_id:
+                st.end_blocking(time_ns)
+            elif st.current_unit_id == unit_id:
+                st.current_unit_id = None
 
-    def _pull_from_buffer(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        buf = self.buffers[upstream_id]
-        pulled = False
-        while buf.has_occupants() and self._can_accept(route.target_node_id):
-            out_uid = buf.occupants[0]
-            u = self.units[out_uid]
-            selected_route = self._select_route_for_unit(upstream_id, u)
-            if selected_route and selected_route.id == route.id:
-                buf.pop_unit()
-                self._dispatch_unit_to_target(k, out_uid, route)
-                pulled = True
-            else:
-                break
-        if pulled:
-            self._try_pull_upstream(k, upstream_id, visited)
-        return pulled
+    def _handle_vehicle_arrived_at_pickup(self, k: EventKernel, event: ScheduledEvent) -> None:
+        vehicle_id = event.payload["vehicle_id"]
+        order_id = event.payload["order_id"]
+        route_id = event.payload["route_id"]
 
-    def _pull_from_source(self, k: EventKernel, upstream_id: str, route: RouteConfig, visited: set[str]) -> bool:
-        pulled = False
-        i = 0
-        while i < len(self.source_pending_units[upstream_id]) and self._can_accept(route.target_node_id):
-            candidate_uid = self.source_pending_units[upstream_id][i]
-            u = self.units[candidate_uid]
-            selected_route = self._select_route_for_unit(upstream_id, u)
-            if selected_route and selected_route.id == route.id:
-                self.source_pending_units[upstream_id].pop(i)
-                self._dispatch_unit_to_target(k, candidate_uid, route)
-                pulled = True
-            else:
-                i += 1
-        return pulled
+        vehicle = self.vehicles[vehicle_id]
+        order = self.transport_orders[order_id]
+        route = self.topology.routes_by_id[route_id]
 
-    def _try_pull_upstream(self, k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
-        if visited is None:
-            visited = set()
-        if node_id in visited:
-            return
-        visited.add(node_id)
-
-        for route in self.routes_to.get(node_id, []):
-            upstream_id = route.source_node_id
-            kind = self.nodes_by_id[upstream_id].kind
-            if kind == "station":
-                self._pull_from_station(k, upstream_id, route, visited)
-            elif kind == "buffer":
-                self._pull_from_buffer(k, upstream_id, route, visited)
-            elif kind == "source":
-                self._pull_from_source(k, upstream_id, route, visited)
+        vehicle.arrive_at_pickup(order.source_node_id, k.current_time_ns)
+        self._begin_transport(k, order, route, vehicle)
+        self._try_dispatch_pending_orders(k)
 
     def _handle_release(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
@@ -736,12 +1012,9 @@ class EpisodeEngine:
             state=ProductionUnitState.RELEASED,
             location=source_id,
         )
-
-        route = self._select_route_for_unit(source_id, unit)
-        if route and self._can_accept(route.target_node_id):
-            self._dispatch_unit_to_target(k, unit_id, route)
-        else:
-            self.source_pending_units[source_id].append(unit_id)
+        self.source_pending_units[source_id].append(unit_id)
+        self._create_transport_order(unit_id, source_id, k.current_time_ns)
+        self._try_dispatch_pending_orders(k)
 
     def _handle_sink_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
         self.units[unit_id].record_transition(
@@ -759,14 +1032,17 @@ class EpisodeEngine:
             state=ProductionUnitState.IN_BUFFER,
             location=node_id,
         )
-        if buf.has_occupants():
-            oldest_uid = buf.occupants[0]
-            oldest_unit = self.units[oldest_uid]
-            route = self._select_route_for_unit(node_id, oldest_unit)
-            if route and self._can_accept(route.target_node_id):
-                buf.pop_unit()
-                self._dispatch_unit_to_target(k, oldest_uid, route)
+        self._create_transport_order(unit_id, node_id, k.current_time_ns)
+        self._try_dispatch_pending_orders(k)
         self._try_pull_upstream(k, node_id)
+
+    def _try_pull_upstream(self, k: EventKernel, node_id: str, visited: set[str] | None = None) -> None:
+        if visited is None:
+            visited = set()
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        self._try_dispatch_pending_orders(k)
 
     def _can_acquire_worker_requirements(
         self, reqs: list[dict[str, Any]], time_ns: int
@@ -1462,7 +1738,21 @@ class EpisodeEngine:
     def _handle_arrival_at_node(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
         node_id = event.payload["node_id"]
+        order_id = event.payload.get("order_id")
+        route_id = event.payload.get("route_id")
+        vehicle_id = event.payload.get("vehicle_id")
+
         self.in_flight_to[node_id] -= 1
+        if route_id and route_id in self.active_route_occupancy:
+            self.active_route_occupancy[route_id] = max(0, self.active_route_occupancy[route_id] - 1)
+
+        if vehicle_id and vehicle_id in self.vehicles:
+            vehicle = self.vehicles[vehicle_id]
+            vehicle.arrive_at_destination(node_id, k.current_time_ns)
+
+        if order_id and order_id in self.transport_orders:
+            self.transport_orders[order_id].complete(k.current_time_ns)
+
         kind = self.nodes_by_id[node_id].kind
         if kind == "sink":
             self._handle_sink_arrival(k, unit_id, node_id)
@@ -1471,36 +1761,34 @@ class EpisodeEngine:
         elif kind == "station":
             self._handle_station_arrival(k, unit_id, node_id)
 
+        self._try_dispatch_pending_orders(k)
+
     def _route_or_buffer_unit(self, k: EventKernel, station_id: str, unit_id: str) -> None:
         st = self.stations[station_id]
         unit = self.units[unit_id]
-        route = self._select_route_for_unit(station_id, unit)
-        downstream_can_accept = route is not None and self._can_accept(route.target_node_id)
 
-        if downstream_can_accept and route is not None:
+        if st.has_output_space():
             st.current_unit_id = None
-            self._dispatch_unit_to_target(k, unit_id, route)
-            self._try_pull_upstream(k, station_id)
+            st.enqueue_output_unit(unit_id)
+            unit.record_transition(
+                time_ns=k.current_time_ns,
+                state=ProductionUnitState.IN_STATION,
+                location=station_id,
+                station_id=station_id,
+            )
         else:
-            if st.has_output_space():
-                st.current_unit_id = None
-                st.enqueue_output_unit(unit_id)
-                unit.record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.IN_STATION,
-                    location=station_id,
-                    station_id=station_id,
-                )
-                self._try_pull_upstream(k, station_id)
-            else:
-                st.start_blocking(unit_id, k.current_time_ns)
-                unit.record_transition(
-                    time_ns=k.current_time_ns,
-                    state=ProductionUnitState.BLOCKED,
-                    location=station_id,
-                    station_id=station_id,
-                )
+            st.start_blocking(unit_id, k.current_time_ns)
+            unit.record_transition(
+                time_ns=k.current_time_ns,
+                state=ProductionUnitState.BLOCKED,
+                location=station_id,
+                station_id=station_id,
+            )
+
+        self._create_transport_order(unit_id, station_id, k.current_time_ns)
+        self._try_dispatch_pending_orders(k)
         self._try_allocate_pending_resources(k.current_time_ns)
+        self._try_pull_upstream(k, station_id)
 
     def _handle_complete_operation(self, k: EventKernel, event: ScheduledEvent) -> None:
         unit_id = event.payload["unit_id"]
@@ -1917,6 +2205,8 @@ class EpisodeEngine:
                         payload={"worker_id": w_cfg.id},
                     )
 
+        vehicles = _create_vehicles_from_config(cfg)
+
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
             units=units,
@@ -1926,6 +2216,10 @@ class EpisodeEngine:
             source_pending_units=source_pending_units,
             machines=machines,
             workers=workers,
+            vehicles=vehicles,
+            transport_orders={},
+            pending_transport_orders=[],
+            active_route_occupancy={r.id: 0 for r in mf.routes},
         )
 
         engine = cls(
@@ -2118,6 +2412,21 @@ class EpisodeEngine:
         maintenance_waiters = list(domain_state.get("maintenance_waiters", []))
         active_maintenances = {k: dict(v) for k, v in domain_state.get("active_maintenances", {}).items()}
 
+        # Restore vehicles
+        vehicles = _create_vehicles_from_config(cfg)
+        for v_id, v_data in domain_state.get("vehicles", {}).items():
+            if v_id in vehicles:
+                vehicles[v_id].restore_state(v_data)
+
+        # Restore transport orders
+        transport_orders: dict[str, TransportOrder] = {
+            oid: TransportOrder.from_snapshot(o_data)
+            for oid, o_data in domain_state.get("transport_orders", {}).items()
+        }
+        pending_transport_orders = list(domain_state.get("pending_transport_orders", []))
+        active_route_occupancy = {r.id: 0 for r in mf.routes}
+        active_route_occupancy.update(domain_state.get("active_route_occupancy", {}))
+
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
             units=units,
@@ -2127,6 +2436,10 @@ class EpisodeEngine:
             source_pending_units=source_pending_units,
             machines=machines,
             workers=workers,
+            vehicles=vehicles,
+            transport_orders=transport_orders,
+            pending_transport_orders=pending_transport_orders,
+            active_route_occupancy=active_route_occupancy,
             resource_waiters=resource_waiters,
             active_operations=active_operations,
             maintenance_waiters=maintenance_waiters,
@@ -2165,6 +2478,16 @@ class EpisodeEngine:
                 w.id: WorkerSnapshot.from_dict(w.to_snapshot())
                 for w in self.workers.values()
             },
+            vehicles={
+                v.id: VehicleSnapshot.from_dict(v.to_snapshot())
+                for v in self.vehicles.values()
+            },
+            transport_orders={
+                o.id: TransportOrderSnapshot.from_dict(o.to_snapshot())
+                for o in self.transport_orders.values()
+            },
+            pending_transport_orders=list(self.pending_transport_orders),
+            active_route_occupancy=dict(self.active_route_occupancy),
             in_flight_to=dict(self.in_flight_to),
             source_pending_units={k: list(v) for k, v in self.source_pending_units.items()},
             resource_waiters=list(self.resource_waiters),
@@ -2220,6 +2543,8 @@ class EpisodeEngine:
             mach.update_metrics(self.kernel.current_time_ns)
         for w in self.workers.values():
             w.update_metrics(self.kernel.current_time_ns)
+        for v in self.vehicles.values():
+            v.update_metrics(self.kernel.current_time_ns)
         for s in self.stations.values():
             if s.waiting_since_ns is not None:
                 s.total_waiting_time_ns += self.kernel.current_time_ns - s.waiting_since_ns
@@ -2300,6 +2625,41 @@ class EpisodeEngine:
             for w in self.workers.values()
         ]
 
+        vehicle_summaries = sorted(
+            [
+                VehicleSummary(
+                    id=v.id,
+                    location=v.location,
+                    transports_completed=v.transports_completed,
+                    total_busy_time_ns=v.total_busy_time_ns,
+                    total_idle_time_ns=v.total_idle_time_ns,
+                    utilization=v.utilization,
+                    pool_id=v.pool_id,
+                )
+                for v in self.vehicles.values()
+            ],
+            key=lambda v: v.id,
+        )
+
+        transport_order_summaries = sorted(
+            [
+                TransportOrderSummary(
+                    id=o.id,
+                    unit_id=o.unit_id,
+                    source_node_id=o.source_node_id,
+                    target_node_id=o.target_node_id,
+                    route_id=o.assigned_route_id,
+                    vehicle_id=o.assigned_vehicle_id,
+                    state=str(o.state),
+                    created_time_ns=o.created_time_ns,
+                    dispatched_time_ns=o.dispatched_time_ns,
+                    completed_time_ns=o.completed_time_ns,
+                )
+                for o in self.transport_orders.values()
+            ],
+            key=lambda o: o.id,
+        )
+
         result_hash = _compute_result_hash(
             status=status,
             seed=self.cfg.seed,
@@ -2310,6 +2670,8 @@ class EpisodeEngine:
             buffers=buffer_summaries,
             machines=machine_summaries,
             workers=worker_summaries,
+            vehicles=vehicle_summaries,
+            transport_orders=transport_order_summaries,
         )
 
         return EpisodeSummary(
@@ -2322,6 +2684,8 @@ class EpisodeEngine:
             buffers=buffer_summaries,
             machines=machine_summaries,
             workers=worker_summaries,
+            vehicles=vehicle_summaries,
+            transport_orders=transport_order_summaries,
             result_hash=result_hash,
         )
 

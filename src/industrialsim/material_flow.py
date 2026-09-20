@@ -117,6 +117,9 @@ class Route:
     target_node_id: str
     target_port_id: str
     transit_time_ns: int = 0
+    capacity: int | None = None
+    required_capabilities: tuple[str, ...] = ()
+    pool_id: str | None = None
 
 
 class MaterialFlowGraph:

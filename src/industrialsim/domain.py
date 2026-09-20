@@ -726,3 +726,167 @@ class Buffer:
             "capacity": self.capacity,
             "peak_occupancy": self.peak_occupancy,
         }
+
+
+class VehicleState(StrEnum):
+    IDLE = "idle"
+    MOVING_TO_PICKUP = "moving_to_pickup"
+    TRANSPORTING = "transporting"
+
+
+@dataclass
+class Vehicle:
+    id: str
+    initial_location: str
+    location: str
+    pool_id: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    speed_multiplier: float = 1.0
+    current_order_id: str | None = None
+    current_unit_id: str | None = None
+    current_route_id: str | None = None
+    state: VehicleState = VehicleState.IDLE
+    total_busy_time_ns: int = 0
+    total_idle_time_ns: int = 0
+    transports_completed: int = 0
+    last_state_change_ns: int = 0
+
+    def is_available(self) -> bool:
+        return self.state == VehicleState.IDLE and self.current_order_id is None
+
+    def start_repositioning(self, order_id: str, target_node_id: str, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.current_order_id = order_id
+        self.state = VehicleState.MOVING_TO_PICKUP
+
+    def arrive_at_pickup(self, pickup_node_id: str, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.location = pickup_node_id
+
+    def start_transport(self, order_id: str, unit_id: str, route_id: str, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.current_order_id = order_id
+        self.current_unit_id = unit_id
+        self.current_route_id = route_id
+        self.state = VehicleState.TRANSPORTING
+
+    def arrive_at_destination(self, destination_node_id: str, time_ns: int) -> None:
+        self.update_metrics(time_ns)
+        self.location = destination_node_id
+        self.current_order_id = None
+        self.current_unit_id = None
+        self.current_route_id = None
+        self.transports_completed += 1
+        self.state = VehicleState.IDLE
+
+    def update_metrics(self, current_time_ns: int) -> None:
+        elapsed = current_time_ns - self.last_state_change_ns
+        if elapsed > 0:
+            if self.state != VehicleState.IDLE:
+                self.total_busy_time_ns += elapsed
+            else:
+                self.total_idle_time_ns += elapsed
+        self.last_state_change_ns = current_time_ns
+
+    @property
+    def utilization(self) -> float:
+        total = self.total_busy_time_ns + self.total_idle_time_ns
+        return self.total_busy_time_ns / total if total > 0 else 0.0
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "initial_location": self.initial_location,
+            "location": self.location,
+            "pool_id": self.pool_id,
+            "capabilities": list(self.capabilities),
+            "current_order_id": self.current_order_id,
+            "current_unit_id": self.current_unit_id,
+            "current_route_id": self.current_route_id,
+            "state": str(self.state),
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "transports_completed": self.transports_completed,
+            "last_state_change_ns": self.last_state_change_ns,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        self.location = state["location"]
+        self.pool_id = state.get("pool_id", self.pool_id)
+        self.capabilities = list(state.get("capabilities", self.capabilities))
+        self.current_order_id = state.get("current_order_id")
+        self.current_unit_id = state.get("current_unit_id")
+        self.current_route_id = state.get("current_route_id")
+        self.state = VehicleState(state["state"])
+        self.total_busy_time_ns = state.get("total_busy_time_ns", 0)
+        self.total_idle_time_ns = state.get("total_idle_time_ns", 0)
+        self.transports_completed = state.get("transports_completed", 0)
+        self.last_state_change_ns = state.get("last_state_change_ns", 0)
+
+
+class TransportOrderState(StrEnum):
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    IN_TRANSIT = "in_transit"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class TransportOrder:
+    id: str
+    unit_id: str
+    source_node_id: str
+    target_node_id: str
+    created_time_ns: int
+    assigned_route_id: str | None = None
+    assigned_vehicle_id: str | None = None
+    state: TransportOrderState = TransportOrderState.PENDING
+    dispatched_time_ns: int | None = None
+    pickup_time_ns: int | None = None
+    completed_time_ns: int | None = None
+
+    def dispatch(self, vehicle_id: str | None, route_id: str, time_ns: int) -> None:
+        self.assigned_vehicle_id = vehicle_id
+        self.assigned_route_id = route_id
+        self.dispatched_time_ns = time_ns
+        self.state = TransportOrderState.DISPATCHED
+
+    def pickup(self, time_ns: int) -> None:
+        self.pickup_time_ns = time_ns
+        self.state = TransportOrderState.IN_TRANSIT
+
+    def complete(self, time_ns: int) -> None:
+        self.completed_time_ns = time_ns
+        self.state = TransportOrderState.COMPLETED
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "unit_id": self.unit_id,
+            "source_node_id": self.source_node_id,
+            "target_node_id": self.target_node_id,
+            "assigned_route_id": self.assigned_route_id,
+            "assigned_vehicle_id": self.assigned_vehicle_id,
+            "state": str(self.state),
+            "created_time_ns": self.created_time_ns,
+            "dispatched_time_ns": self.dispatched_time_ns,
+            "pickup_time_ns": self.pickup_time_ns,
+            "completed_time_ns": self.completed_time_ns,
+        }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any]) -> TransportOrder:
+        return cls(
+            id=data["id"],
+            unit_id=data["unit_id"],
+            source_node_id=data["source_node_id"],
+            target_node_id=data["target_node_id"],
+            assigned_route_id=data.get("assigned_route_id"),
+            assigned_vehicle_id=data.get("assigned_vehicle_id"),
+            state=TransportOrderState(data["state"]),
+            created_time_ns=data["created_time_ns"],
+            dispatched_time_ns=data.get("dispatched_time_ns"),
+            pickup_time_ns=data.get("pickup_time_ns"),
+            completed_time_ns=data.get("completed_time_ns"),
+        )

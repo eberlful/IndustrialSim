@@ -34,6 +34,10 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["machines"] = [m.model_dump(mode="json") for m in cfg.machines]
         if getattr(cfg, "workers", None):
             model_data["workers"] = [w.model_dump(mode="json") for w in cfg.workers]
+        if getattr(cfg, "vehicle_pools", None):
+            model_data["vehicle_pools"] = [p.model_dump(mode="json") for p in cfg.vehicle_pools]
+        if getattr(cfg, "vehicles", None):
+            model_data["vehicles"] = [v.model_dump(mode="json") for v in cfg.vehicles]
         if getattr(cfg, "process_plans", None):
             model_data["process_plans"] = [p.model_dump(mode="json") for p in cfg.process_plans]
     elif isinstance(cfg, dict):
@@ -46,6 +50,10 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["machines"] = cfg.get("machines")
         if cfg.get("workers"):
             model_data["workers"] = cfg.get("workers")
+        if cfg.get("vehicle_pools"):
+            model_data["vehicle_pools"] = cfg.get("vehicle_pools")
+        if cfg.get("vehicles"):
+            model_data["vehicles"] = cfg.get("vehicles")
         if cfg.get("process_plans"):
             model_data["process_plans"] = cfg.get("process_plans")
     else:
@@ -395,6 +403,116 @@ class BufferSnapshot:
         )
 
 
+@dataclass(frozen=True)
+class VehicleSnapshot:
+    id: str
+    initial_location: str
+    location: str
+    pool_id: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    current_order_id: str | None = None
+    current_unit_id: str | None = None
+    current_route_id: str | None = None
+    state: str = "idle"
+    total_busy_time_ns: int = 0
+    total_idle_time_ns: int = 0
+    transports_completed: int = 0
+    last_state_change_ns: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "initial_location": self.initial_location,
+            "location": self.location,
+            "pool_id": self.pool_id,
+            "capabilities": list(self.capabilities),
+            "current_order_id": self.current_order_id,
+            "current_unit_id": self.current_unit_id,
+            "current_route_id": self.current_route_id,
+            "state": self.state,
+            "total_busy_time_ns": self.total_busy_time_ns,
+            "total_idle_time_ns": self.total_idle_time_ns,
+            "transports_completed": self.transports_completed,
+            "last_state_change_ns": self.last_state_change_ns,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> VehicleSnapshot:
+        return cls(
+            id=str(data["id"]),
+            initial_location=str(data["initial_location"]),
+            location=str(data["location"]),
+            pool_id=data.get("pool_id"),
+            capabilities=list(data.get("capabilities", [])),
+            current_order_id=data.get("current_order_id"),
+            current_unit_id=data.get("current_unit_id"),
+            current_route_id=data.get("current_route_id"),
+            state=str(data.get("state", "idle")),
+            total_busy_time_ns=int(data.get("total_busy_time_ns", 0)),
+            total_idle_time_ns=int(data.get("total_idle_time_ns", 0)),
+            transports_completed=int(data.get("transports_completed", 0)),
+            last_state_change_ns=int(data.get("last_state_change_ns", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class TransportOrderSnapshot:
+    id: str
+    unit_id: str
+    source_node_id: str
+    target_node_id: str
+    created_time_ns: int
+    assigned_route_id: str | None = None
+    assigned_vehicle_id: str | None = None
+    state: str = "pending"
+    dispatched_time_ns: int | None = None
+    pickup_time_ns: int | None = None
+    completed_time_ns: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "unit_id": self.unit_id,
+            "source_node_id": self.source_node_id,
+            "target_node_id": self.target_node_id,
+            "created_time_ns": self.created_time_ns,
+            "assigned_route_id": self.assigned_route_id,
+            "assigned_vehicle_id": self.assigned_vehicle_id,
+            "state": self.state,
+            "dispatched_time_ns": self.dispatched_time_ns,
+            "pickup_time_ns": self.pickup_time_ns,
+            "completed_time_ns": self.completed_time_ns,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TransportOrderSnapshot:
+        return cls(
+            id=str(data["id"]),
+            unit_id=str(data["unit_id"]),
+            source_node_id=str(data["source_node_id"]),
+            target_node_id=str(data["target_node_id"]),
+            created_time_ns=int(data["created_time_ns"]),
+            assigned_route_id=data.get("assigned_route_id"),
+            assigned_vehicle_id=data.get("assigned_vehicle_id"),
+            state=str(data.get("state", "pending")),
+            dispatched_time_ns=data.get("dispatched_time_ns"),
+            pickup_time_ns=data.get("pickup_time_ns"),
+            completed_time_ns=data.get("completed_time_ns"),
+        )
+
+
 @dataclass
 class DomainStateSnapshot:
     production_units: dict[str, ProductionUnitSnapshot]
@@ -402,6 +520,10 @@ class DomainStateSnapshot:
     buffers: dict[str, BufferSnapshot] = field(default_factory=dict)
     machines: dict[str, MachineSnapshot] = field(default_factory=dict)
     workers: dict[str, WorkerSnapshot] = field(default_factory=dict)
+    vehicles: dict[str, VehicleSnapshot] = field(default_factory=dict)
+    transport_orders: dict[str, TransportOrderSnapshot] = field(default_factory=dict)
+    pending_transport_orders: list[str] = field(default_factory=list)
+    active_route_occupancy: dict[str, int] = field(default_factory=dict)
     in_flight_to: dict[str, int] = field(default_factory=dict)
     source_pending_units: dict[str, list[str]] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
@@ -416,6 +538,10 @@ class DomainStateSnapshot:
             "buffers": {k: v.to_dict() for k, v in self.buffers.items()},
             "machines": {k: v.to_dict() for k, v in self.machines.items()},
             "workers": {k: v.to_dict() for k, v in self.workers.items()},
+            "vehicles": {k: v.to_dict() for k, v in self.vehicles.items()},
+            "transport_orders": {k: v.to_dict() for k, v in self.transport_orders.items()},
+            "pending_transport_orders": list(self.pending_transport_orders),
+            "active_route_occupancy": dict(self.active_route_occupancy),
             "in_flight_to": dict(self.in_flight_to),
             "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
             "resource_waiters": list(self.resource_waiters),
@@ -435,6 +561,14 @@ class DomainStateSnapshot:
             return self.machines
         if key == "workers":
             return self.workers
+        if key == "vehicles":
+            return self.vehicles
+        if key == "transport_orders":
+            return self.transport_orders
+        if key == "pending_transport_orders":
+            return self.pending_transport_orders
+        if key == "active_route_occupancy":
+            return self.active_route_occupancy
         if key == "in_flight_to":
             return self.in_flight_to
         if key == "source_pending_units":
@@ -478,6 +612,16 @@ class DomainStateSnapshot:
                 k: WorkerSnapshot.from_dict(v) if isinstance(v, dict) else v
                 for k, v in data.get("workers", {}).items()
             },
+            vehicles={
+                k: VehicleSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("vehicles", {}).items()
+            },
+            transport_orders={
+                k: TransportOrderSnapshot.from_dict(v) if isinstance(v, dict) else v
+                for k, v in data.get("transport_orders", {}).items()
+            },
+            pending_transport_orders=list(data.get("pending_transport_orders", [])),
+            active_route_occupancy=dict(data.get("active_route_occupancy", {})),
             in_flight_to=dict(data.get("in_flight_to", {})),
             source_pending_units={
                 k: list(v) for k, v in data.get("source_pending_units", {}).items()

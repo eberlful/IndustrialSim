@@ -356,6 +356,35 @@ class WorkerRequirementConfig(StrictBaseModel):
         return self
 
 
+# Vehicles & Logistics
+class VehiclePoolConfig(StrictBaseModel):
+    id: str
+    name: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    speed_multiplier: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_pool(self) -> VehiclePoolConfig:
+        if self.speed_multiplier <= 0.0:
+            raise ValueError(f"Vehicle pool speed_multiplier must be > 0.0, got {self.speed_multiplier}")
+        return self
+
+
+class VehicleConfig(StrictBaseModel):
+    id: str
+    name: str | None = None
+    pool_id: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    initial_location: str
+    speed_multiplier: float | None = None
+
+    @model_validator(mode="after")
+    def validate_vehicle(self) -> VehicleConfig:
+        if self.speed_multiplier is not None and self.speed_multiplier <= 0.0:
+            raise ValueError(f"Vehicle speed_multiplier must be > 0.0, got {self.speed_multiplier}")
+        return self
+
+
 # Operations & Stations
 class InspectionConfig(StrictBaseModel):
     sensitivity: float = 1.0
@@ -472,10 +501,15 @@ class RouteConfig(StrictBaseModel):
     target_port_id: str
     transit_time: int | str = 0
     transit_time_ns: int = 0
+    capacity: int | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
+    pool_id: str | None = None
 
     @model_validator(mode="after")
     def compute_transit_time_ns(self) -> RouteConfig:
         object.__setattr__(self, "transit_time_ns", parse_duration_ns(self.transit_time))
+        if self.capacity is not None and self.capacity < 1:
+            raise ValueError(f"Route '{self.id}' capacity must be >= 1, got {self.capacity}")
         return self
 
 
@@ -539,6 +573,9 @@ class MaterialFlowConfig(StrictBaseModel):
                     target_node_id=rc.target_node_id,
                     target_port_id=rc.target_port_id,
                     transit_time_ns=rc.transit_time_ns,
+                    capacity=rc.capacity,
+                    required_capabilities=tuple(rc.required_capabilities),
+                    pool_id=rc.pool_id,
                 )
             )
 
@@ -634,6 +671,8 @@ class SimulationConfig(StrictBaseModel):
     material_flow: MaterialFlowConfig | None = None
     machines: list[MachineConfig] = Field(default_factory=list)
     workers: list[WorkerConfig] = Field(default_factory=list)
+    vehicle_pools: list[VehiclePoolConfig] = Field(default_factory=list)
+    vehicles: list[VehicleConfig] = Field(default_factory=list)
     production_units: list[ProductionUnitConfig] = Field(default_factory=list)
     production_plan: list[ProductionPlanEntryConfig] = Field(default_factory=list)
     process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
@@ -678,6 +717,30 @@ class SimulationConfig(StrictBaseModel):
         worker_ids = [w.id for w in self.workers]
         if len(worker_ids) != len(set(worker_ids)):
             raise ValueError(f"Duplicate worker IDs found: {worker_ids}")
+
+        pool_ids = [p.id for p in self.vehicle_pools]
+        if len(pool_ids) != len(set(pool_ids)):
+            raise ValueError(f"Duplicate vehicle pool IDs found: {pool_ids}")
+
+        vehicle_ids = [v.id for v in self.vehicles]
+        if len(vehicle_ids) != len(set(vehicle_ids)):
+            raise ValueError(f"Duplicate vehicle IDs found: {vehicle_ids}")
+
+        valid_pool_set = set(pool_ids)
+        for v in self.vehicles:
+            if v.pool_id is not None and v.pool_id not in valid_pool_set:
+                raise ValueError(f"Vehicle '{v.id}' references unknown vehicle pool '{v.pool_id}'")
+
+        if self.material_flow is not None:
+            valid_node_ids = {node.id for node in self.material_flow.nodes}
+            for v in self.vehicles:
+                if v.initial_location not in valid_node_ids:
+                    raise ValueError(
+                        f"Vehicle '{v.id}' references unknown initial_location '{v.initial_location}'"
+                    )
+            for r in self.material_flow.routes:
+                if r.pool_id is not None and r.pool_id not in valid_pool_set:
+                    raise ValueError(f"Route '{r.id}' references unknown vehicle pool '{r.pool_id}'")
 
         valid_mach_set = set(mach_ids)
         valid_worker_set = set(worker_ids)
