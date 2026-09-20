@@ -6,6 +6,7 @@ import sys
 from typing import Any, Callable, Sequence
 
 from industrialsim.application import (
+    branch_checkpoint,
     inspect_checkpoint,
     resume_episode,
     run_episode,
@@ -62,6 +63,26 @@ def create_parser() -> argparse.ArgumentParser:
         help="Optional path to the YAML configuration file to validate against checkpoint",
     )
 
+    branch_parser = subparsers.add_parser(
+        "branch",
+        help="Branch counterfactual decisions from a simulation checkpoint",
+    )
+    branch_parser.add_argument(
+        "checkpoint_path",
+        help="Path to the Decision Checkpoint file",
+    )
+    branch_parser.add_argument(
+        "action_files",
+        nargs="+",
+        help="Paths to at least two JSON files containing alternative Action sets",
+    )
+    branch_parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="Optional path to the YAML configuration file to validate against checkpoint",
+    )
+
     return parser
 
 
@@ -93,8 +114,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "resume":
         return _execute_cli_action(lambda: resume_episode(args.checkpoint_path, config_source=args.config_path))
 
+    if args.command == "branch":
+        def run_branch() -> Any:
+            if len(args.action_files) < 2:
+                raise ValueError(
+                    f"Counterfactual branching requires at least two alternative Action sets, got {len(args.action_files)}"
+                )
+            from pathlib import Path
+
+            alternatives: list[Any] = []
+            for file_str in args.action_files:
+                p = Path(file_str)
+                data = json.loads(p.read_text(encoding="utf-8"))
+                alternatives.append(data)
+
+            return branch_checkpoint(
+                args.checkpoint_path,
+                alternative_actions=alternatives,
+                config_source=args.config_path,
+            )
+
+        return _execute_cli_action(run_branch)
+
     return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

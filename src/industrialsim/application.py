@@ -7,7 +7,7 @@ import heapq
 import json
 from pathlib import Path
 from typing import Any, Sequence
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from ruamel.yaml import YAML
 
 from industrialsim.config import (
@@ -56,6 +56,7 @@ from industrialsim.decisions import (
     DecisionBatchCoordinator,
     DecisionBatchResponse,
     DecisionDiagnosticRecord,
+    DecisionProvenance,
     DecisionProvider,
     DecisionRequest,
     DispatchAction,
@@ -645,7 +646,7 @@ class EpisodeEngine:
         self.kernel = kernel
         self.topology = topology
         self.domain = domain
-        self.random_occurrence_counters = random_occurrence_counters or {}
+        self.random_occurrence_counters = dict(random_occurrence_counters or {})
         self.plugin_metadata = plugin_metadata or {}
         self.decision_provider = decision_provider
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=f"ep-{self.cfg.seed}")
@@ -3191,7 +3192,11 @@ class EpisodeEngine:
             configuration=self.cfg.model_dump(mode="json"),
         )
 
-    def run(self, pause_at_ns: int | None = None) -> EpisodeSummary:
+    def run(
+        self,
+        pause_at_ns: int | None = None,
+        pause_at_decision_batch: bool = False,
+    ) -> EpisodeSummary:
         max_t = pause_at_ns
         if self.cfg.episode.end_condition.max_time_ns is not None:
             if max_t is None:
@@ -3202,6 +3207,17 @@ class EpisodeEngine:
         while self.kernel.queue_size > 0 and not self.is_aborted:
             if self._is_terminal_condition_met(self.kernel):
                 break
+
+            has_more_events_at_same_time = (
+                self.kernel.peek_next_time() == self.kernel.current_time_ns
+            )
+            if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
+                if pause_at_decision_batch:
+                    return self.to_summary()
+                self._process_decision_batch()
+                if self.is_aborted:
+                    break
+
             next_time = self.kernel.peek_next_time()
             if next_time is None or (max_t is not None and next_time > max_t):
                 break
@@ -3215,6 +3231,8 @@ class EpisodeEngine:
                 self.kernel.peek_next_time() == self.kernel.current_time_ns
             )
             if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
+                if pause_at_decision_batch:
+                    return self.to_summary()
                 self._process_decision_batch()
                 if self.is_aborted:
                     break
@@ -3223,11 +3241,13 @@ class EpisodeEngine:
                 break
 
         if not self.is_aborted and self.decision_coordinator.has_pending():
-            self._process_decision_batch()
+            if not pause_at_decision_batch:
+                self._process_decision_batch()
 
         if not self.is_aborted and not self._is_terminal_condition_met(self.kernel):
-            if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
-                self.kernel.advance_to(pause_at_ns)
+            if not (pause_at_decision_batch and self.decision_coordinator.has_pending()):
+                if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
+                    self.kernel.advance_to(pause_at_ns)
 
         return self.to_summary()
 
@@ -3403,37 +3423,37 @@ class EpisodeEngine:
 def create_checkpoint(
     source: str | Path | dict[str, Any] | SimulationConfig | EpisodeEngine,
     at_time_ns: int | None = None,
+    pause_at_decision_batch: bool = False,
     decision_provider: DecisionProvider | None = None,
 ) -> Checkpoint:
     if isinstance(source, EpisodeEngine):
         engine = source
         if decision_provider is not None:
             engine.decision_provider = decision_provider
-        if at_time_ns is not None:
-            if at_time_ns < engine.kernel.current_time_ns:
-                raise ValueError(
-                    f"Cannot create checkpoint at {at_time_ns} ns: engine has already advanced past this time to {engine.kernel.current_time_ns} ns"
-                )
-            if at_time_ns > engine.kernel.current_time_ns:
-                engine.run(pause_at_ns=at_time_ns)
-        return engine.create_checkpoint()
-
-    if isinstance(source, SimulationConfig):
-        cfg = source
-    else:
-        validation = validate_config(source)
-        if not validation.is_valid or validation.config is None:
-            raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
-        cfg = validation.config
-
-    engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
-    if at_time_ns is not None:
-        if at_time_ns < cfg.episode.start_time_ns:
+        if at_time_ns is not None and at_time_ns < engine.kernel.current_time_ns:
             raise ValueError(
-                f"Cannot create checkpoint at {at_time_ns} ns: start time is {cfg.episode.start_time_ns} ns"
+                f"Cannot create checkpoint at {at_time_ns} ns: engine has already advanced past this time to {engine.kernel.current_time_ns} ns"
             )
-        if at_time_ns > cfg.episode.start_time_ns:
-            engine.run(pause_at_ns=at_time_ns)
+    else:
+        if isinstance(source, SimulationConfig):
+            cfg = source
+        else:
+            validation = validate_config(source)
+            if not validation.is_valid or validation.config is None:
+                raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+            cfg = validation.config
+
+        if at_time_ns is not None and at_time_ns < cfg.episode.start_time_ns:
+            raise ValueError(
+                f"Cannot create checkpoint at {at_time_ns} ns: episode start time is {cfg.episode.start_time_ns} ns"
+            )
+        engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
+
+    if pause_at_decision_batch:
+        engine.run(pause_at_ns=at_time_ns, pause_at_decision_batch=True)
+    elif at_time_ns is not None and at_time_ns > engine.kernel.current_time_ns:
+        engine.run(pause_at_ns=at_time_ns)
+
     return engine.create_checkpoint()
 
 
@@ -3493,4 +3513,341 @@ def run_episode(
     cfg = validation.config
     engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
     return engine.run()
+
+
+@dataclass(frozen=True)
+class CounterfactualBranchResult:
+    branch_id: str
+    actions: list[dict[str, Any]]
+    provenance: DecisionProvenance
+    raw_metrics: dict[str, Any]
+    hard_constraints: dict[str, Any]
+    summary: EpisodeSummary
+    result_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch_id": self.branch_id,
+            "actions": self.actions,
+            "provenance": self.provenance.model_dump(mode="json"),
+            "raw_metrics": self.raw_metrics,
+            "hard_constraints": self.hard_constraints,
+            "summary": self.summary.to_dict(),
+            "result_hash": self.result_hash,
+        }
+
+
+@dataclass(frozen=True)
+class BranchComparisonResult:
+    checkpoint_config_hash: str
+    checkpoint_time_ns: int
+    decision_batch_id: str
+    branches: list[CounterfactualBranchResult]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "checkpoint_config_hash": self.checkpoint_config_hash,
+            "checkpoint_time_ns": self.checkpoint_time_ns,
+            "decision_batch_id": self.decision_batch_id,
+            "branches": [b.to_dict() for b in self.branches],
+        }
+
+
+def _parse_action_set(
+    action_input: Any,
+) -> tuple[str | None, str | None, str | None, list[DecisionAction]]:
+    action_adapter: TypeAdapter[DecisionAction] = TypeAdapter(DecisionAction)
+
+    if isinstance(action_input, DecisionBatchResponse):
+        prov = action_input.provenance
+        return prov.provider_id, prov.model_id, prov.prompt_id, list(action_input.actions)
+
+    provider_id: str | None = None
+    model_id: str | None = None
+    prompt_id: str | None = None
+    raw_actions: list[Any] = []
+
+    if isinstance(action_input, dict):
+        if "action_type" in action_input:
+            raw_actions = [action_input]
+        else:
+            provider_id = action_input.get("provider_id")
+            model_id = action_input.get("model_id")
+            prompt_id = action_input.get("prompt_id")
+            raw_actions = action_input.get("actions", [])
+    elif isinstance(action_input, (list, tuple)):
+        raw_actions = list(action_input)
+    else:
+        raw_actions = [action_input]
+
+    parsed_actions: list[DecisionAction] = []
+    for item in raw_actions:
+        if isinstance(
+            item,
+            (
+                BufferReorderAction,
+                RoutingAction,
+                DispatchAction,
+                MachineModeAction,
+                MaintenanceAction,
+                ReconfigurationAction,
+                WorkerReassignmentAction,
+                QualityControlAction,
+            ),
+        ):
+            parsed_actions.append(item)
+        else:
+            parsed_actions.append(action_adapter.validate_python(item))
+
+    return provider_id, model_id, prompt_id, parsed_actions
+
+
+def _derive_branch_id(
+    config_hash: str,
+    root_seed: int,
+    simulated_time_ns: int,
+    actions: Sequence[DecisionAction],
+) -> str:
+    # Sort action representations to ensure set order invariance
+    serialized_actions = [
+        json.dumps(a.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        for a in actions
+    ]
+    canonical_actions = json.dumps(sorted(serialized_actions), separators=(",", ":"))
+    action_hash = hashlib.sha256(canonical_actions.encode("utf-8")).hexdigest()[:12]
+    material = f"{config_hash}:{root_seed}:{simulated_time_ns}:{action_hash}".encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()[:12]
+    return f"branch-{digest}"
+
+
+def _compute_raw_metrics(summary: EpisodeSummary) -> dict[str, Any]:
+    # Good output: completed units at sink with quality_state != 'scrapped'
+    good_output = sum(
+        1
+        for u in summary.production_units
+        if u.state == "terminal" and u.location != "scrapped" and u.quality_state != "scrapped"
+    )
+    # Scrap: units in terminal state marked as scrapped
+    scrap = sum(
+        1
+        for u in summary.production_units
+        if u.state == "terminal" and (u.location == "scrapped" or u.quality_state == "scrapped")
+    )
+    # WIP: units released but not terminal
+    wip = sum(
+        1
+        for u in summary.production_units
+        if u.state not in ("created", "terminal")
+    )
+    # Good completed units for lead time and lateness (exclude scrapped units!)
+    good_completed_units = [
+        u
+        for u in summary.production_units
+        if u.state == "terminal" and u.location != "scrapped" and u.quality_state != "scrapped" and u.history
+    ]
+    if good_completed_units:
+        total_lead_time_ns = sum(
+            u.history[-1]["time_ns"] - u.history[0]["time_ns"]
+            for u in good_completed_units
+        )
+        lead_time_ns = int(round(total_lead_time_ns / len(good_completed_units)))
+    else:
+        lead_time_ns = 0
+
+    # Downtime (ns): sum of failed time and maintenance time across machines
+    downtime_ns = sum(
+        m.total_failed_time_ns + m.total_maintenance_time_ns
+        for m in summary.machines
+    )
+
+    # Lateness (ns): total lateness beyond due date for good completed units
+    lateness_ns = sum(
+        max(0, u.history[-1]["time_ns"] - u.due_date_ns)
+        for u in good_completed_units
+        if u.due_date_ns is not None
+    )
+
+    # Resource utilization
+    resource_utilization = {
+        "machines": {m.id: m.utilization for m in summary.machines},
+        "workers": {w.id: w.utilization for w in summary.workers},
+        "vehicles": {v.id: v.utilization for v in summary.vehicles},
+    }
+
+    return {
+        "good_output": good_output,
+        "lead_time_ns": lead_time_ns,
+        "wip": wip,
+        "scrap": scrap,
+        "downtime_ns": downtime_ns,
+        "lateness_ns": lateness_ns,
+        "resource_utilization": resource_utilization,
+        "total_strategic_cost": summary.total_strategic_cost,
+    }
+
+
+def _compute_hard_constraints(summary: EpisodeSummary) -> dict[str, Any]:
+    violations: list[dict[str, Any]] = []
+    if summary.is_aborted:
+        violations.append(
+            {
+                "code": "EPISODE_ABORTED",
+                "reason": summary.abort_reason or "Unknown abort reason",
+            }
+        )
+    for b in summary.buffers:
+        if b.peak_occupancy > b.capacity:
+            violations.append(
+                {
+                    "code": "BUFFER_CAPACITY_VIOLATION",
+                    "buffer_id": b.id,
+                    "capacity": b.capacity,
+                    "peak_occupancy": b.peak_occupancy,
+                }
+            )
+
+    satisfied = (len(violations) == 0) and not summary.is_aborted
+    return {
+        "satisfied": satisfied,
+        "violations": violations,
+        "aborted": summary.is_aborted,
+        "abort_reason": summary.abort_reason,
+    }
+
+
+def branch_checkpoint(
+    checkpoint: str | Path | dict[str, Any] | Checkpoint,
+    alternative_actions: Sequence[Any],
+    config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+) -> BranchComparisonResult:
+    if len(alternative_actions) < 2:
+        raise ValueError(
+            f"Counterfactual branching requires at least two alternative Action sets, got {len(alternative_actions)}"
+        )
+
+    if isinstance(checkpoint, (str, Path)):
+        cp = load_checkpoint(checkpoint)
+    elif isinstance(checkpoint, dict):
+        cp = deserialize_checkpoint(checkpoint)
+    elif isinstance(checkpoint, Checkpoint):
+        cp = checkpoint
+    else:
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    cfg: SimulationConfig | None = None
+    if config_source is not None:
+        if isinstance(config_source, SimulationConfig):
+            cfg = config_source
+        else:
+            validation = validate_config(config_source)
+            if not validation.is_valid or validation.config is None:
+                raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+            cfg = validation.config
+
+    # Verify that the checkpoint is at a Decision Batch
+    coord = (
+        cp.domain_state.get("decision_coordinator")
+        if hasattr(cp.domain_state, "get")
+        else getattr(cp.domain_state, "decision_coordinator", None)
+    )
+    if isinstance(coord, dict):
+        pending = coord.get("pending_requests", [])
+    elif hasattr(coord, "pending_requests"):
+        pending = getattr(coord, "pending_requests")
+    else:
+        pending = []
+
+    if not pending:
+        raise ValueError(
+            "Checkpoint is not at a Decision Batch: no pending decision requests found in checkpoint."
+        )
+
+    branch_results: list[CounterfactualBranchResult] = []
+    batch_id: str = "unknown"
+
+    for alt in alternative_actions:
+        provider_id, model_id, prompt_id, actions = _parse_action_set(alt)
+        branch_id = _derive_branch_id(
+            config_hash=cp.config_hash,
+            root_seed=cp.root_seed,
+            simulated_time_ns=cp.simulated_time_ns,
+            actions=actions,
+        )
+
+        # Restore isolated engine for this branch
+        engine = EpisodeEngine.restore(cp, config=cfg)
+        engine.decision_coordinator.branch_id = branch_id
+        engine.random_occurrence_counters = dict(cp.random_occurrence_counters)
+        engine.random_stream = SemanticRandomStream(
+            root_seed=engine.cfg.seed,
+            occurrence_counters=engine.random_occurrence_counters,
+        )
+
+        # Form the decision batch
+        batch = engine.decision_coordinator.form_batch(
+            time_ns=engine.kernel.current_time_ns,
+            observation_builder=lambda req: engine._build_observation_for_request(
+                req, engine.kernel.current_time_ns
+            ),
+        )
+        if batch is None:
+            raise ValueError("Failed to form Decision Batch from checkpoint pending requests.")
+
+        batch = batch.model_copy(update={"branch_id": branch_id})
+        batch_id = batch.batch_id
+
+        # Validate and apply actions with full provenance contract
+        provenance = DecisionProvenance(
+            episode_id=batch.episode_id,
+            branch_id=branch_id,
+            batch_id=batch.batch_id,
+            provider_id=provider_id or f"action-set-{branch_id}",
+            model_id=model_id,
+            prompt_id=prompt_id,
+        )
+        response = DecisionBatchResponse(
+            batch_id=batch.batch_id,
+            provenance=provenance,
+            actions=actions,
+        )
+
+        is_valid, diagnostics = validate_decision_batch_response(batch, response)
+        if is_valid:
+            engine._apply_decision_actions(batch, response)
+        else:
+            engine._handle_decision_failure(batch, diagnostics)
+
+        # Continue branch execution to episode completion
+        summary = engine.run()
+
+        # The actions actually applied in this branch
+        applied_actions = (
+            engine.decision_batches[-1].get("actions", [a.model_dump(mode="json") for a in actions])
+            if engine.decision_batches
+            else [a.model_dump(mode="json") for a in actions]
+        )
+
+        raw_metrics = _compute_raw_metrics(summary)
+        hard_constraints = _compute_hard_constraints(summary)
+
+        branch_results.append(
+            CounterfactualBranchResult(
+                branch_id=branch_id,
+                actions=applied_actions,
+                provenance=provenance,
+                raw_metrics=raw_metrics,
+                hard_constraints=hard_constraints,
+                summary=summary,
+                result_hash=summary.result_hash,
+            )
+        )
+
+    return BranchComparisonResult(
+        checkpoint_config_hash=cp.config_hash,
+        checkpoint_time_ns=cp.simulated_time_ns,
+        decision_batch_id=batch_id,
+        branches=branch_results,
+    )
+
+
 

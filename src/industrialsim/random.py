@@ -60,10 +60,41 @@ class SemanticRandomStream:
     root_seed: int
     occurrence_counters: dict[str, int]
 
-    def draw_float(self, stream_kind: str, entity_id: str, mode: str) -> float:
+    @staticmethod
+    def format_semantic_key(
+        stream_kind: str,
+        entity_id: str,
+        mode: str,
+        occurrence: int,
+    ) -> str:
+        """Format semantic key: stream_kind:entity_id:mode:occurrence."""
+        return f"{stream_kind}:{entity_id}:{mode}:{occurrence}"
+
+    def get_semantic_key(
+        self,
+        stream_kind: str,
+        entity_id: str,
+        mode: str,
+        occurrence: int | None = None,
+    ) -> str:
+        """Get semantic key for the next (or specified) occurrence index."""
+        if occurrence is None:
+            occurrence = self.occurrence_counters.get(f"{stream_kind}:{entity_id}:{mode}", 0)
+        return self.format_semantic_key(stream_kind, entity_id, mode, occurrence)
+
+    def draw_float(
+        self,
+        stream_kind: str,
+        entity_id: str,
+        mode: str,
+        occurrence: int | None = None,
+    ) -> float:
         semantic_address = f"{stream_kind}:{entity_id}:{mode}"
-        occurrence = self.occurrence_counters.get(semantic_address, 0)
-        self.occurrence_counters[semantic_address] = occurrence + 1
+        if occurrence is None:
+            occ = self.occurrence_counters.get(semantic_address, 0)
+            self.occurrence_counters[semantic_address] = occ + 1
+        else:
+            occ = occurrence
 
         # Derive 64-bit key from root_seed and semantic address
         seed_material = f"{self.root_seed}:{semantic_address}".encode("utf-8")
@@ -72,8 +103,8 @@ class SemanticRandomStream:
         k1 = int.from_bytes(hash_bytes[4:8], byteorder="little")
 
         rng = Philox4x32(key=(k0, k1))
-        c0 = occurrence & MASK32
-        c1 = (occurrence >> 32) & MASK32
+        c0 = occ & MASK32
+        c1 = (occ >> 32) & MASK32
         words = rng.generate(counter=(c0, c1, 0, 0))
 
         # Form 53-bit uniform float in [0.0, 1.0)
@@ -81,3 +112,4 @@ class SemanticRandomStream:
         lo = words[1] >> 11
         bits53 = (hi << 21) | lo
         return bits53 / TWO_POW_53
+

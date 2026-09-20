@@ -200,3 +200,96 @@ def test_cli_resume_failure_incompatible_config(tmp_path: Path, capsys: pytest.C
     assert "mismatch" in data["error"].lower()
 
 
+def test_cli_branch_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from test_branch_counterfactual_decisions_e2e import BASE_DECISION_YAML
+    from industrialsim.application import create_checkpoint, save_checkpoint
+
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    cp_file = tmp_path / "decision_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    act1_file = tmp_path / "actions1.json"
+    act1_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-1", "u-2"]}]),
+        encoding="utf-8",
+    )
+
+    act2_file = tmp_path / "actions2.json"
+    act2_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-2", "u-1"]}]),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["branch", str(cp_file), str(act1_file), str(act2_file)])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert "branches" in data
+    assert len(data["branches"]) == 2
+    assert "branch_id" in data["branches"][0]
+    assert "raw_metrics" in data["branches"][0]
+    assert "hard_constraints" in data["branches"][0]
+
+
+def test_cli_branch_failure_fewer_than_two_alternatives(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_branch_counterfactual_decisions_e2e import BASE_DECISION_YAML
+    from industrialsim.application import create_checkpoint, save_checkpoint
+
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    cp_file = tmp_path / "decision_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    act1_file = tmp_path / "actions1.json"
+    act1_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-1", "u-2"]}]),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["branch", str(cp_file), str(act1_file)])
+    assert exit_code == 1
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "error"
+    assert "at least two" in data["error"].lower()
+
+
+def test_cli_branch_three_alternatives(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from test_branch_counterfactual_decisions_e2e import BASE_DECISION_YAML
+    from industrialsim.application import create_checkpoint, save_checkpoint
+
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    cp_file = tmp_path / "decision_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    act1_file = tmp_path / "actions1.json"
+    act1_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-1", "u-2"]}]),
+        encoding="utf-8",
+    )
+
+    act2_file = tmp_path / "actions2.json"
+    act2_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-2", "u-1"]}]),
+        encoding="utf-8",
+    )
+
+    act3_file = tmp_path / "actions3.json"
+    act3_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-1", "u-2"]}]),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["branch", str(cp_file), str(act1_file), str(act2_file), str(act3_file)])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert len(data["branches"]) == 3
+
+
+
+
