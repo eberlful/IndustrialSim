@@ -40,6 +40,20 @@ from industrialsim.domain import (
     VehicleState,
     Worker,
 )
+from industrialsim.decisions import (
+    BufferObservation,
+    BufferOccupantSummary,
+    BufferReorderAction,
+    BufferTriggerRuntime,
+    DecisionBatch,
+    DecisionBatchCoordinator,
+    DecisionBatchResponse,
+    DecisionDiagnosticRecord,
+    DecisionProvider,
+    DecisionRequest,
+    FifoBufferFallbackPolicy,
+    validate_decision_batch_response,
+)
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
 from industrialsim.random import SemanticRandomStream
 
@@ -259,9 +273,13 @@ class EpisodeSummary:
     workers: list[WorkerSummary] = field(default_factory=list)
     vehicles: list[VehicleSummary] = field(default_factory=list)
     transport_orders: list[TransportOrderSummary] = field(default_factory=list)
+    decision_batches: list[dict[str, Any]] = field(default_factory=list)
+    decision_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    is_aborted: bool = False
+    abort_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        res = {
             "status": self.status,
             "seed": self.seed,
             "simulated_time_ns": self.simulated_time_ns,
@@ -273,8 +291,14 @@ class EpisodeSummary:
             "workers": [w.to_dict() for w in self.workers],
             "vehicles": [v.to_dict() for v in self.vehicles],
             "transport_orders": [t.to_dict() for t in self.transport_orders],
+            "decision_batches": list(self.decision_batches),
+            "decision_diagnostics": list(self.decision_diagnostics),
             "result_hash": self.result_hash,
         }
+        if self.is_aborted:
+            res["is_aborted"] = True
+            res["abort_reason"] = self.abort_reason
+        return res
 
 
 def _parse_yaml_source(source: str | Path | dict[str, Any]) -> dict[str, Any]:
@@ -330,6 +354,8 @@ def _compute_result_hash(
     workers: list[WorkerSummary] | None = None,
     vehicles: list[VehicleSummary] | None = None,
     transport_orders: list[TransportOrderSummary] | None = None,
+    decision_batches: list[dict[str, Any]] | None = None,
+    decision_diagnostics: list[dict[str, Any]] | None = None,
 ) -> str:
     data: dict[str, Any] = {
         "status": status,
@@ -348,6 +374,10 @@ def _compute_result_hash(
         data["vehicles"] = [v.to_dict() for v in vehicles]
     if transport_orders:
         data["transport_orders"] = [t.to_dict() for t in transport_orders]
+    if decision_batches:
+        data["decision_batches"] = decision_batches
+    if decision_diagnostics:
+        data["decision_diagnostics"] = decision_diagnostics
     canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -580,6 +610,7 @@ class EpisodeEngine:
         random_occurrence_counters: dict[str, int] | None = None,
         plugin_metadata: dict[str, str] | None = None,
         dispatch_policy: BaselineDispatchPolicy | None = None,
+        decision_provider: DecisionProvider | None = None,
     ) -> None:
         self.cfg = config
         self.kernel = kernel
@@ -587,6 +618,20 @@ class EpisodeEngine:
         self.domain = domain
         self.random_occurrence_counters = random_occurrence_counters or {}
         self.plugin_metadata = plugin_metadata or {}
+        self.decision_provider = decision_provider
+        self.decision_coordinator = DecisionBatchCoordinator(episode_id=f"ep-{self.cfg.seed}")
+        self.decision_triggers: dict[str, list[BufferTriggerRuntime]] = {}
+        for t in self.cfg.decision_triggers:
+            runtime = BufferTriggerRuntime(
+                config=t,
+                max_batches_per_timestamp=self.cfg.max_batches_per_timestamp,
+            )
+            self.decision_triggers.setdefault(t.buffer_id, []).append(runtime)
+        self.decision_diagnostics: list[dict[str, Any]] = []
+        self.decision_batches: list[dict[str, Any]] = []
+        self.is_aborted: bool = False
+        self.abort_reason: str | None = None
+        self.buffer_history: dict[str, list[dict[str, Any]]] = {}
         self.process_plans: dict[str, ProcessPlanConfig] = {
             p.variant: p for p in self.cfg.process_plans
         }
@@ -705,6 +750,219 @@ class EpisodeEngine:
         self.kernel.register_handler("MAINTENANCE_TRIGGER", self._handle_maintenance_trigger)
         self.kernel.register_handler("COMPLETE_MAINTENANCE", self._handle_complete_maintenance)
 
+    def _build_buffer_observation(self, buffer_id: str, time_ns: int) -> BufferObservation:
+        buf = self.buffers[buffer_id]
+        occupants: list[BufferOccupantSummary] = []
+        for uid in buf.occupants:
+            unit = self.units[uid]
+            enter_t: int | None = None
+            for rec in reversed(unit.history):
+                if rec.location == buffer_id and rec.state == ProductionUnitState.IN_BUFFER:
+                    enter_t = rec.time_ns
+                    break
+            occupants.append(
+                BufferOccupantSummary(
+                    unit_id=uid,
+                    variant=unit.variant,
+                    due_date_ns=unit.due_date_ns,
+                    enter_time_ns=enter_t,
+                    findings_count=len(unit.findings),
+                )
+            )
+
+        upstream_nodes = [r.source_node_id for r in self.routes_to.get(buffer_id, [])]
+        downstream_nodes = [r.target_node_id for r in self.routes_from.get(buffer_id, [])]
+
+        route_statuses: dict[str, Any] = {}
+        for r in self.routes_from.get(buffer_id, []):
+            route_statuses[r.id] = {
+                "target_node_id": r.target_node_id,
+                "capacity": r.capacity,
+                "active_occupancy": self.active_route_occupancy.get(r.id, 0),
+                "reserved_occupancy": self.reserved_route_occupancy.get(r.id, 0),
+            }
+
+        completed_count = sum(
+            1 for u in self.units.values() if u.state == ProductionUnitState.TERMINAL and u.location == "sink"
+        )
+        scrapped_count = sum(
+            1 for u in self.units.values() if u.state == ProductionUnitState.TERMINAL and u.location == "scrapped"
+        )
+        wip_count = sum(
+            1
+            for u in self.units.values()
+            if u.state not in (ProductionUnitState.CREATED, ProductionUnitState.TERMINAL)
+        )
+        rework_count = sum(1 for u in self.units.values() if u.is_in_rework)
+
+        history_records = list(self.buffer_history.get(buffer_id, []))[-10:]
+
+        return BufferObservation(
+            schema_version="1.0",
+            buffer_id=buffer_id,
+            capacity=buf.capacity,
+            occupancy=len(buf.occupants),
+            occupants=occupants,
+            upstream_nodes=sorted(set(upstream_nodes)),
+            downstream_nodes=sorted(set(downstream_nodes)),
+            route_statuses=route_statuses,
+            aggregate_metrics={
+                "simulation_time_ns": time_ns,
+                "completed_units": completed_count,
+                "scrapped_units": scrapped_count,
+                "wip": wip_count,
+                "rework_count": rework_count,
+            },
+            history=history_records,
+        )
+
+    def _evaluate_buffer_triggers(
+        self,
+        buffer_id: str,
+        old_occupancy: int,
+        new_occupancy: int,
+        time_ns: int,
+    ) -> None:
+        triggers = self.decision_triggers.get(buffer_id, [])
+        for trig in triggers:
+            if trig.check_transition(buffer_id, old_occupancy, new_occupancy, time_ns):
+                obs = self._build_buffer_observation(buffer_id, time_ns)
+                req_id = f"req-{buffer_id}-{trig.config.id}-{time_ns}"
+                req = DecisionRequest(
+                    request_id=req_id,
+                    request_type="buffer_threshold",
+                    time_ns=time_ns,
+                    target_id=buffer_id,
+                    observation=obs,
+                    action_schema="buffer_reorder",
+                )
+                self.decision_coordinator.add_request(req)
+
+    def _process_decision_batch(self) -> None:
+        batch = self.decision_coordinator.form_batch(time_ns=self.kernel.current_time_ns)
+        if batch is None:
+            return
+
+        response: DecisionBatchResponse | None = None
+        diagnostics: list[DecisionDiagnosticRecord] = []
+
+        if self.decision_provider is not None:
+            try:
+                response = self.decision_provider.decide(batch)
+                if response is not None:
+                    is_valid, validation_diags = validate_decision_batch_response(batch, response)
+                    diagnostics.extend(validation_diags)
+                else:
+                    diagnostics.append(
+                        DecisionDiagnosticRecord(
+                            code="NULL_RESPONSE",
+                            message="Decision provider returned None",
+                            batch_id=batch.batch_id,
+                        )
+                    )
+            except Exception as exc:
+                diagnostics.append(
+                    DecisionDiagnosticRecord(
+                        code="PROVIDER_EXCEPTION",
+                        message=f"Decision provider raised exception: {exc}",
+                        batch_id=batch.batch_id,
+                    )
+                )
+        else:
+            diagnostics.append(
+                DecisionDiagnosticRecord(
+                    code="NO_PROVIDER",
+                    message="No decision provider configured",
+                    batch_id=batch.batch_id,
+                )
+            )
+
+        if response is not None and len(diagnostics) == 0:
+            self._apply_decision_actions(batch, response)
+        else:
+            self._handle_decision_failure(batch, diagnostics)
+
+    def _apply_decision_actions(
+        self, batch: DecisionBatch, response: DecisionBatchResponse
+    ) -> None:
+        for action in response.actions:
+            buf = self.buffers.get(action.target_id)
+            if buf is not None:
+                buf.occupants = list(action.new_order)
+
+        self.decision_batches.append(
+            {
+                "batch_id": batch.batch_id,
+                "time_ns": batch.time_ns,
+                "status": "applied",
+                "provenance": response.provenance.model_dump(),
+                "actions": [a.model_dump() for a in response.actions],
+            }
+        )
+
+        for req in batch.requests:
+            self._try_pull_upstream(self.kernel, req.target_id)
+            for r in self.routes_from.get(req.target_id, []):
+                self._try_pull_upstream(self.kernel, r.target_node_id)
+        self._try_dispatch_pending_orders(self.kernel)
+
+    def _handle_decision_failure(
+        self,
+        batch: DecisionBatch,
+        diagnostics: list[DecisionDiagnosticRecord],
+    ) -> None:
+        self.decision_diagnostics.extend([d.model_dump() for d in diagnostics])
+
+        should_abort = False
+        abort_trigger_id = None
+        for req in batch.requests:
+            for trig in self.decision_triggers.get(req.target_id, []):
+                if trig.config.on_failure == "abort":
+                    should_abort = True
+                    abort_trigger_id = trig.config.id
+                    break
+            if should_abort:
+                break
+
+        if should_abort:
+            self.is_aborted = True
+            reasons = "; ".join(d.message for d in diagnostics)
+            self.abort_reason = (
+                f"Trigger '{abort_trigger_id}' aborted episode due to decision failure: {reasons}"
+            )
+            self.decision_batches.append(
+                {
+                    "batch_id": batch.batch_id,
+                    "time_ns": batch.time_ns,
+                    "status": "aborted",
+                    "diagnostics": [d.model_dump() for d in diagnostics],
+                }
+            )
+            return
+
+        fallback_policy = FifoBufferFallbackPolicy()
+        fallback_actions = fallback_policy.generate_fallback_actions(batch)
+        for action in fallback_actions:
+            buf = self.buffers.get(action.target_id)
+            if buf is not None:
+                buf.occupants = list(action.new_order)
+
+        self.decision_batches.append(
+            {
+                "batch_id": batch.batch_id,
+                "time_ns": batch.time_ns,
+                "status": "fallback",
+                "diagnostics": [d.model_dump() for d in diagnostics],
+                "actions": [a.model_dump() for a in fallback_actions],
+            }
+        )
+
+        for req in batch.requests:
+            self._try_pull_upstream(self.kernel, req.target_id)
+            for r in self.routes_from.get(req.target_id, []):
+                self._try_pull_upstream(self.kernel, r.target_node_id)
+        self._try_dispatch_pending_orders(self.kernel)
+
     def _can_accept(self, node_id: str) -> bool:
         kind = self.nodes_by_id[node_id].kind
         if kind == "sink":
@@ -808,6 +1066,8 @@ class EpisodeEngine:
                 return pending[0] == unit_id
             return True
         elif kind == "buffer":
+            if any(req.target_id == node_id for req in self.decision_coordinator.pending_requests):
+                return False
             buf = self.buffers.get(node_id)
             if not buf or not buf.occupants:
                 return False
@@ -988,10 +1248,21 @@ class EpisodeEngine:
                 self.source_pending_units[node_id].remove(unit_id)
         elif kind == "buffer":
             buf = self.buffers[node_id]
+            old_occ = len(buf.occupants)
             if buf.occupants and buf.occupants[0] == unit_id:
                 buf.pop_unit()
             elif unit_id in buf.occupants:
                 buf.occupants.remove(unit_id)
+            new_occ = len(buf.occupants)
+            self.buffer_history.setdefault(node_id, []).append(
+                {
+                    "time_ns": time_ns,
+                    "event": "departed",
+                    "unit_id": unit_id,
+                    "occupancy": new_occ,
+                }
+            )
+            self._evaluate_buffer_triggers(node_id, old_occ, new_occ, time_ns)
         elif kind == "station":
             st = self.stations[node_id]
             if st.has_output_units() and st.output_buffer[0] == unit_id:
@@ -1048,12 +1319,23 @@ class EpisodeEngine:
 
     def _handle_buffer_arrival(self, k: EventKernel, unit_id: str, node_id: str) -> None:
         buf = self.buffers[node_id]
+        old_occ = len(buf.occupants)
         buf.add_unit(unit_id)
+        new_occ = len(buf.occupants)
         self.units[unit_id].record_transition(
             time_ns=k.current_time_ns,
             state=ProductionUnitState.IN_BUFFER,
             location=node_id,
         )
+        self.buffer_history.setdefault(node_id, []).append(
+            {
+                "time_ns": k.current_time_ns,
+                "event": "entered",
+                "unit_id": unit_id,
+                "occupancy": new_occ,
+            }
+        )
+        self._evaluate_buffer_triggers(node_id, old_occ, new_occ, k.current_time_ns)
         self._create_transport_order(unit_id, node_id, k.current_time_ns)
         self._try_dispatch_pending_orders(k)
         self._try_pull_upstream(k, node_id)
@@ -1981,7 +2263,11 @@ class EpisodeEngine:
         return False
 
     @classmethod
-    def create(cls, cfg: SimulationConfig) -> EpisodeEngine:
+    def create(
+        cls,
+        cfg: SimulationConfig,
+        decision_provider: DecisionProvider | None = None,
+    ) -> EpisodeEngine:
         units: dict[str, ProductionUnit] = {
             u_cfg.id: ProductionUnit(
                 id=u_cfg.id,
@@ -2250,6 +2536,7 @@ class EpisodeEngine:
             kernel=kernel,
             topology=topology,
             domain=domain,
+            decision_provider=decision_provider,
         )
 
         for m in machines.values():
@@ -2263,6 +2550,7 @@ class EpisodeEngine:
         cls,
         checkpoint: Checkpoint,
         config: SimulationConfig | None = None,
+        decision_provider: DecisionProvider | None = None,
     ) -> EpisodeEngine:
         # Schema and kernel version compatibility checks
         if checkpoint.schema_version != "1.0":
@@ -2472,14 +2760,27 @@ class EpisodeEngine:
             active_maintenances=active_maintenances,
         )
 
-        return cls(
+        engine = cls(
             config=cfg,
             kernel=kernel,
             topology=topology,
             domain=domain,
             random_occurrence_counters=checkpoint.random_occurrence_counters,
             plugin_metadata=checkpoint.plugin_metadata,
+            decision_provider=decision_provider,
         )
+        if checkpoint.domain_state.get("decision_coordinator"):
+            engine.decision_coordinator.restore_state(checkpoint.domain_state.get("decision_coordinator"))
+        if checkpoint.domain_state.get("decision_triggers"):
+            trig_data = checkpoint.domain_state.get("decision_triggers")
+            for t_id, t_state in trig_data.items():
+                for trigs in engine.decision_triggers.values():
+                    for t in trigs:
+                        if t.config.id == t_id:
+                            t.restore_state(t_state)
+        engine.decision_diagnostics = list(checkpoint.domain_state.get("decision_diagnostics", []))
+        engine.decision_batches = list(checkpoint.domain_state.get("decision_batches", []))
+        return engine
 
     def create_checkpoint(self) -> Checkpoint:
         snap = self.kernel.snapshot()
@@ -2521,6 +2822,14 @@ class EpisodeEngine:
             active_operations={k: dict(v) for k, v in self.active_operations.items()},
             maintenance_waiters=list(self.maintenance_waiters),
             active_maintenances={k: dict(v) for k, v in self.active_maintenances.items()},
+            decision_triggers={
+                trig.config.id: trig.to_snapshot()
+                for trigs in self.decision_triggers.values()
+                for trig in trigs
+            },
+            decision_coordinator=self.decision_coordinator.to_snapshot(),
+            decision_diagnostics=list(self.decision_diagnostics),
+            decision_batches=list(self.decision_batches),
         )
 
         return Checkpoint(
@@ -2543,27 +2852,53 @@ class EpisodeEngine:
         )
 
     def run(self, pause_at_ns: int | None = None) -> EpisodeSummary:
-        if pause_at_ns is not None:
-            max_t = pause_at_ns
-            if self.cfg.episode.end_condition.max_time_ns is not None:
+        max_t = pause_at_ns
+        if self.cfg.episode.end_condition.max_time_ns is not None:
+            if max_t is None:
+                max_t = self.cfg.episode.end_condition.max_time_ns
+            else:
                 max_t = min(max_t, self.cfg.episode.end_condition.max_time_ns)
-            self.kernel.run_until(
-                max_time_ns=max_t,
-                stop_condition=self._is_terminal_condition_met,
+
+        while self.kernel.queue_size > 0 and not self.is_aborted:
+            if self._is_terminal_condition_met(self.kernel):
+                break
+            next_time = self.kernel._queue[0][0]
+            if max_t is not None and next_time > max_t:
+                break
+
+            self.kernel.step()
+
+            if self.is_aborted:
+                break
+
+            has_more_events_at_same_time = (
+                self.kernel.queue_size > 0 and self.kernel._queue[0][0] == self.kernel.current_time_ns
             )
-            if not self._is_terminal_condition_met(self.kernel) and self.kernel.current_time_ns < pause_at_ns:
+            if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
+                self._process_decision_batch()
+                if self.is_aborted:
+                    break
+
+            if self._is_terminal_condition_met(self.kernel):
+                break
+
+        if not self.is_aborted and self.decision_coordinator.has_pending():
+            self._process_decision_batch()
+
+        if not self.is_aborted and not self._is_terminal_condition_met(self.kernel):
+            if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                 self.kernel.advance_to(pause_at_ns)
-        else:
-            self.kernel.run_until(
-                max_time_ns=self.cfg.episode.end_condition.max_time_ns,
-                stop_condition=self._is_terminal_condition_met,
-            )
 
         return self.to_summary()
 
     def to_summary(self) -> EpisodeSummary:
         all_terminal = self._is_terminal_condition_met(self.kernel)
-        status = "completed" if all_terminal else "incomplete"
+        if self.is_aborted:
+            status = "aborted"
+        elif all_terminal:
+            status = "completed"
+        else:
+            status = "incomplete"
 
         # Update resource and station metrics to current time
         for mach in self.machines.values():
@@ -2699,6 +3034,8 @@ class EpisodeEngine:
             workers=worker_summaries,
             vehicles=vehicle_summaries,
             transport_orders=transport_order_summaries,
+            decision_batches=self.decision_batches,
+            decision_diagnostics=self.decision_diagnostics,
         )
 
         return EpisodeSummary(
@@ -2713,6 +3050,10 @@ class EpisodeEngine:
             workers=worker_summaries,
             vehicles=vehicle_summaries,
             transport_orders=transport_order_summaries,
+            decision_batches=list(self.decision_batches),
+            decision_diagnostics=list(self.decision_diagnostics),
+            is_aborted=self.is_aborted,
+            abort_reason=self.abort_reason,
             result_hash=result_hash,
         )
 
@@ -2720,9 +3061,12 @@ class EpisodeEngine:
 def create_checkpoint(
     source: str | Path | dict[str, Any] | SimulationConfig | EpisodeEngine,
     at_time_ns: int | None = None,
+    decision_provider: DecisionProvider | None = None,
 ) -> Checkpoint:
     if isinstance(source, EpisodeEngine):
         engine = source
+        if decision_provider is not None:
+            engine.decision_provider = decision_provider
         if at_time_ns is not None:
             if at_time_ns < engine.kernel.current_time_ns:
                 raise ValueError(
@@ -2740,7 +3084,7 @@ def create_checkpoint(
             raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
         cfg = validation.config
 
-    engine = EpisodeEngine.create(cfg)
+    engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
     if at_time_ns is not None:
         if at_time_ns < cfg.episode.start_time_ns:
             raise ValueError(
@@ -2754,6 +3098,7 @@ def create_checkpoint(
 def restore_checkpoint(
     checkpoint: str | Path | dict[str, Any] | Checkpoint,
     config: str | Path | dict[str, Any] | SimulationConfig | None = None,
+    decision_provider: DecisionProvider | None = None,
 ) -> EpisodeEngine:
     if isinstance(checkpoint, (str, Path)):
         cp = load_checkpoint(checkpoint)
@@ -2774,31 +3119,36 @@ def restore_checkpoint(
                 raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
             cfg = validation.config
 
-    return EpisodeEngine.restore(cp, config=cfg)
+    return EpisodeEngine.restore(cp, config=cfg, decision_provider=decision_provider)
 
 
 def continue_checkpoint(
     checkpoint: str | Path | dict[str, Any] | Checkpoint,
     config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
     until_time_ns: int | None = None,
+    decision_provider: DecisionProvider | None = None,
 ) -> EpisodeSummary:
-    engine = restore_checkpoint(checkpoint, config=config_source)
+    engine = restore_checkpoint(checkpoint, config=config_source, decision_provider=decision_provider)
     return engine.run(pause_at_ns=until_time_ns)
 
 
 def resume_episode(
     checkpoint: str | Path | dict[str, Any] | Checkpoint,
     config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+    decision_provider: DecisionProvider | None = None,
 ) -> EpisodeSummary:
-    return continue_checkpoint(checkpoint, config_source=config_source)
+    return continue_checkpoint(checkpoint, config_source=config_source, decision_provider=decision_provider)
 
 
-def run_episode(source: str | Path | dict[str, Any]) -> EpisodeSummary:
+def run_episode(
+    source: str | Path | dict[str, Any],
+    decision_provider: DecisionProvider | None = None,
+) -> EpisodeSummary:
     validation = validate_config(source)
     if not validation.is_valid or validation.config is None:
         raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
 
     cfg = validation.config
-    engine = EpisodeEngine.create(cfg)
+    engine = EpisodeEngine.create(cfg, decision_provider=decision_provider)
     return engine.run()
 

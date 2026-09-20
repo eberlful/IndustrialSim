@@ -40,6 +40,8 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["vehicles"] = [v.model_dump(mode="json") for v in cfg.vehicles]
         if getattr(cfg, "process_plans", None):
             model_data["process_plans"] = [p.model_dump(mode="json") for p in cfg.process_plans]
+        if getattr(cfg, "decision_triggers", None):
+            model_data["decision_triggers"] = [t.model_dump(mode="json") for t in cfg.decision_triggers]
     elif isinstance(cfg, dict):
         model_data = {
             "plant": cfg.get("plant"),
@@ -56,6 +58,8 @@ def compute_model_hash(cfg: Any) -> str:
             model_data["vehicles"] = cfg.get("vehicles")
         if cfg.get("process_plans"):
             model_data["process_plans"] = cfg.get("process_plans")
+        if cfg.get("decision_triggers"):
+            model_data["decision_triggers"] = cfg.get("decision_triggers")
     else:
         raise TypeError(f"Expected SimulationConfig or dict, got {type(cfg).__name__}")
     canonical = json.dumps(model_data, sort_keys=True, separators=(",", ":"))
@@ -531,6 +535,10 @@ class DomainStateSnapshot:
     active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     maintenance_waiters: list[dict[str, Any]] = field(default_factory=list)
     active_maintenances: dict[str, dict[str, Any]] = field(default_factory=dict)
+    decision_triggers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    decision_coordinator: dict[str, Any] = field(default_factory=dict)
+    decision_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    decision_batches: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -550,6 +558,10 @@ class DomainStateSnapshot:
             "active_operations": dict(self.active_operations),
             "maintenance_waiters": list(self.maintenance_waiters),
             "active_maintenances": dict(self.active_maintenances),
+            "decision_triggers": dict(self.decision_triggers),
+            "decision_coordinator": dict(self.decision_coordinator),
+            "decision_diagnostics": list(self.decision_diagnostics),
+            "decision_batches": list(self.decision_batches),
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -585,6 +597,14 @@ class DomainStateSnapshot:
             return self.maintenance_waiters
         if key == "active_maintenances":
             return self.active_maintenances
+        if key == "decision_triggers":
+            return self.decision_triggers
+        if key == "decision_coordinator":
+            return self.decision_coordinator
+        if key == "decision_diagnostics":
+            return self.decision_diagnostics
+        if key == "decision_batches":
+            return self.decision_batches
         raise KeyError(key)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -635,6 +655,10 @@ class DomainStateSnapshot:
             active_operations=dict(data.get("active_operations", {})),
             maintenance_waiters=list(data.get("maintenance_waiters", [])),
             active_maintenances=dict(data.get("active_maintenances", {})),
+            decision_triggers=dict(data.get("decision_triggers", {})),
+            decision_coordinator=dict(data.get("decision_coordinator", {})),
+            decision_diagnostics=list(data.get("decision_diagnostics", [])),
+            decision_batches=list(data.get("decision_batches", [])),
         )
 
 

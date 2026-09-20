@@ -663,6 +663,35 @@ class ProcessPlanConfig(StrictBaseModel):
     steps: list[ProcessPlanStepConfig] = Field(min_length=1)
 
 
+class BufferThresholdTriggerConfig(StrictBaseModel):
+    id: str
+    buffer_id: str
+    threshold: int
+    direction: Literal["rising", "falling"] = "rising"
+    rearm_threshold: int | None = None
+    on_failure: Literal["fallback", "abort"] = "fallback"
+    fallback_policy: str = "fifo"
+
+    @model_validator(mode="after")
+    def validate_trigger(self) -> BufferThresholdTriggerConfig:
+        if self.threshold < 0:
+            raise ValueError(f"Trigger '{self.id}' threshold cannot be negative: {self.threshold}")
+        if self.rearm_threshold is None:
+            if self.direction == "rising":
+                object.__setattr__(self, "rearm_threshold", max(0, self.threshold - 1))
+            else:
+                object.__setattr__(self, "rearm_threshold", self.threshold + 1)
+        if self.direction == "rising" and self.rearm_threshold is not None and self.rearm_threshold >= self.threshold:
+            raise ValueError(
+                f"Trigger '{self.id}' rising rearm_threshold ({self.rearm_threshold}) must be strictly less than threshold ({self.threshold})"
+            )
+        if self.direction == "falling" and self.rearm_threshold is not None and self.rearm_threshold <= self.threshold:
+            raise ValueError(
+                f"Trigger '{self.id}' falling rearm_threshold ({self.rearm_threshold}) must be strictly greater than threshold ({self.threshold})"
+            )
+        return self
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
@@ -677,6 +706,8 @@ class SimulationConfig(StrictBaseModel):
     production_plan: list[ProductionPlanEntryConfig] = Field(default_factory=list)
     process_plans: list[ProcessPlanConfig] = Field(default_factory=list)
     stations: list[StationConfig] = Field(default_factory=list)
+    decision_triggers: list[BufferThresholdTriggerConfig] = Field(default_factory=list)
+    max_batches_per_timestamp: int = 10
 
     @model_validator(mode="after")
     def validate_simulation_config(self) -> SimulationConfig:
@@ -851,4 +882,19 @@ class SimulationConfig(StrictBaseModel):
                         f"Production unit '{u.id}' variant '{u.variant}' has no matching process plan"
                     )
 
+        # Validate decision triggers
+        if self.decision_triggers:
+            trigger_ids = [t.id for t in self.decision_triggers]
+            if len(trigger_ids) != len(set(trigger_ids)):
+                raise ValueError(f"Duplicate decision trigger IDs found: {trigger_ids}")
+
+            if self.material_flow is not None:
+                buffer_ids = {node.id for node in self.material_flow.nodes if node.kind == "buffer"}
+                for t in self.decision_triggers:
+                    if t.buffer_id not in buffer_ids:
+                        raise ValueError(
+                            f"Decision trigger '{t.id}' references unknown buffer '{t.buffer_id}'"
+                        )
+
         return self
+
