@@ -234,8 +234,8 @@ class RunArtifactWriter:
 
         self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
-        # Remove incomplete marker on clean completion
-        if status == "completed" and self.incomplete_marker.exists():
+        # Remove incomplete marker on clean completion or deterministic termination
+        if status in ("completed", "deadlocked") and self.incomplete_marker.exists():
             self.incomplete_marker.unlink()
 
 

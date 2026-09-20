@@ -817,6 +817,22 @@ class TelemetryConfig(StrictBaseModel):
         return self
 
 
+class DeadlockConfig(StrictBaseModel):
+    enabled: bool = True
+    max_interval_without_progress: int | str | None = None
+    max_interval_without_progress_ns: int | None = None
+
+    @model_validator(mode="after")
+    def compute_interval_ns(self) -> DeadlockConfig:
+        if self.max_interval_without_progress is not None:
+            object.__setattr__(
+                self,
+                "max_interval_without_progress_ns",
+                parse_duration_ns(self.max_interval_without_progress),
+            )
+        return self
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
@@ -834,6 +850,7 @@ class SimulationConfig(StrictBaseModel):
     reward_policy: RewardPolicyConfig | None = None
     hard_constraints: HardConstraintsConfig | None = None
     telemetry: TelemetryConfig | None = None
+    deadlock: DeadlockConfig | None = None
     decision_triggers: list[DecisionTriggerConfig] = Field(default_factory=list)
 
     @field_validator("decision_triggers", mode="before")

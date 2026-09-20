@@ -88,6 +88,7 @@ from industrialsim.decisions import (
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
 from industrialsim.random import SemanticRandomStream
+from industrialsim.deadlock import DeadlockDiagnosis, analyze_deadlock
 from industrialsim.audit import (
     AuditLogger,
     AuditRecord,
@@ -322,6 +323,8 @@ class EpisodeSummary:
     decision_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     is_aborted: bool = False
     abort_reason: str | None = None
+    is_deadlocked: bool = False
+    deadlock_diagnosis: dict[str, Any] | None = None
     total_cost: float = 0.0
     total_strategic_cost: float = 0.0
     raw_metrics: dict[str, Any] = field(default_factory=dict)
@@ -355,6 +358,11 @@ class EpisodeSummary:
         if self.is_aborted:
             res["is_aborted"] = True
             res["abort_reason"] = self.abort_reason
+        if self.is_deadlocked or self.status == "deadlocked":
+            res["status"] = "deadlocked"
+            res["is_deadlocked"] = True
+            if self.deadlock_diagnosis is not None:
+                res["deadlock_diagnosis"] = dict(self.deadlock_diagnosis)
         return res
 
 
@@ -413,6 +421,7 @@ def _compute_result_hash(
     transport_orders: list[TransportOrderSummary] | None = None,
     decision_batches: list[dict[str, Any]] | None = None,
     decision_diagnostics: list[dict[str, Any]] | None = None,
+    deadlock_diagnosis: dict[str, Any] | None = None,
 ) -> str:
     data: dict[str, Any] = {
         "status": status,
@@ -435,6 +444,8 @@ def _compute_result_hash(
         data["decision_batches"] = decision_batches
     if decision_diagnostics:
         data["decision_diagnostics"] = decision_diagnostics
+    if deadlock_diagnosis:
+        data["deadlock_diagnosis"] = deadlock_diagnosis
     canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -720,6 +731,13 @@ class EpisodeEngine:
             root_seed=self.cfg.seed,
             occurrence_counters=self.random_occurrence_counters,
         )
+        self.is_deadlocked: bool = False
+        self.deadlock_diagnosis: DeadlockDiagnosis | None = None
+        self.last_domain_progress_time_ns: int = self.cfg.episode.start_time_ns
+        self.max_interval_without_progress_ns: int | None = None
+        if self.cfg.deadlock is not None and self.cfg.deadlock.enabled:
+            self.max_interval_without_progress_ns = self.cfg.deadlock.max_interval_without_progress_ns
+
         self.dispatch_policy = dispatch_policy or BaselineDispatchPolicy()
 
         self._setup_handlers()
@@ -734,6 +752,21 @@ class EpisodeEngine:
     def disable_telemetry(self) -> None:
         self.telemetry_manager.disable()
 
+    def _record_domain_progress(self, time_ns: int) -> None:
+        self.last_domain_progress_time_ns = time_ns
+
+    def _terminate_with_deadlock(self, diagnosis: DeadlockDiagnosis) -> None:
+        self.is_deadlocked = True
+        self.deadlock_diagnosis = diagnosis
+        self.audit_logger.record(
+            event_type="deadlock",
+            simulated_time_ns=self.kernel.current_time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            entity_ids=diagnosis.involved_entities,
+            details=diagnosis.to_dict(),
+        )
+
     def _record_unit_transition(
         self,
         unit: ProductionUnit,
@@ -744,6 +777,7 @@ class EpisodeEngine:
         station_id: str | None = None,
         operation_id: str | None = None,
     ) -> None:
+        self._record_domain_progress(time_ns)
         st_id = station_id or (details.get("station_id") if details else None)
         op_id = operation_id or (details.get("operation_id") if details else None)
         unit.record_transition(
@@ -780,6 +814,7 @@ class EpisodeEngine:
         op_id: str,
         time_ns: int,
     ) -> None:
+        self._record_domain_progress(time_ns)
         unit = self.units.get(unit_id)
         quality_state = unit.quality_state if unit else "unknown"
         self.audit_logger.record(
@@ -803,6 +838,7 @@ class EpisodeEngine:
         op_id: str,
         time_ns: int,
     ) -> None:
+        self._record_domain_progress(time_ns)
         unit = self.units.get(unit_id)
         quality_state = unit.quality_state if unit else "unknown"
         self.audit_logger.record(
@@ -929,6 +965,14 @@ class EpisodeEngine:
         self.kernel.register_handler("COMPLETE_RECONFIGURATION", self._handle_complete_reconfiguration)
 
         self.kernel.register_handler("TELEMETRY_INTERVAL", self._handle_telemetry_interval)
+        self.kernel.register_handler("DEADLOCK_CHECK", self._handle_deadlock_check)
+
+        if self.max_interval_without_progress_ns is not None:
+            self.kernel.schedule(
+                time_ns=self.cfg.episode.start_time_ns + self.max_interval_without_progress_ns,
+                priority=EventPriority.SAFETY,
+                event_type="DEADLOCK_CHECK",
+            )
 
         for t in self.cfg.decision_triggers:
             if isinstance(t, SafePointTriggerConfig):
@@ -972,6 +1016,33 @@ class EpisodeEngine:
                     priority=EventPriority.TELEMETRY,
                     event_type="TELEMETRY_INTERVAL",
                     payload={"interval_ns": interval_ns},
+                )
+
+    def _handle_deadlock_check(self, k: EventKernel, event: ScheduledEvent) -> None:
+        if self.is_deadlocked or self.is_aborted or self._is_terminal_condition_met(k):
+            return
+        if self.max_interval_without_progress_ns is None:
+            return
+
+        elapsed = k.current_time_ns - self.last_domain_progress_time_ns
+        if elapsed >= self.max_interval_without_progress_ns:
+            diagnosis = analyze_deadlock(self)
+            if diagnosis is not None:
+                self._terminate_with_deadlock(diagnosis)
+                return
+            else:
+                k.schedule(
+                    time_ns=k.current_time_ns + self.max_interval_without_progress_ns,
+                    priority=EventPriority.SAFETY,
+                    event_type="DEADLOCK_CHECK",
+                )
+        else:
+            next_t = self.last_domain_progress_time_ns + self.max_interval_without_progress_ns
+            if next_t > k.current_time_ns:
+                k.schedule(
+                    time_ns=next_t,
+                    priority=EventPriority.SAFETY,
+                    event_type="DEADLOCK_CHECK",
                 )
 
     def _emit_domain_event(self, event_name: str) -> None:
@@ -3807,7 +3878,7 @@ class EpisodeEngine:
                 max_t = min(max_t, self.cfg.episode.end_condition.max_time_ns)
 
         self._check_runtime_hard_constraints()
-        while self.kernel.queue_size > 0 and not self.is_aborted:
+        while self.kernel.queue_size > 0 and not self.is_aborted and not self.is_deadlocked:
             if self._is_terminal_condition_met(self.kernel):
                 break
 
@@ -3819,7 +3890,7 @@ class EpisodeEngine:
                     return self.to_summary()
                 self._process_decision_batch()
                 self._check_runtime_hard_constraints()
-                if self.is_aborted:
+                if self.is_aborted or self.is_deadlocked:
                     break
 
             next_time = self.kernel.peek_next_time()
@@ -3829,7 +3900,7 @@ class EpisodeEngine:
             self.kernel.step()
             self._check_runtime_hard_constraints()
 
-            if self.is_aborted:
+            if self.is_aborted or self.is_deadlocked:
                 break
 
             has_more_events_at_same_time = (
@@ -3840,17 +3911,28 @@ class EpisodeEngine:
                     return self.to_summary()
                 self._process_decision_batch()
                 self._check_runtime_hard_constraints()
-                if self.is_aborted:
+                if self.is_aborted or self.is_deadlocked:
                     break
 
             if self._is_terminal_condition_met(self.kernel):
                 break
 
-        if not self.is_aborted and self.decision_coordinator.has_pending():
+        if not self.is_aborted and not self.is_deadlocked and self.decision_coordinator.has_pending():
             if not pause_at_decision_batch:
                 self._process_decision_batch()
 
-        if not self.is_aborted and not self._is_terminal_condition_met(self.kernel):
+        # Check for deadlock if unfinished, not aborted/deadlocked, and deadlock detection enabled
+        if (
+            not self.is_aborted
+            and not self.is_deadlocked
+            and not self._is_terminal_condition_met(self.kernel)
+            and (self.cfg.deadlock is None or self.cfg.deadlock.enabled)
+        ):
+            diagnosis = analyze_deadlock(self)
+            if diagnosis is not None:
+                self._terminate_with_deadlock(diagnosis)
+
+        if not self.is_aborted and not self.is_deadlocked and not self._is_terminal_condition_met(self.kernel):
             if not (pause_at_decision_batch and self.decision_coordinator.has_pending()):
                 if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                     self.kernel.advance_to(pause_at_ns)
@@ -3876,7 +3958,9 @@ class EpisodeEngine:
 
     def to_summary(self) -> EpisodeSummary:
         all_terminal = self._is_terminal_condition_met(self.kernel)
-        if self.is_aborted:
+        if self.is_deadlocked:
+            status = "deadlocked"
+        elif self.is_aborted:
             status = "aborted"
         elif all_terminal:
             status = "completed"
@@ -4019,6 +4103,7 @@ class EpisodeEngine:
             transport_orders=transport_order_summaries,
             decision_batches=self.decision_batches,
             decision_diagnostics=self.decision_diagnostics,
+            deadlock_diagnosis=self.deadlock_diagnosis.to_dict() if self.deadlock_diagnosis else None,
         )
 
         summary_obj = EpisodeSummary(
@@ -4037,6 +4122,8 @@ class EpisodeEngine:
             decision_diagnostics=list(self.decision_diagnostics),
             is_aborted=self.is_aborted,
             abort_reason=self.abort_reason,
+            is_deadlocked=self.is_deadlocked,
+            deadlock_diagnosis=self.deadlock_diagnosis.to_dict() if self.deadlock_diagnosis else None,
             total_cost=self.total_strategic_cost,
             total_strategic_cost=self.total_strategic_cost,
             result_hash=result_hash,
@@ -4168,7 +4255,7 @@ def run_episode(
     if writer is not None:
         final_cp = engine.create_checkpoint()
         save_checkpoint(final_cp, writer.checkpoints_dir / "final_checkpoint.json")
-        writer.finalize(summary.to_dict(), status="aborted" if summary.is_aborted else "completed")
+        writer.finalize(summary.to_dict(), status=summary.status)
 
     return summary
 
@@ -4659,7 +4746,7 @@ def branch_checkpoint(
             save_checkpoint(branch_cp, branch_writer.checkpoints_dir / "final_checkpoint.json")
             branch_writer.finalize(
                 summary.to_dict(),
-                status="aborted" if summary.is_aborted else "completed",
+                status=summary.status,
             )
 
         # The actions actually applied in this branch
