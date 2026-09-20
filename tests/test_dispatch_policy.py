@@ -8,7 +8,11 @@ from industrialsim.domain import (
     TransportOrder,
     Vehicle,
 )
-from industrialsim.dispatch import BaselineDispatchPolicy, DispatchDecision
+from industrialsim.dispatch import (
+    BaselineDispatchPolicy,
+    DispatchContext,
+    DispatchDecision,
+)
 
 
 def test_dispatch_policy_nearest_vehicle_and_shortest_route() -> None:
@@ -179,3 +183,166 @@ def test_dispatch_policy_deterministic_tie_breaking() -> None:
     # v-a < v-z tie-break
     assert decision.vehicle is not None
     assert decision.vehicle.id == "v-a"
+
+
+def test_dispatch_policy_with_dispatch_context() -> None:
+    policy = BaselineDispatchPolicy()
+    order = TransportOrder(
+        id="to-ctx",
+        unit_id="u-ctx",
+        source_node_id="src-1",
+        target_node_id="st-1",
+        created_time_ns=0,
+    )
+    route = RouteConfig(
+        id="r-1",
+        source_node_id="src-1",
+        source_port_id="out",
+        target_node_id="st-1",
+        target_port_id="in",
+        transit_time="5s",
+    )
+    vehicle = Vehicle(id="v-1", initial_location="src-1", location="src-1")
+
+    ctx = DispatchContext(
+        order=order,
+        candidate_routes=[route],
+        available_vehicles=[vehicle],
+        active_route_occupancy={},
+        node_distance_fn=lambda f, t: 0,
+        can_accept_fn=lambda nid: True,
+    )
+    decision = policy.select_dispatch(ctx)
+    assert decision is not None
+    assert decision.route.id == "r-1"
+    assert decision.vehicle is not None
+    assert decision.vehicle.id == "v-1"
+
+
+def test_dispatch_policy_shortest_route_priority_over_pickup_distance() -> None:
+    # Route A is short (5s), vehicle A is 1s away.
+    # Route B is long (20s), vehicle B is 0s away.
+    # Policy must choose shortest admissible route (Route A) rather than picking
+    # an arbitrarily longer route just because vehicle B is at distance 0.
+    policy = BaselineDispatchPolicy()
+    order = TransportOrder(
+        id="to-4",
+        unit_id="u-4",
+        source_node_id="st-1",
+        target_node_id="st-2",
+        created_time_ns=0,
+    )
+    r_short = RouteConfig(
+        id="r-short",
+        source_node_id="st-1",
+        source_port_id="out",
+        target_node_id="st-2",
+        target_port_id="in",
+        transit_time="5s",
+    )
+    r_long = RouteConfig(
+        id="r-long",
+        source_node_id="st-1",
+        source_port_id="out",
+        target_node_id="st-2",
+        target_port_id="in",
+        transit_time="20s",
+    )
+    v_at_pickup = Vehicle(id="v-at-pickup", initial_location="st-1", location="st-1")
+    v_farther = Vehicle(id="v-farther", initial_location="src-1", location="src-1")
+
+    distances = {
+        ("st-1", "st-1"): 0,
+        ("src-1", "st-1"): 1_000_000_000,  # 1s away
+    }
+
+    ctx = DispatchContext(
+        order=order,
+        candidate_routes=[r_long, r_short],
+        available_vehicles=[v_at_pickup, v_farther],
+        active_route_occupancy={},
+        node_distance_fn=lambda f, t: distances.get((f, t)),
+        can_accept_fn=lambda nid: True,
+    )
+    decision = policy.select_dispatch(ctx)
+    assert decision is not None
+    assert decision.route.id == "r-short"
+    assert decision.vehicle is not None
+    assert decision.vehicle.id == "v-at-pickup"
+
+
+def test_dispatch_policy_speed_multiplier_in_pickup_time() -> None:
+    # Vehicle A: raw distance 10s, speed 1.0 -> effective pickup time 10s
+    # Vehicle B: raw distance 12s, speed 2.0 -> effective pickup time 6s
+    # Policy must select Vehicle B as the nearest available vehicle.
+    policy = BaselineDispatchPolicy()
+    order = TransportOrder(
+        id="to-5",
+        unit_id="u-5",
+        source_node_id="st-1",
+        target_node_id="st-2",
+        created_time_ns=0,
+    )
+    route = RouteConfig(
+        id="r-1",
+        source_node_id="st-1",
+        source_port_id="out",
+        target_node_id="st-2",
+        target_port_id="in",
+        transit_time="5s",
+    )
+    v_a = Vehicle(id="v-a", initial_location="loc-a", location="loc-a", speed_multiplier=1.0)
+    v_b = Vehicle(id="v-b", initial_location="loc-b", location="loc-b", speed_multiplier=2.0)
+
+    distances = {
+        ("loc-a", "st-1"): 10_000_000_000,
+        ("loc-b", "st-1"): 12_000_000_000,
+    }
+
+    ctx = DispatchContext(
+        order=order,
+        candidate_routes=[route],
+        available_vehicles=[v_a, v_b],
+        active_route_occupancy={},
+        node_distance_fn=lambda f, t: distances.get((f, t)),
+        can_accept_fn=lambda nid: True,
+    )
+    decision = policy.select_dispatch(ctx)
+    assert decision is not None
+    assert decision.vehicle is not None
+    assert decision.vehicle.id == "v-b"
+
+
+def test_dispatch_policy_reserved_route_occupancy_blocks_dispatch() -> None:
+    policy = BaselineDispatchPolicy()
+    order = TransportOrder(
+        id="to-6",
+        unit_id="u-6",
+        source_node_id="st-1",
+        target_node_id="st-2",
+        created_time_ns=0,
+    )
+    route = RouteConfig(
+        id="r-1",
+        source_node_id="st-1",
+        source_port_id="out",
+        target_node_id="st-2",
+        target_port_id="in",
+        transit_time="5s",
+        capacity=1,
+    )
+    vehicle = Vehicle(id="v-1", initial_location="st-1", location="st-1")
+
+    # Route active occupancy is 0, but reserved occupancy is 1 (capacity is 1)
+    ctx = DispatchContext(
+        order=order,
+        candidate_routes=[route],
+        available_vehicles=[vehicle],
+        active_route_occupancy={"r-1": 0},
+        reserved_route_occupancy={"r-1": 1},
+        node_distance_fn=lambda f, t: 0,
+        can_accept_fn=lambda nid: True,
+    )
+    decision = policy.select_dispatch(ctx)
+    assert decision is None
+

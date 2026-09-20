@@ -524,6 +524,7 @@ class DomainStateSnapshot:
     transport_orders: dict[str, TransportOrderSnapshot] = field(default_factory=dict)
     pending_transport_orders: list[str] = field(default_factory=list)
     active_route_occupancy: dict[str, int] = field(default_factory=dict)
+    reserved_route_occupancy: dict[str, int] = field(default_factory=dict)
     in_flight_to: dict[str, int] = field(default_factory=dict)
     source_pending_units: dict[str, list[str]] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
@@ -542,6 +543,7 @@ class DomainStateSnapshot:
             "transport_orders": {k: v.to_dict() for k, v in self.transport_orders.items()},
             "pending_transport_orders": list(self.pending_transport_orders),
             "active_route_occupancy": dict(self.active_route_occupancy),
+            "reserved_route_occupancy": dict(self.reserved_route_occupancy),
             "in_flight_to": dict(self.in_flight_to),
             "source_pending_units": {k: list(v) for k, v in self.source_pending_units.items()},
             "resource_waiters": list(self.resource_waiters),
@@ -569,6 +571,8 @@ class DomainStateSnapshot:
             return self.pending_transport_orders
         if key == "active_route_occupancy":
             return self.active_route_occupancy
+        if key == "reserved_route_occupancy":
+            return self.reserved_route_occupancy
         if key == "in_flight_to":
             return self.in_flight_to
         if key == "source_pending_units":
@@ -622,6 +626,7 @@ class DomainStateSnapshot:
             },
             pending_transport_orders=list(data.get("pending_transport_orders", [])),
             active_route_occupancy=dict(data.get("active_route_occupancy", {})),
+            reserved_route_occupancy=dict(data.get("reserved_route_occupancy", {})),
             in_flight_to=dict(data.get("in_flight_to", {})),
             source_pending_units={
                 k: list(v) for k, v in data.get("source_pending_units", {}).items()

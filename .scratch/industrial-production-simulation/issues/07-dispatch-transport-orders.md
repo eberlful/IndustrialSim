@@ -29,18 +29,20 @@ Issue 07 has been fully implemented across configuration, domain models, dispatc
    - `VehicleConfig`: Specific vehicles with `id`, `initial_location`, `pool_id`, `capabilities`, and `speed_multiplier` (inheriting pool attributes when unspecified).
    - Validation ensures positive speeds, valid node references, and pool reference integrity.
 
-3. **Deterministic Baseline Dispatch Policy**:
+3. **Deterministic Baseline Dispatch Policy (ADR 0012)**:
    - Implemented `BaselineDispatchPolicy` (`src/industrialsim/dispatch.py`), matching pending orders to vehicles and routes:
+     - Uses `DispatchContext` parameter object to encapsulate routing context and eliminate data clumps.
      - Only considers admissible candidate routes respecting process plans, quality rework rules, and downstream node capacity (`_can_accept`).
-     - Enforces route capacity limits (`active_route_occupancy < route.capacity`).
-     - Selects vehicles satisfying route/order capability constraints and pool memberships.
+     - Enforces total route capacity limits (`active_route_occupancy + reserved_route_occupancy < route.capacity`).
+     - Selects vehicles satisfying route capability constraints and pool memberships.
      - Calculates shortest graph repositioning distance using Dijkstra pathfinding on `MaterialFlowTopology`.
-     - Deterministic tie-breaking prioritizing: lowest reposition travel time -> lowest route transit time -> lexicographical order ID -> lexicographical route ID -> lexicographical vehicle ID.
+     - Prioritizes shortest admissible route (`r.transit_time_ns`), then nearest suitable vehicle (`effective_pickup_time` scaled by `v.speed_multiplier`), with deterministic tie-breaking on `(r.id, v.id)`.
      - Supports unconstrained fallback when no vehicles are configured, ensuring 100% backward compatibility.
 
 4. **Contention, Queuing, and Observable Logistics Backpressure**:
    - Competing orders queue deterministically in FIFO order when vehicles or routes are at capacity.
    - If multiple routes lead to admissible targets, the policy routes around congested or occupied routes to alternative admissible routes.
+   - Separated `active_route_occupancy` (units physically occupying the route in transit) from `reserved_route_occupancy` (orders dispatched while vehicle is repositioning to pickup), preventing premature route occupancy while maintaining hard capacity limits.
    - Vehicle scarcity and route congestion stall departure from upstream stations and buffers, causing station blocking (`is_blocked=True`, `blocked_unit_id`) and upstream starvation.
 
 5. **Single-Occupancy & Node Disjointness Invariant**:
@@ -51,6 +53,7 @@ Issue 07 has been fully implemented across configuration, domain models, dispatc
 
 6. **Checkpointing & Bit-for-Bit Determinism (ADR 0009)**:
    - Added `VehicleSnapshot` and `TransportOrderSnapshot` to `DomainStateSnapshot`.
+   - Preserved `active_route_occupancy` and `reserved_route_occupancy` in checkpoint state.
    - Updated `compute_model_hash` to include vehicle and transport order states.
    - Serialized state maintains deterministic ordering with zero-padded order IDs (`to-000001`) and sorted summary outputs, ensuring resumed runs match uninterrupted runs bit-for-bit.
 
@@ -58,8 +61,8 @@ Issue 07 has been fully implemented across configuration, domain models, dispatc
    - Added comprehensive test suites:
      - `tests/test_vehicle_config.py`: Configuration and validation.
      - `tests/test_vehicle_domain.py`: State transitions, speed, metrics, and utilization.
-     - `tests/test_dispatch_policy.py`: Vehicle matching, capability requirements, route capacity, and deterministic tie-breaking.
+     - `tests/test_dispatch_policy.py`: Vehicle matching, capability requirements, route capacity, DispatchContext, shortest route priority, speed multiplier, and deterministic tie-breaking.
      - `tests/test_transport_orders_simulation.py`: End-to-end vehicle contention, backpressure, route contention, alternative routing, and checkpoint/resume equivalence.
-   - All 125 tests pass (`uv run pytest`) and type checks pass cleanly (`uv run mypy src tests`).
+   - All 129 tests pass (`uv run pytest`) and type checks pass cleanly (`uv run mypy src tests`).
 
 

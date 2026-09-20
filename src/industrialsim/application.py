@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import hashlib
+import heapq
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -18,7 +19,11 @@ from industrialsim.config import (
     SimulationConfig,
     StationConfig,
 )
-from industrialsim.dispatch import BaselineDispatchPolicy, DispatchDecision
+from industrialsim.dispatch import (
+    BaselineDispatchPolicy,
+    DispatchContext,
+    DispatchDecision,
+)
 from industrialsim.domain import (
     Break,
     Buffer,
@@ -445,8 +450,6 @@ class MaterialFlowTopology:
     routes_to: dict[str, list[RouteConfig]]
 
     def find_shortest_path_distance(self, from_node: str, to_node: str, directed: bool = True) -> int | None:
-        import heapq
-
         if from_node == to_node:
             return 0
         adj: dict[str, list[tuple[str, int]]] = {}
@@ -475,9 +478,14 @@ class MaterialFlowTopology:
     def compute_distance(self, from_node: str, to_node: str) -> int | None:
         if from_node == to_node:
             return 0
+        # Check directed path first
         dist = self.find_shortest_path_distance(from_node, to_node, directed=True)
         if dist is not None:
             return dist
+        # Fall back to physical route connectivity for empty vehicle repositioning:
+        # Source nodes have in-degree 0 in the directed material flow graph (sources
+        # cannot have input ports per schema), so returning to pickup traverses the
+        # physical transport connectivity between nodes.
         return self.find_shortest_path_distance(from_node, to_node, directed=False)
 
     @classmethod
@@ -538,6 +546,7 @@ class SimulationDomainState:
     transport_orders: dict[str, TransportOrder] = field(default_factory=dict)
     pending_transport_orders: list[str] = field(default_factory=list)
     active_route_occupancy: dict[str, int] = field(default_factory=dict)
+    reserved_route_occupancy: dict[str, int] = field(default_factory=dict)
     resource_waiters: list[dict[str, Any]] = field(default_factory=list)
     active_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     maintenance_waiters: list[dict[str, Any]] = field(default_factory=list)
@@ -660,6 +669,10 @@ class EpisodeEngine:
     @property
     def active_route_occupancy(self) -> dict[str, int]:
         return self.domain.active_route_occupancy
+
+    @property
+    def reserved_route_occupancy(self) -> dict[str, int]:
+        return self.domain.reserved_route_occupancy
 
     @property
     def resource_waiters(self) -> list[dict[str, Any]]:
@@ -838,16 +851,17 @@ class EpisodeEngine:
             if not candidates:
                 continue
 
-            decision = self.dispatch_policy.select_dispatch(
+            ctx = DispatchContext(
                 order=order,
-                unit=unit,
                 candidate_routes=candidates,
                 available_vehicles=available_vehicles,
                 active_route_occupancy=self.active_route_occupancy,
                 node_distance_fn=self._compute_node_distance,
                 can_accept_fn=self._can_accept,
+                reserved_route_occupancy=self.reserved_route_occupancy,
                 unconstrained=unconstrained,
             )
+            decision = self.dispatch_policy.select_dispatch(ctx)
 
             if decision is None:
                 continue
@@ -873,7 +887,6 @@ class EpisodeEngine:
 
         order.target_node_id = target_id
         self.in_flight_to[target_id] += 1
-        self.active_route_occupancy[route.id] = self.active_route_occupancy.get(route.id, 0) + 1
 
         order.dispatch(
             vehicle_id=vehicle.id if vehicle else None,
@@ -891,6 +904,9 @@ class EpisodeEngine:
             if reposition_time_ns == 0:
                 self._begin_transport(k, order, route, vehicle)
             else:
+                self.reserved_route_occupancy[route.id] = (
+                    self.reserved_route_occupancy.get(route.id, 0) + 1
+                )
                 vehicle.start_repositioning(
                     order_id=order.id,
                     target_node_id=order.source_node_id,
@@ -914,6 +930,12 @@ class EpisodeEngine:
         route: RouteConfig,
         vehicle: Vehicle | None,
     ) -> None:
+        if self.reserved_route_occupancy.get(route.id, 0) > 0:
+            self.reserved_route_occupancy[route.id] -= 1
+        self.active_route_occupancy[route.id] = (
+            self.active_route_occupancy.get(route.id, 0) + 1
+        )
+
         unit = self.units[order.unit_id]
         self._remove_unit_from_node(order.source_node_id, unit.id, k.current_time_ns)
         order.pickup(k.current_time_ns)
@@ -2220,6 +2242,7 @@ class EpisodeEngine:
             transport_orders={},
             pending_transport_orders=[],
             active_route_occupancy={r.id: 0 for r in mf.routes},
+            reserved_route_occupancy={r.id: 0 for r in mf.routes},
         )
 
         engine = cls(
@@ -2426,6 +2449,8 @@ class EpisodeEngine:
         pending_transport_orders = list(domain_state.get("pending_transport_orders", []))
         active_route_occupancy = {r.id: 0 for r in mf.routes}
         active_route_occupancy.update(domain_state.get("active_route_occupancy", {}))
+        reserved_route_occupancy = {r.id: 0 for r in mf.routes}
+        reserved_route_occupancy.update(domain_state.get("reserved_route_occupancy", {}))
 
         topology = MaterialFlowTopology.from_material_flow(mf)
         domain = SimulationDomainState(
@@ -2440,6 +2465,7 @@ class EpisodeEngine:
             transport_orders=transport_orders,
             pending_transport_orders=pending_transport_orders,
             active_route_occupancy=active_route_occupancy,
+            reserved_route_occupancy=reserved_route_occupancy,
             resource_waiters=resource_waiters,
             active_operations=active_operations,
             maintenance_waiters=maintenance_waiters,
@@ -2488,6 +2514,7 @@ class EpisodeEngine:
             },
             pending_transport_orders=list(self.pending_transport_orders),
             active_route_occupancy=dict(self.active_route_occupancy),
+            reserved_route_occupancy=dict(self.reserved_route_occupancy),
             in_flight_to=dict(self.in_flight_to),
             source_pending_units={k: list(v) for k, v in self.source_pending_units.items()},
             resource_waiters=list(self.resource_waiters),
