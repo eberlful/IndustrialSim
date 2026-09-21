@@ -365,6 +365,239 @@ class EpisodeSummary:
                 res["deadlock_diagnosis"] = dict(self.deadlock_diagnosis)
         return res
 
+    def compare_with(
+        self,
+        other: EpisodeSummary,
+        config_hash: str = "",
+        model_hash: str = "",
+    ) -> PolicyComparisonResult:
+        b_metrics = self.raw_metrics or {}
+        p_metrics = other.raw_metrics or {}
+        all_metric_keys = sorted(set(b_metrics.keys()) | set(p_metrics.keys()))
+
+        metrics_comp: dict[str, MetricDelta] = {}
+        for k in all_metric_keys:
+            b_val = b_metrics.get(k, 0)
+            p_val = p_metrics.get(k, 0)
+            delta = (p_val - b_val) if isinstance(b_val, (int, float)) and isinstance(p_val, (int, float)) else None
+            metrics_comp[k] = MetricDelta(baseline=b_val, provider=p_val, delta=delta)
+
+        b_reward = self.reward
+        p_reward = other.reward
+        delta_reward = (p_reward - b_reward) if (b_reward is not None and p_reward is not None) else None
+
+        breakdown_keys = sorted(set(self.reward_breakdown.keys()) | set(other.reward_breakdown.keys()))
+        breakdown_comp = {
+            k: MetricDelta(
+                baseline=self.reward_breakdown.get(k, 0.0),
+                provider=other.reward_breakdown.get(k, 0.0),
+                delta=other.reward_breakdown.get(k, 0.0) - self.reward_breakdown.get(k, 0.0),
+            )
+            for k in breakdown_keys
+        }
+        reward_comp = RewardComparison(
+            baseline_reward=b_reward,
+            provider_reward=p_reward,
+            delta_reward=delta_reward,
+            breakdown_comparison=breakdown_comp,
+        )
+
+        hard_constraints_comp = HardConstraintsComparison(
+            baseline_satisfied=self.hard_constraints.get("satisfied", True),
+            provider_satisfied=other.hard_constraints.get("satisfied", True),
+            baseline_violations=list(self.hard_constraints.get("violations", [])),
+            provider_violations=list(other.hard_constraints.get("violations", [])),
+            baseline_aborted=self.hard_constraints.get("aborted", False),
+            provider_aborted=other.hard_constraints.get("aborted", False),
+        )
+
+        b_fallbacks = [d for d in self.decision_diagnostics if d.get("applied_fallback")]
+        p_fallbacks = [d for d in other.decision_diagnostics if d.get("applied_fallback")]
+        fallbacks_comp = FallbacksComparison(
+            baseline_fallbacks=len(b_fallbacks),
+            provider_fallbacks=len(p_fallbacks),
+            baseline_diagnostics=list(self.decision_diagnostics),
+            provider_diagnostics=list(other.decision_diagnostics),
+        )
+
+        status_comp = StatusComparison(
+            baseline_status=self.status,
+            provider_status=other.status,
+            baseline_simulated_time_ns=self.simulated_time_ns,
+            provider_simulated_time_ns=other.simulated_time_ns,
+            baseline_events_processed=self.events_processed,
+            provider_events_processed=other.events_processed,
+            baseline_result_hash=self.result_hash,
+            provider_result_hash=other.result_hash,
+        )
+
+        return PolicyComparisonResult(
+            config_hash=config_hash,
+            model_hash=model_hash,
+            seed=self.seed,
+            baseline_summary=self,
+            provider_summary=other,
+            metrics_comparison=metrics_comp,
+            reward_comparison=reward_comp,
+            hard_constraints_comparison=hard_constraints_comp,
+            fallbacks_comparison=fallbacks_comp,
+            status_comparison=status_comp,
+        )
+
+
+@dataclass(frozen=True)
+class MetricDelta:
+    baseline: int | float
+    provider: int | float
+    delta: int | float | None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline": self.baseline,
+            "provider": self.provider,
+            "delta": self.delta,
+        }
+
+
+@dataclass(frozen=True)
+class RewardComparison:
+    baseline_reward: float | None
+    provider_reward: float | None
+    delta_reward: float | None
+    breakdown_comparison: dict[str, MetricDelta]
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_reward": self.baseline_reward,
+            "provider_reward": self.provider_reward,
+            "delta_reward": self.delta_reward,
+            "breakdown_comparison": {k: v.to_dict() for k, v in self.breakdown_comparison.items()},
+        }
+
+
+@dataclass(frozen=True)
+class HardConstraintsComparison:
+    baseline_satisfied: bool
+    provider_satisfied: bool
+    baseline_violations: list[dict[str, Any]]
+    provider_violations: list[dict[str, Any]]
+    baseline_aborted: bool
+    provider_aborted: bool
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_satisfied": self.baseline_satisfied,
+            "provider_satisfied": self.provider_satisfied,
+            "baseline_violations": list(self.baseline_violations),
+            "provider_violations": list(self.provider_violations),
+            "baseline_aborted": self.baseline_aborted,
+            "provider_aborted": self.provider_aborted,
+        }
+
+
+@dataclass(frozen=True)
+class FallbacksComparison:
+    baseline_fallbacks: int
+    provider_fallbacks: int
+    baseline_diagnostics: list[dict[str, Any]]
+    provider_diagnostics: list[dict[str, Any]]
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_fallbacks": self.baseline_fallbacks,
+            "provider_fallbacks": self.provider_fallbacks,
+            "baseline_diagnostics": list(self.baseline_diagnostics),
+            "provider_diagnostics": list(self.provider_diagnostics),
+        }
+
+
+@dataclass(frozen=True)
+class StatusComparison:
+    baseline_status: str
+    provider_status: str
+    baseline_simulated_time_ns: int
+    provider_simulated_time_ns: int
+    baseline_events_processed: int
+    provider_events_processed: int
+    baseline_result_hash: str
+    provider_result_hash: str
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_status": self.baseline_status,
+            "provider_status": self.provider_status,
+            "baseline_simulated_time_ns": self.baseline_simulated_time_ns,
+            "provider_simulated_time_ns": self.provider_simulated_time_ns,
+            "baseline_events_processed": self.baseline_events_processed,
+            "provider_events_processed": self.provider_events_processed,
+            "baseline_result_hash": self.baseline_result_hash,
+            "provider_result_hash": self.provider_result_hash,
+        }
+
+
+@dataclass(frozen=True)
+class PolicyComparisonResult:
+    config_hash: str
+    model_hash: str
+    seed: int
+    baseline_summary: EpisodeSummary
+    provider_summary: EpisodeSummary
+    metrics_comparison: dict[str, MetricDelta]
+    reward_comparison: RewardComparison
+    hard_constraints_comparison: HardConstraintsComparison
+    fallbacks_comparison: FallbacksComparison
+    status_comparison: StatusComparison
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "config_hash": self.config_hash,
+            "model_hash": self.model_hash,
+            "seed": self.seed,
+            "baseline_summary": self.baseline_summary.to_dict(),
+            "provider_summary": self.provider_summary.to_dict(),
+            "metrics_comparison": {k: v.to_dict() for k, v in self.metrics_comparison.items()},
+            "reward_comparison": self.reward_comparison.to_dict(),
+            "hard_constraints_comparison": self.hard_constraints_comparison.to_dict(),
+            "fallbacks_comparison": self.fallbacks_comparison.to_dict(),
+            "status_comparison": self.status_comparison.to_dict(),
+        }
+
 
 def _parse_yaml_source(source: str | Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(source, dict):
@@ -388,10 +621,16 @@ def _parse_yaml_source(source: str | Path | dict[str, Any]) -> dict[str, Any]:
             raise ValueError("YAML content did not produce a dictionary mapping")
         return parsed
 
+    if isinstance(source, SimulationConfig):
+        return source.model_dump(mode="json")
+
     raise TypeError(f"Unsupported source type: {type(source).__name__}")
 
 
-def validate_config(source: str | Path | dict[str, Any]) -> ValidationResult:
+def validate_config(source: str | Path | dict[str, Any] | SimulationConfig) -> ValidationResult:
+    if isinstance(source, SimulationConfig):
+        return ValidationResult(is_valid=True, errors=[], config=source)
+
     try:
         raw_dict = _parse_yaml_source(source)
     except Exception as e:
@@ -3347,6 +3586,9 @@ class EpisodeEngine:
     def _is_terminal_condition_met(self, k: EventKernel) -> bool:
         if self.cfg.episode.end_condition.type == "all_units_terminal":
             return all(u.state == ProductionUnitState.TERMINAL for u in self.units.values())
+        if self.cfg.episode.end_condition.type == "max_time":
+            if self.cfg.episode.end_condition.max_time_ns is not None:
+                return k.current_time_ns >= self.cfg.episode.end_condition.max_time_ns
         return False
 
     @classmethod
@@ -4088,6 +4330,12 @@ class EpisodeEngine:
             if not (pause_at_decision_batch and self.decision_coordinator.has_pending()):
                 if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                     self.kernel.advance_to(pause_at_ns)
+                elif (
+                    self.cfg.episode.end_condition.type == "max_time"
+                    and self.cfg.episode.end_condition.max_time_ns is not None
+                    and self.kernel.current_time_ns < self.cfg.episode.end_condition.max_time_ns
+                ):
+                    self.kernel.advance_to(self.cfg.episode.end_condition.max_time_ns)
 
         summary = self.to_summary()
         if not pause_at_decision_batch:
@@ -4375,7 +4623,7 @@ def resume_episode(
 
 
 def run_episode(
-    source: str | Path | dict[str, Any],
+    source: str | Path | dict[str, Any] | SimulationConfig,
     decision_provider: DecisionProvider | None = None,
     output_dir: str | Path | None = None,
 ) -> EpisodeSummary:
@@ -4520,13 +4768,20 @@ def _derive_branch_id(
 
 
 def _compute_raw_metrics(summary: EpisodeSummary, warm_up_time_ns: int = 0) -> dict[str, Any]:
-    # Good output: completed units at sink with quality_state != 'scrapped' and terminal >= warm_up_time_ns
+    def is_unit_scrapped(u: ProductionUnitSummary) -> bool:
+        return (
+            u.location == "scrapped"
+            or u.quality_state == "scrapped"
+            or any(f.get("disposition") == "scrap" for f in u.findings)
+            or (bool(u.history) and u.history[-1].get("details", {}).get("reason") == "quality_inspection_scrap")
+        )
+
+    # Good output: completed units at sink that were not scrapped and terminal >= warm_up_time_ns
     good_completed_units = [
         u
         for u in summary.production_units
         if u.state == "terminal"
-        and u.location != "scrapped"
-        and u.quality_state != "scrapped"
+        and not is_unit_scrapped(u)
         and (not u.history or u.history[-1]["time_ns"] >= warm_up_time_ns)
     ]
     good_output = len(good_completed_units)
@@ -4536,7 +4791,7 @@ def _compute_raw_metrics(summary: EpisodeSummary, warm_up_time_ns: int = 0) -> d
         u
         for u in summary.production_units
         if u.state == "terminal"
-        and (u.location == "scrapped" or u.quality_state == "scrapped")
+        and is_unit_scrapped(u)
         and (not u.history or u.history[-1]["time_ns"] >= warm_up_time_ns)
     ]
     scrap = len(scrap_units)
@@ -4742,6 +4997,8 @@ def branch_checkpoint(
                 raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
             cfg = validation.config
 
+    eff_cfg = cfg or SimulationConfig.model_validate(cp.configuration)
+
     # Verify that the checkpoint is at a Decision Batch
     coord = (
         cp.domain_state.get("decision_coordinator")
@@ -4777,9 +5034,6 @@ def branch_checkpoint(
 
         if out_p is not None:
             branch_dir = out_p / "branches" / branch_id
-            eff_cfg = cfg
-            if eff_cfg is None:
-                eff_cfg = SimulationConfig.model_validate(cp.configuration)
             branch_writer = RunArtifactWriter(
                 output_dir=branch_dir,
                 config=eff_cfg,
@@ -4912,8 +5166,8 @@ def branch_checkpoint(
             else [a.model_dump(mode="json") for a in actions]
         )
 
-        raw_metrics = _compute_raw_metrics(summary)
-        hard_constraints = _compute_hard_constraints(summary)
+        raw_metrics = _compute_raw_metrics(summary, warm_up_time_ns=eff_cfg.episode.warm_up_time_ns)
+        hard_constraints = _compute_hard_constraints(summary, config=eff_cfg.hard_constraints, raw_metrics=raw_metrics)
 
         branch_results.append(
             CounterfactualBranchResult(
@@ -4938,7 +5192,6 @@ def branch_checkpoint(
         (out_p / "comparison_summary.json").write_text(
             json.dumps(comp_result.to_dict(), indent=2), encoding="utf-8"
         )
-        eff_cfg = cfg or SimulationConfig.model_validate(cp.configuration)
         buf = StringIO()
         _yaml.dump(eff_cfg.model_dump(mode="json"), buf)
         (out_p / "resolved_config.yaml").write_text(buf.getvalue(), encoding="utf-8")
@@ -4967,7 +5220,7 @@ def branch_checkpoint(
             "runtime": collect_runtime_metadata(),
             "libraries": collect_library_metadata(),
             "seed": cp.root_seed,
-            "calibration": collect_calibration_metadata(),
+            "calibration": collect_calibration_metadata(eff_cfg),
             "plugin_metadata": cp.plugin_metadata,
         }
         (out_p / "manifest.json").write_text(json.dumps(root_manifest, indent=2), encoding="utf-8")
@@ -4975,6 +5228,88 @@ def branch_checkpoint(
             (out_p / ".incomplete").unlink()
 
     return comp_result
+
+
+def compare_policies(
+    config_source: str | Path | dict[str, Any] | SimulationConfig,
+    decision_provider: DecisionProvider,
+    baseline_provider: DecisionProvider | None = None,
+    output_dir: str | Path | None = None,
+) -> PolicyComparisonResult:
+    if isinstance(config_source, SimulationConfig):
+        cfg = config_source
+    else:
+        validation = validate_config(config_source)
+        if not validation.is_valid or validation.config is None:
+            raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+        cfg = validation.config
+
+    config_hash = compute_config_hash(cfg.model_dump(mode="json"))
+    model_hash = compute_model_hash(cfg.model_dump(mode="json"))
+
+    if baseline_provider is None:
+        from industrialsim.decisions import BaselineDecisionProvider
+        baseline_provider = BaselineDecisionProvider()
+
+    out_p: Path | None = Path(output_dir) if output_dir is not None else None
+    root_created_at = datetime.now(timezone.utc).isoformat()
+
+    if out_p is not None:
+        manifest_p = out_p / "manifest.json"
+        if manifest_p.exists():
+            try:
+                m_data = json.loads(manifest_p.read_text(encoding="utf-8"))
+                if m_data.get("status") == "completed":
+                    raise RunArtifactExistsError(
+                        f"Run directory '{output_dir}' already exists and is completed"
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+        out_p.mkdir(parents=True, exist_ok=True)
+        (out_p / ".incomplete").write_text("in_progress\n", encoding="utf-8")
+
+    baseline_out = (out_p / "baseline") if out_p is not None else None
+    provider_out = (out_p / "provider") if out_p is not None else None
+
+    baseline_summary = run_episode(cfg, decision_provider=baseline_provider, output_dir=baseline_out)
+    provider_summary = run_episode(cfg, decision_provider=decision_provider, output_dir=provider_out)
+
+    comp_result = baseline_summary.compare_with(
+        provider_summary,
+        config_hash=config_hash,
+        model_hash=model_hash,
+    )
+
+    if out_p is not None:
+        (out_p / "comparison_summary.json").write_text(
+            json.dumps(comp_result.to_dict(), indent=2), encoding="utf-8"
+        )
+        buf = StringIO()
+        _yaml.dump(cfg.model_dump(mode="json"), buf)
+        (out_p / "resolved_config.yaml").write_text(buf.getvalue(), encoding="utf-8")
+
+        root_manifest = {
+            "schema_version": cfg.schema_version,
+            "kernel_version": "1.0",
+            "run_id": f"policy-comp-{config_hash[:8]}-{cfg.seed}",
+            "type": "policy_comparison",
+            "status": "completed",
+            "created_at": root_created_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "config_hash": config_hash,
+            "model_hash": model_hash,
+            "seed": cfg.seed,
+            "runtime": collect_runtime_metadata(),
+            "libraries": collect_library_metadata(),
+            "calibration": collect_calibration_metadata(cfg),
+            "plugin_metadata": {},
+        }
+        (out_p / "manifest.json").write_text(json.dumps(root_manifest, indent=2), encoding="utf-8")
+        if (out_p / ".incomplete").exists():
+            (out_p / ".incomplete").unlink()
+
+    return comp_result
+
 
 
 

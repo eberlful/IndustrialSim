@@ -837,9 +837,17 @@ class DeadlockConfig(StrictBaseModel):
         return self
 
 
+class CalibrationConfig(StrictBaseModel):
+    is_calibrated: bool = False
+    calibration_id: str | None = None
+    notes: str = "synthetic reference parameters; not calibrated for quantitative real-world prediction"
+    uncalibrated_parameters: list[str] = Field(default_factory=list)
+
+
 class SimulationConfig(StrictBaseModel):
     schema_version: str = "1.0"
     seed: int = 42
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     episode: EpisodeConfig
     plant: PlantConfig | None = None
     material_flow: MaterialFlowConfig | None = None

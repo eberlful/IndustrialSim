@@ -1,0 +1,764 @@
+schema_version: "1.0"
+seed: 42
+
+calibration:
+  is_calibrated: false
+  notes: "Synthetic automotive reference plant model; uncalibrated parameters."
+  uncalibrated_parameters:
+    - "station_cycle_times"
+    - "machine_degradation_rates"
+    - "inspection_sensitivity"
+    - "failure_hazard_rates"
+    - "vehicle_transit_times"
+
+episode:
+  start_time: "0s"
+  warm_up_time: "8h"
+  end_condition:
+    type: "max_time"
+    max_time: "5d"
+
+telemetry:
+  enabled: true
+  sample_interval: "2h"
+  domain_events:
+    - "operation_completed"
+    - "machine_state_change"
+
+plant:
+  id: "plant-reference-automotive"
+  name: "Reference Automotive Plant"
+  areas:
+    - id: "area-body-construction"
+      name: "Body Construction Area"
+      halls:
+        - id: "hall-body-construction"
+          name: "Body Construction Hall"
+    - id: "area-paint-application"
+      name: "Paint Application Area"
+      halls:
+        - id: "hall-paint-application"
+          name: "Paint Application Hall"
+    - id: "area-final-assembly"
+      name: "Final Assembly Area"
+      halls:
+        - id: "hall-final-assembly"
+          name: "Final Assembly Hall"
+
+material_flow:
+  nodes:
+    - id: "src-bodies"
+      kind: "source"
+      hall_id: "hall-body-construction"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+
+    - id: "st-body-1"
+      kind: "station"
+      hall_id: "hall-body-construction"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-body-weld"
+          duration: "120s"
+          required_machines: ["m-body-welder-1"]
+          required_workers:
+            - qualification: "body_operator"
+              count: 1
+          interruption_policy: "resume"
+          defect_probability: 0.05
+          defect_name: "weld_defect"
+
+    - id: "st-body-2"
+      kind: "station"
+      hall_id: "hall-body-construction"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-body-weld"
+          duration: "120s"
+          required_machines: ["m-body-welder-2"]
+          required_workers:
+            - qualification: "body_operator"
+              count: 1
+          interruption_policy: "resume"
+          defect_probability: 0.05
+          defect_name: "weld_defect"
+
+    - id: "buf-body-out"
+      kind: "buffer"
+      capacity: 4
+      hall_id: "hall-body-construction"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+
+    - id: "buf-paint-in"
+      kind: "buffer"
+      capacity: 3
+      hall_id: "hall-paint-application"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+
+    - id: "st-paint-pretreat"
+      kind: "station"
+      hall_id: "hall-paint-application"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-paint-pretreat"
+          duration: "90s"
+          required_machines: ["m-pretreat-bath"]
+          interruption_policy: "restart"
+
+    - id: "st-paint-booth"
+      kind: "station"
+      hall_id: "hall-paint-application"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-paint-spray"
+          duration: "150s"
+          required_machines: ["m-paint-robot"]
+          interruption_policy: "restart"
+          defect_probability: 0.04
+          defect_name: "paint_blemish"
+
+    - id: "st-paint-drying"
+      kind: "station"
+      hall_id: "hall-paint-application"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-paint-dry"
+          duration: "180s"
+          required_machines: ["m-drying-oven"]
+          interruption_policy: "resume"
+
+    - id: "buf-paint-out"
+      kind: "buffer"
+      capacity: 3
+      hall_id: "hall-paint-application"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+
+    - id: "buf-assembly-in"
+      kind: "buffer"
+      capacity: 4
+      hall_id: "hall-final-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+
+    - id: "st-assembly-1"
+      kind: "station"
+      hall_id: "hall-final-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-assembly-trim"
+          duration: "180s"
+          required_machines: ["m-assembly-station-1"]
+          required_workers:
+            - qualification: "assembly_technician"
+              count: 1
+          interruption_policy: "resume"
+
+    - id: "st-assembly-2"
+      kind: "station"
+      hall_id: "hall-final-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-assembly-chassis"
+          duration: "200s"
+          required_machines: ["m-assembly-station-2"]
+          required_workers:
+            - qualification: "assembly_technician"
+              count: 1
+          interruption_policy: "resume"
+          defect_probability: 0.08
+          defect_name: "torque_defect"
+
+    - id: "st-inspect"
+      kind: "station"
+      hall_id: "hall-final-assembly"
+      output_capacity: 2
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-quality-inspect"
+          duration: "60s"
+          required_workers:
+            - qualification: "inspector"
+              count: 1
+          inspection:
+            sensitivity: 0.92
+            false_positive_rate: 0.02
+            disposition_on_defect: "rework"
+            rework_station_id: "st-rework"
+            rework_operation_id: "op-rework"
+            max_reworks: 1
+
+    - id: "st-rework"
+      kind: "station"
+      hall_id: "hall-final-assembly"
+      output_capacity: 2
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "body"
+          direction: "output"
+      operations:
+        - id: "op-rework"
+          duration: "150s"
+          required_machines: ["m-rework-rig"]
+          required_workers:
+            - qualification: "maintenance"
+              count: 1
+          restores_quality: true
+          rework_success_probability: 0.60
+
+    - id: "snk-finished"
+      kind: "sink"
+      hall_id: "hall-final-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "body"
+          direction: "input"
+
+  routes:
+    - id: "r-src-body-1"
+      source_node_id: "src-bodies"
+      source_port_id: "p-out"
+      target_node_id: "st-body-1"
+      target_port_id: "p-in"
+      transit_time: "10s"
+
+    - id: "r-src-body-2"
+      source_node_id: "src-bodies"
+      source_port_id: "p-out"
+      target_node_id: "st-body-2"
+      target_port_id: "p-in"
+      transit_time: "10s"
+
+    - id: "r-body-1-buf"
+      source_node_id: "st-body-1"
+      source_port_id: "p-out"
+      target_node_id: "buf-body-out"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-body-2-buf"
+      source_node_id: "st-body-2"
+      source_port_id: "p-out"
+      target_node_id: "buf-body-out"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-body-paint"
+      source_node_id: "buf-body-out"
+      source_port_id: "p-out"
+      target_node_id: "buf-paint-in"
+      target_port_id: "p-in"
+      transit_time: "60s"
+      pool_id: "pool-transporters"
+
+    - id: "r-paint-in-pretreat"
+      source_node_id: "buf-paint-in"
+      source_port_id: "p-out"
+      target_node_id: "st-paint-pretreat"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-pretreat-booth"
+      source_node_id: "st-paint-pretreat"
+      source_port_id: "p-out"
+      target_node_id: "st-paint-booth"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-booth-drying"
+      source_node_id: "st-paint-booth"
+      source_port_id: "p-out"
+      target_node_id: "st-paint-drying"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-drying-paint-out"
+      source_node_id: "st-paint-drying"
+      source_port_id: "p-out"
+      target_node_id: "buf-paint-out"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-paint-assembly"
+      source_node_id: "buf-paint-out"
+      source_port_id: "p-out"
+      target_node_id: "buf-assembly-in"
+      target_port_id: "p-in"
+      transit_time: "60s"
+      pool_id: "pool-transporters"
+
+    - id: "r-assembly-in-st1"
+      source_node_id: "buf-assembly-in"
+      source_port_id: "p-out"
+      target_node_id: "st-assembly-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-st1-st2"
+      source_node_id: "st-assembly-1"
+      source_port_id: "p-out"
+      target_node_id: "st-assembly-2"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-st2-inspect"
+      source_node_id: "st-assembly-2"
+      source_port_id: "p-out"
+      target_node_id: "st-inspect"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-inspect-rework"
+      source_node_id: "st-inspect"
+      source_port_id: "p-out"
+      target_node_id: "st-rework"
+      target_port_id: "p-in"
+      transit_time: "10s"
+
+    - id: "r-rework-inspect"
+      source_node_id: "st-rework"
+      source_port_id: "p-out"
+      target_node_id: "st-inspect"
+      target_port_id: "p-in"
+      transit_time: "10s"
+
+    - id: "r-inspect-snk"
+      source_node_id: "st-inspect"
+      source_port_id: "p-out"
+      target_node_id: "snk-finished"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+vehicle_pools:
+  - id: "pool-transporters"
+
+vehicles:
+  - id: "agv-1"
+    pool_id: "pool-transporters"
+    initial_location: "buf-body-out"
+  - id: "agv-2"
+    pool_id: "pool-transporters"
+    initial_location: "buf-paint-out"
+
+machines:
+  - id: "m-body-welder-1"
+    initial_health: 1.0
+    degradation:
+      use_rate_per_s: 0.00005
+      cycle_time_factor: 0.5
+      defect_probability_factor: 0.2
+      failure_hazard_rate_per_s: 0.00001
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.985
+      duration: "300s"
+      restored_health: 1.0
+      required_workers:
+        - qualification: "maintenance"
+          count: 1
+    failure:
+      hazard_rate_per_s: 0.00001
+      repair_duration: "300s"
+      repaired_health: 0.98
+      required_workers:
+        - qualification: "maintenance"
+          count: 1
+    planned_disruptions:
+      - id: "disrupt-welder-1"
+        start_time: "36h"
+        duration: "30m"
+        repaired_health: 0.95
+        required_workers:
+          - qualification: "maintenance"
+            count: 1
+
+  - id: "m-body-welder-2"
+    initial_health: 1.0
+    degradation:
+      use_rate_per_s: 0.00002
+      cycle_time_factor: 0.5
+      defect_probability_factor: 0.2
+      failure_hazard_rate_per_s: 0.000005
+    maintenance:
+      duration: "300s"
+      restored_health: 0.95
+      required_workers:
+        - qualification: "maintenance"
+          count: 1
+
+  - id: "m-pretreat-bath"
+    initial_health: 1.0
+
+  - id: "m-paint-robot"
+    initial_health: 1.0
+    degradation:
+      use_rate_per_s: 0.00003
+      cycle_time_factor: 0.4
+      defect_probability_factor: 0.25
+      failure_hazard_rate_per_s: 0.000008
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.985
+      duration: "360s"
+      restored_health: 1.0
+      required_workers:
+        - qualification: "maintenance"
+          count: 1
+    failure:
+      hazard_rate_per_s: 0.00001
+      repair_duration: "360s"
+      repaired_health: 0.98
+      required_workers:
+        - qualification: "maintenance"
+          count: 1
+
+  - id: "m-drying-oven"
+    initial_health: 1.0
+
+  - id: "m-assembly-station-1"
+    initial_health: 1.0
+
+  - id: "m-assembly-station-2"
+    initial_health: 1.0
+
+  - id: "m-rework-rig"
+    initial_health: 1.0
+
+workers:
+  - id: "w-body-1"
+    qualifications: ["body_operator"]
+    shifts:
+      - id: "shift-body-1-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-body-2"
+    qualifications: ["body_operator"]
+    shifts:
+      - id: "shift-body-2-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-assembly-1"
+    qualifications: ["assembly_technician"]
+    shifts:
+      - id: "shift-assembly-1-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-assembly-2"
+    qualifications: ["assembly_technician"]
+    shifts:
+      - id: "shift-assembly-2-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-inspector-1"
+    qualifications: ["inspector"]
+    shifts:
+      - id: "shift-inspector-1-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-maint-1"
+    qualifications: ["maintenance"]
+    shifts:
+      - id: "shift-maint-1-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+  - id: "w-maint-2"
+    qualifications: ["maintenance"]
+    shifts:
+      - id: "shift-maint-2-day"
+        start_time: "0s"
+        end_time: "5d"
+        breaks:
+          - start_time: "4h"
+            duration: "30m"
+          - start_time: "28h"
+            duration: "30m"
+          - start_time: "52h"
+            duration: "30m"
+          - start_time: "76h"
+            duration: "30m"
+          - start_time: "100h"
+            duration: "30m"
+
+production_plan:
+  - id: "plan-sedan-batch1"
+    variant: "sedan"
+    quantity: 15
+    release_time: "0s"
+    due_date: "24h"
+    source_id: "src-bodies"
+
+  - id: "plan-suv-batch1"
+    variant: "suv"
+    quantity: 10
+    release_time: "6h"
+    due_date: "36h"
+    source_id: "src-bodies"
+
+  - id: "plan-sedan-batch2"
+    variant: "sedan"
+    quantity: 15
+    release_time: "24h"
+    due_date: "48h"
+    source_id: "src-bodies"
+
+  - id: "plan-suv-batch2"
+    variant: "suv"
+    quantity: 10
+    release_time: "30h"
+    due_date: "60h"
+    source_id: "src-bodies"
+
+  - id: "plan-sedan-batch3"
+    variant: "sedan"
+    quantity: 15
+    release_time: "48h"
+    due_date: "72h"
+    source_id: "src-bodies"
+
+  - id: "plan-suv-batch3"
+    variant: "suv"
+    quantity: 10
+    release_time: "54h"
+    due_date: "84h"
+    source_id: "src-bodies"
+
+  - id: "plan-sedan-batch4"
+    variant: "sedan"
+    quantity: 15
+    release_time: "72h"
+    due_date: "96h"
+    source_id: "src-bodies"
+
+  - id: "plan-suv-batch4"
+    variant: "suv"
+    quantity: 10
+    release_time: "78h"
+    due_date: "108h"
+    source_id: "src-bodies"
+
+process_plans:
+  - variant: "sedan"
+    steps:
+      - operation_id: "op-body-weld"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-pretreat"
+        compatible_stations: ["st-paint-pretreat"]
+      - operation_id: "op-paint-spray"
+        compatible_stations: ["st-paint-booth"]
+      - operation_id: "op-paint-dry"
+        compatible_stations: ["st-paint-drying"]
+      - operation_id: "op-assembly-trim"
+        compatible_stations: ["st-assembly-1"]
+      - operation_id: "op-assembly-chassis"
+        compatible_stations: ["st-assembly-2"]
+      - operation_id: "op-quality-inspect"
+        compatible_stations: ["st-inspect"]
+
+  - variant: "suv"
+    steps:
+      - operation_id: "op-body-weld"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-pretreat"
+        compatible_stations: ["st-paint-pretreat"]
+      - operation_id: "op-paint-spray"
+        compatible_stations: ["st-paint-booth"]
+      - operation_id: "op-paint-dry"
+        compatible_stations: ["st-paint-drying"]
+      - operation_id: "op-assembly-trim"
+        compatible_stations: ["st-assembly-1"]
+      - operation_id: "op-assembly-chassis"
+        compatible_stations: ["st-assembly-2"]
+      - operation_id: "op-quality-inspect"
+        compatible_stations: ["st-inspect"]
+
+reward_policy:
+  id: "throughput_and_quality"
+  components:
+    - name: "good_output"
+      weight: 100.0
+      scale: 10.0
+    - name: "lead_time_ns"
+      weight: -1.0
+      scale: 3600000000000.0
+    - name: "scrap"
+      weight: -50.0
+      scale: 1.0
+    - name: "lateness_ns"
+      weight: -2.0
+      scale: 3600000000000.0
+
+hard_constraints:
+  max_scrap: 20
+
+decision_triggers:
+  - id: "trig-body-buf"
+    buffer_id: "buf-body-out"
+    threshold: 2
+    direction: "rising"
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+  - id: "trig-welder-maint"
+    machine_id: "m-body-welder-1"
+    health_threshold: 0.4
+    on_failure: "fallback"
+    fallback_policy: "baseline"

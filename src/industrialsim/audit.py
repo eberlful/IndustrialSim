@@ -113,11 +113,20 @@ def collect_library_metadata() -> dict[str, str]:
     return libs
 
 
-def collect_calibration_metadata() -> dict[str, Any]:
+def collect_calibration_metadata(config: SimulationConfig | None = None) -> dict[str, Any]:
+    if config is not None and getattr(config, "calibration", None) is not None:
+        cal = config.calibration
+        return {
+            "is_calibrated": cal.is_calibrated,
+            "calibration_id": cal.calibration_id,
+            "notes": cal.notes,
+            "uncalibrated_parameters": list(cal.uncalibrated_parameters),
+        }
     return {
         "is_calibrated": False,
         "calibration_id": None,
         "notes": "synthetic reference parameters; not calibrated for quantitative real-world prediction",
+        "uncalibrated_parameters": [],
     }
 
 
@@ -194,7 +203,7 @@ class RunArtifactWriter:
             "config_hash": config_hash,
             "plugin_metadata": self.plugin_metadata,
             "seed": self.config.seed,
-            "calibration": collect_calibration_metadata(),
+            "calibration": collect_calibration_metadata(self.config),
         }
         self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
