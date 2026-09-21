@@ -433,6 +433,8 @@ class StationConfig(StrictBaseModel):
     id: str
     operations: list[OperationConfig] = Field(min_length=1)
     output_capacity: int = 0
+    type_id: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("operations")
     @classmethod
@@ -456,6 +458,8 @@ class NodeConfig(StrictBaseModel):
     hall_id: str | None = None
     capacity: int | None = None
     output_capacity: int = 0
+    type_id: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
     operations: list[OperationConfig] = Field(default_factory=list)
     input_ports: list[PortConfig] = Field(default_factory=list)
     output_ports: list[PortConfig] = Field(default_factory=list)
@@ -852,6 +856,7 @@ class SimulationConfig(StrictBaseModel):
     telemetry: TelemetryConfig | None = None
     deadlock: DeadlockConfig | None = None
     decision_triggers: list[DecisionTriggerConfig] = Field(default_factory=list)
+    approved_plugins: list[str] = Field(default_factory=list)
 
     @field_validator("decision_triggers", mode="before")
     @classmethod
@@ -1061,6 +1066,31 @@ class SimulationConfig(StrictBaseModel):
                             raise ValueError(
                                 f"Decision trigger '{t.id}' references unknown buffer '{t.buffer_id}'"
                             )
+
+        # Validate plugins and station types
+        from industrialsim.plugins import get_plugin_registry, PluginValidationError
+
+        registry = get_plugin_registry()
+        for p_id in self.approved_plugins:
+            if not registry.has_plugin(p_id):
+                raise ValueError(f"Approved plugin '{p_id}' is not registered or installed")
+
+        all_station_configs: list[NodeConfig | StationConfig] = []
+        if self.material_flow is not None:
+            all_station_configs.extend(
+                [n for n in self.material_flow.nodes if n.kind == "station"]
+            )
+        all_station_configs.extend(self.stations)
+
+        for st_cfg in all_station_configs:
+            if st_cfg.type_id and st_cfg.type_id != "macro_station":
+                try:
+                    registry.validate_type_selection(
+                        type_id=st_cfg.type_id,
+                        approved_plugins=self.approved_plugins,
+                    )
+                except PluginValidationError as e:
+                    raise ValueError(str(e)) from e
 
         return self
 

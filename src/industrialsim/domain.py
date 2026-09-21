@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from industrialsim.material_flow import Port
 
 
 class ProductionUnitState(StrEnum):
@@ -527,11 +529,224 @@ class Operation:
     inspection: dict[str, Any] | None = None
 
 
+class TimingPolicy:
+    def compute_duration_ns(
+        self,
+        operation: Operation,
+        unit: ProductionUnit | None = None,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> int:
+        raise NotImplementedError
+
+
+class StandardTimingPolicy(TimingPolicy):
+    def compute_duration_ns(
+        self,
+        operation: Operation,
+        unit: ProductionUnit | None = None,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> int:
+        return operation.duration_ns
+
+
+class ResourceDemandPolicy:
+    def get_required_machines(self, operation: Operation, context: Any = None) -> list[str]:
+        raise NotImplementedError
+
+    def get_required_workers(self, operation: Operation, context: Any = None) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+
+class StandardResourceDemandPolicy(ResourceDemandPolicy):
+    def get_required_machines(self, operation: Operation, context: Any = None) -> list[str]:
+        return list(operation.required_machines)
+
+    def get_required_workers(self, operation: Operation, context: Any = None) -> list[dict[str, Any]]:
+        return list(operation.required_workers)
+
+
+class QualityPolicy:
+    def compute_defect(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> tuple[bool, str | None, str | None]:
+        raise NotImplementedError
+
+    def compute_rework(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        raise NotImplementedError
+
+    def evaluate_inspection(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> QualityFinding | None:
+        raise NotImplementedError
+
+
+class StandardQualityPolicy(QualityPolicy):
+    def compute_defect(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> tuple[bool, str | None, str | None]:
+        if operation.defect_probability > 0.0 and context is not None:
+            random_stream = getattr(context, "random_stream", None)
+            if random_stream is not None:
+                eff_prob = operation.defect_probability
+                defect_roll = random_stream.draw_float("quality", f"{unit.id}:{operation.id}", "defect")
+                if defect_roll < eff_prob:
+                    defect_name = operation.defect_name or f"defect_{operation.id}"
+                    target_state = operation.target_quality_state or defect_name
+                    return True, defect_name, target_state
+        return False, None, None
+
+    def compute_rework(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        if not operation.restores_quality:
+            return False
+        if operation.rework_success_probability < 1.0 and context is not None:
+            random_stream = getattr(context, "random_stream", None)
+            if random_stream is not None:
+                roll = random_stream.draw_float("quality", f"{unit.id}:{operation.id}", "rework_success")
+                return bool(roll < operation.rework_success_probability)
+        return True
+
+    def evaluate_inspection(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> QualityFinding | None:
+        if not operation.inspection:
+            return None
+        insp = operation.inspection
+        sensitivity = float(insp.get("sensitivity", 1.0))
+        fp_rate = float(insp.get("false_positive_rate", 0.0))
+        disp_on_defect = insp.get("disposition_on_defect", "scrap")
+        max_reworks = int(insp.get("max_reworks", 1))
+
+        is_defect_detected = False
+        random_stream = getattr(context, "random_stream", None) if context else None
+        if unit.is_defective:
+            if random_stream:
+                detection_roll = random_stream.draw_float("inspection", f"{unit.id}:{operation.id}", "detection")
+                is_defect_detected = detection_roll < sensitivity
+            else:
+                is_defect_detected = True
+        else:
+            if random_stream and fp_rate > 0.0:
+                fp_roll = random_stream.draw_float("inspection", f"{unit.id}:{operation.id}", "false_positive")
+                is_defect_detected = fp_roll < fp_rate
+
+        if is_defect_detected:
+            result = "defect_detected"
+            if disp_on_defect == "rework" and unit.rework_count >= max_reworks:
+                disposition = "scrap"
+            else:
+                disposition = disp_on_defect
+        else:
+            result = "nominal"
+            disposition = "pass"
+
+        return QualityFinding(
+            time_ns=time_ns,
+            unit_id=unit.id,
+            station_id=getattr(context, "station_id", ""),
+            operation_id=operation.id,
+            result=result,
+            disposition=disposition,
+        )
+
+
+class DegradationPolicy:
+    def apply_degradation(
+        self,
+        machine: Machine,
+        dt_s: float,
+        operating_mode: str,
+        context: Any = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class StandardDegradationPolicy(DegradationPolicy):
+    def apply_degradation(
+        self,
+        machine: Machine,
+        dt_s: float,
+        operating_mode: str,
+        context: Any = None,
+    ) -> None:
+        if not machine.degradation_policy:
+            return
+        use_rate = float(machine.degradation_policy.get("use_rate_per_s", 0.0))
+        mode_info = machine.modes.get(operating_mode, {})
+        if isinstance(mode_info, dict):
+            mode_mult = float(mode_info.get("degradation_multiplier", 1.0))
+        else:
+            mode_mult = float(getattr(mode_info, "degradation_multiplier", 1.0))
+        machine.health = max(0.0, machine.health - dt_s * use_rate * mode_mult)
+        phys_rates = machine.degradation_policy.get("physical_rates_per_s", {})
+        for k, rate in phys_rates.items():
+            machine.physical_state[k] = machine.physical_state.get(k, 0.0) + dt_s * float(rate)
+
+
+class FailurePolicy:
+    def evaluate_failure(
+        self,
+        machine: Machine,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        raise NotImplementedError
+
+
+class StandardFailurePolicy(FailurePolicy):
+    def evaluate_failure(
+        self,
+        machine: Machine,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        return machine.is_failed
+
+
 @dataclass
 class Station:
     id: str
     operations: dict[str, Operation]
+    input_ports: dict[str, Port] = field(default_factory=dict)
+    output_ports: dict[str, Port] = field(default_factory=dict)
     output_capacity: int = 0
+    type_id: str = "macro_station"
+    plugin_id: str | None = None
+    plugin_version: str | None = None
+    timing_policy: TimingPolicy = field(default_factory=StandardTimingPolicy)
+    resource_policy: ResourceDemandPolicy = field(default_factory=StandardResourceDemandPolicy)
+    quality_policy: QualityPolicy = field(default_factory=StandardQualityPolicy)
+    degradation_policy: DegradationPolicy = field(default_factory=StandardDegradationPolicy)
+    failure_policy: FailurePolicy = field(default_factory=StandardFailurePolicy)
     is_busy: bool = False
     is_blocked: bool = False
     current_unit_id: str | None = None
@@ -550,6 +765,68 @@ class Station:
     waiting_since_ns: int | None = None
     configuration: dict[str, Any] = field(default_factory=dict)
     is_reconfiguring: bool = False
+
+    def get_port(self, port_id: str) -> Port | None:
+        return self.input_ports.get(port_id) or self.output_ports.get(port_id)
+
+    def compute_duration_ns(
+        self,
+        operation: Operation,
+        unit: ProductionUnit | None = None,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> int:
+        return self.timing_policy.compute_duration_ns(operation, unit=unit, time_ns=time_ns, context=context)
+
+    def get_required_machines(self, operation: Operation, context: Any = None) -> list[str]:
+        return self.resource_policy.get_required_machines(operation, context=context)
+
+    def get_required_workers(self, operation: Operation, context: Any = None) -> list[dict[str, Any]]:
+        return self.resource_policy.get_required_workers(operation, context=context)
+
+    def compute_defect(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> tuple[bool, str | None, str | None]:
+        return self.quality_policy.compute_defect(operation, unit=unit, time_ns=time_ns, context=context)
+
+    def compute_rework(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        return self.quality_policy.compute_rework(operation, unit=unit, time_ns=time_ns, context=context)
+
+    def evaluate_inspection(
+        self,
+        operation: Operation,
+        unit: ProductionUnit,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> QualityFinding | None:
+        return self.quality_policy.evaluate_inspection(operation, unit=unit, time_ns=time_ns, context=context)
+
+    def apply_degradation(
+        self,
+        machine: Machine,
+        dt_s: float,
+        operating_mode: str,
+        context: Any = None,
+    ) -> None:
+        self.degradation_policy.apply_degradation(machine, dt_s=dt_s, operating_mode=operating_mode, context=context)
+
+    def evaluate_failure(
+        self,
+        machine: Machine,
+        time_ns: int = 0,
+        context: Any = None,
+    ) -> bool:
+        return self.failure_policy.evaluate_failure(machine, time_ns=time_ns, context=context)
 
     def can_accept(self, reserved: int = 0) -> bool:
         return (

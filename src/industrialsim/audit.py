@@ -231,6 +231,7 @@ class RunArtifactWriter:
             + self.telemetry_manager.training_records_written
         )
         manifest_data["thinned_samples_count"] = self.telemetry_manager.thinned_samples_count
+        manifest_data["plugin_metadata"] = self.plugin_metadata
 
         self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 

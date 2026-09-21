@@ -656,6 +656,11 @@ def _verify_checkpoint_compatibility(
     cfg: SimulationConfig,
     source_label: str,
 ) -> None:
+    for p_id in checkpoint.plugin_metadata:
+        if p_id not in cfg.approved_plugins:
+            raise IncompatibleCheckpointError(
+                f"Incompatible plugin metadata: plugin '{p_id}' is not approved in {source_label} configuration"
+            )
     model_hash = compute_model_hash(cfg)
     if model_hash != checkpoint.model_hash:
         raise IncompatibleCheckpointError(
@@ -666,6 +671,68 @@ def _verify_checkpoint_compatibility(
         raise IncompatibleCheckpointError(
             f"Configuration hash mismatch: checkpoint requires '{checkpoint.config_hash}', but {source_label} config has '{config_hash}'"
         )
+
+
+def _create_station_instance(n: Any) -> Station:
+    from industrialsim.material_flow import Port, PortDirection
+    from industrialsim.plugins import get_plugin_registry
+
+    ops = {
+        op.id: Operation(
+            id=op.id,
+            duration_ns=op.duration_ns,
+            required_machines=list(op.required_machines),
+            required_workers=[
+                req.model_dump() if hasattr(req, "model_dump") else dict(req)
+                for req in op.required_workers
+            ],
+            interruption_policy=op.interruption_policy,
+            defect_probability=op.defect_probability,
+            defect_name=op.defect_name,
+            target_quality_state=op.target_quality_state,
+            restores_quality=op.restores_quality,
+            rework_success_probability=op.rework_success_probability,
+            inspection=(
+                op.inspection.model_dump()
+                if hasattr(op.inspection, "model_dump")
+                else (dict(op.inspection) if op.inspection else None)
+            ),
+        )
+        for op in getattr(n, "operations", [])
+    }
+    in_ports = {
+        p.id: Port(id=p.id, port_type=p.port_type, direction=PortDirection.INPUT)
+        for p in getattr(n, "input_ports", [])
+    }
+    out_ports = {
+        p.id: Port(id=p.id, port_type=p.port_type, direction=PortDirection.OUTPUT)
+        for p in getattr(n, "output_ports", [])
+    }
+    out_cap = getattr(n, "output_capacity", 0)
+    type_id = getattr(n, "type_id", None)
+    params = getattr(n, "parameters", {})
+
+    if type_id and type_id != "macro_station":
+        registry = get_plugin_registry()
+        plugin = registry.get_plugin_by_type(type_id)
+        if plugin is not None and hasattr(plugin, "create_station"):
+            return plugin.create_station(
+                node_id=n.id,
+                operations=ops,
+                input_ports=in_ports,
+                output_ports=out_ports,
+                output_capacity=out_cap,
+                parameters=params,
+            )
+
+    return Station(
+        id=n.id,
+        operations=ops,
+        input_ports=in_ports,
+        output_ports=out_ports,
+        output_capacity=out_cap,
+        type_id="macro_station",
+    )
 
 
 class EpisodeEngine:
@@ -687,7 +754,12 @@ class EpisodeEngine:
         self.topology = topology
         self.domain = domain
         self.random_occurrence_counters = dict(random_occurrence_counters or {})
-        self.plugin_metadata = plugin_metadata or {}
+        self.plugin_metadata = dict(plugin_metadata or {})
+        for st in self.domain.stations.values():
+            p_id = getattr(st, "plugin_id", None)
+            p_ver = getattr(st, "plugin_version", None)
+            if p_id is not None and p_ver is not None:
+                self.plugin_metadata[str(p_id)] = str(p_ver)
         self.decision_provider = decision_provider
         self.episode_id = f"ep-{self.cfg.seed}"
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=self.episode_id)
@@ -952,6 +1024,7 @@ class EpisodeEngine:
         self.kernel.register_handler("ARRIVAL_AT_NODE", self._handle_arrival_at_node)
         self.kernel.register_handler("VEHICLE_ARRIVED_AT_PICKUP", self._handle_vehicle_arrived_at_pickup)
         self.kernel.register_handler("COMPLETE_OPERATION", self._handle_complete_operation)
+        self.kernel.register_handler("COMPLETE_MICRO_OPERATION", self._handle_complete_micro_operation)
         self.kernel.register_handler("SHIFT_START", self._handle_shift_start)
         self.kernel.register_handler("SHIFT_END", self._handle_shift_end)
         self.kernel.register_handler("BREAK_START", self._handle_break_start)
@@ -2894,6 +2967,12 @@ class EpisodeEngine:
             details={"station_id": node_id, "operation_id": op.id},
         )
 
+        from industrialsim.plugins import MicroSubgraphStation
+
+        if isinstance(st, MicroSubgraphStation):
+            self._start_micro_subgraph_operation(k, st, unit, op, op_index)
+            return
+
         can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, node_id, k.current_time_ns)
         eff_dur = self._compute_effective_operation_duration(op, k.current_time_ns)
         if can_acq:
@@ -3002,7 +3081,19 @@ class EpisodeEngine:
         st.complete_operation(current_op.id, k.current_time_ns)
         self._record_operation_completed(unit_id, station_id, current_op.id, k.current_time_ns)
         self._emit_domain_event("operation_completed")
+        self._finish_operation_lifecycle(k, st, unit, current_op, op_index, ops_list)
 
+    def _finish_operation_lifecycle(
+        self,
+        k: EventKernel,
+        st: Station,
+        unit: ProductionUnit,
+        current_op: Operation,
+        op_index: int,
+        ops_list: list[Operation],
+    ) -> None:
+        station_id = st.id
+        unit_id = unit.id
         was_in_rework = unit.is_in_rework
 
         # 1. Defect generation (addressed by unit and operation for counterfactual consistency)
@@ -3163,6 +3254,96 @@ class EpisodeEngine:
         # Last operation completed for this unit:
         self._route_or_buffer_unit(k, station_id, unit_id)
 
+    def _start_micro_subgraph_operation(
+        self,
+        k: EventKernel,
+        st: Any,
+        unit: ProductionUnit,
+        op: Operation,
+        op_index: int,
+    ) -> None:
+        total_remaining = sum(s.duration_ns for s in st.stages) if getattr(st, "stages", None) else op.duration_ns
+        self.active_operations[st.id] = {
+            "unit_id": unit.id,
+            "operation_id": op.id,
+            "start_time_ns": k.current_time_ns,
+            "remaining_duration_ns": total_remaining,
+            "end_time_ns": k.current_time_ns + total_remaining,
+            "allocated_machines": [],
+            "allocated_workers": [],
+            "is_interrupted": False,
+            "interrupted_at_ns": None,
+            "resumed_at_ns": None,
+            "restart_count": 0,
+            "interruption_policy": op.interruption_policy,
+        }
+        st.start_operation(unit.id, op.id, k.current_time_ns)
+        st.active_stage_index = 0
+        st.stage_start_ns = k.current_time_ns
+        token = f"micro-{st.id}-{unit.id}-{k.current_time_ns}"
+        st.active_token = token
+        self._record_operation_started(unit.id, st.id, op.id, k.current_time_ns)
+
+        stage = st.get_current_stage()
+        stage_dur = stage.duration_ns if stage else op.duration_ns
+        k.schedule(
+            time_ns=k.current_time_ns + stage_dur,
+            priority=EventPriority.COMPLETION,
+            event_type="COMPLETE_MICRO_OPERATION",
+            payload={
+                "unit_id": unit.id,
+                "station_id": st.id,
+                "op_id": op.id,
+                "op_index": op_index,
+                "token": token,
+                "stage_index": 0,
+            },
+        )
+
+    def _handle_complete_micro_operation(self, k: EventKernel, event: ScheduledEvent) -> None:
+        station_id = event.payload["station_id"]
+        unit_id = event.payload["unit_id"]
+        op_id = event.payload["op_id"]
+        op_index = event.payload.get("op_index", 0)
+        token = event.payload.get("token")
+
+        st = self.stations.get(station_id)
+        from industrialsim.plugins import MicroSubgraphStation
+
+        if not isinstance(st, MicroSubgraphStation) or st.active_token != token:
+            return
+
+        unit = self.units[unit_id]
+        has_next = st.advance_stage(k.current_time_ns)
+        self._record_domain_progress(k.current_time_ns)
+
+        if has_next:
+            next_stage = st.get_current_stage()
+            next_dur = next_stage.duration_ns if next_stage else 0
+            k.schedule(
+                time_ns=k.current_time_ns + next_dur,
+                priority=EventPriority.COMPLETION,
+                event_type="COMPLETE_MICRO_OPERATION",
+                payload={
+                    "unit_id": unit.id,
+                    "station_id": st.id,
+                    "op_id": op_id,
+                    "op_index": op_index,
+                    "token": token,
+                    "stage_index": st.active_stage_index,
+                },
+            )
+        else:
+            current_op = st.operations[op_id]
+            self.active_operations.pop(station_id, None)
+            st.complete_operation(op_id, k.current_time_ns)
+            st.active_token = None
+            st.active_stage_index = None
+            self._record_operation_completed(unit_id, station_id, op_id, k.current_time_ns)
+            self._emit_domain_event("operation_completed")
+            ops_list = list(st.operations.values())
+            self._finish_operation_lifecycle(k, st, unit, current_op, op_index, ops_list)
+
     def _is_terminal_condition_met(self, k: EventKernel) -> bool:
         if self.cfg.episode.end_condition.type == "all_units_terminal":
             return all(u.state == ProductionUnitState.TERMINAL for u in self.units.values())
@@ -3202,26 +3383,7 @@ class EpisodeEngine:
 
         for n in mf.nodes:
             if n.kind == "station":
-                stations[n.id] = Station(
-                    id=n.id,
-                    operations={
-                        op.id: Operation(
-                            id=op.id,
-                            duration_ns=op.duration_ns,
-                            required_machines=list(op.required_machines),
-                            required_workers=[req.model_dump() for req in op.required_workers],
-                            interruption_policy=op.interruption_policy,
-                            defect_probability=op.defect_probability,
-                            defect_name=op.defect_name,
-                            target_quality_state=op.target_quality_state,
-                            restores_quality=op.restores_quality,
-                            rework_success_probability=op.rework_success_probability,
-                            inspection=op.inspection.model_dump() if op.inspection else None,
-                        )
-                        for op in n.operations
-                    },
-                    output_capacity=n.output_capacity,
-                )
+                stations[n.id] = _create_station_instance(n)
             elif n.kind == "buffer":
                 assert n.capacity is not None
                 buffers[n.id] = Buffer(id=n.id, capacity=n.capacity)
@@ -3473,10 +3635,19 @@ class EpisodeEngine:
             raise IncompatibleCheckpointError(
                 f"Incompatible kernel version: expected '1.0', got '{checkpoint.kernel_version}'"
             )
-        if checkpoint.plugin_metadata:
-            raise IncompatibleCheckpointError(
-                f"Incompatible plugin metadata: plugins {list(checkpoint.plugin_metadata.keys())} are not available"
-            )
+        from industrialsim.plugins import get_plugin_registry
+
+        registry = get_plugin_registry()
+        for p_id, p_ver in checkpoint.plugin_metadata.items():
+            if not registry.has_plugin(p_id):
+                raise IncompatibleCheckpointError(
+                    f"Incompatible plugin metadata: plugin '{p_id}' is not available"
+                )
+            p = registry.get_plugin_by_id(p_id)
+            if p and p.version != p_ver:
+                raise IncompatibleCheckpointError(
+                    f"Incompatible plugin version: plugin '{p_id}' expected version '{p_ver}', but installed version is '{p.version}'"
+                )
 
         # Resolve and validate configuration: prioritize model hash diagnostic over config hash
         if config is not None:
@@ -3524,26 +3695,7 @@ class EpisodeEngine:
         stations: dict[str, Station] = {}
         for st_id, st_data in domain_state["stations"].items():
             node = nodes_by_id[st_id]
-            st = Station(
-                id=st_id,
-                operations={
-                    op.id: Operation(
-                        id=op.id,
-                        duration_ns=op.duration_ns,
-                        required_machines=list(op.required_machines),
-                        required_workers=[req.model_dump() for req in op.required_workers],
-                        interruption_policy=op.interruption_policy,
-                        defect_probability=op.defect_probability,
-                        defect_name=op.defect_name,
-                        target_quality_state=op.target_quality_state,
-                        restores_quality=op.restores_quality,
-                        rework_success_probability=op.rework_success_probability,
-                        inspection=op.inspection.model_dump() if op.inspection else None,
-                    )
-                    for op in node.operations
-                },
-                output_capacity=node.output_capacity,
-            )
+            st = _create_station_instance(node)
             st.restore_state(st_data)
             stations[st_id] = st
 
@@ -4250,6 +4402,8 @@ def run_episode(
         audit_logger=audit_logger,
         telemetry_manager=writer.telemetry_manager if writer is not None else None,
     )
+    if writer is not None:
+        writer.plugin_metadata.update(engine.plugin_metadata)
     summary = engine.run()
 
     if writer is not None:
@@ -4643,6 +4797,8 @@ def branch_checkpoint(
             audit_logger=branch_audit_logger,
             telemetry_manager=branch_writer.telemetry_manager if branch_writer is not None else None,
         )
+        if branch_writer is not None:
+            branch_writer.plugin_metadata.update(engine.plugin_metadata)
         engine.decision_coordinator.branch_id = branch_id
         engine.random_occurrence_counters = dict(cp.random_occurrence_counters)
         engine.random_stream = SemanticRandomStream(

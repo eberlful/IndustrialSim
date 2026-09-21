@@ -193,9 +193,14 @@ class StationSnapshot:
     busy_start_ns: int | None = None
     blocked_start_ns: int | None = None
     waiting_since_ns: int | None = None
+    type_id: str = "macro_station"
+    plugin_id: str | None = None
+    plugin_version: str | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
+    custom_state: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "id": self.id,
             "operations_completed": self.operations_completed,
             "total_busy_time_ns": self.total_busy_time_ns,
@@ -213,16 +218,40 @@ class StationSnapshot:
             "busy_start_ns": self.busy_start_ns,
             "blocked_start_ns": self.blocked_start_ns,
             "waiting_since_ns": self.waiting_since_ns,
+            "type_id": self.type_id,
         }
+        if self.plugin_id is not None:
+            result["plugin_id"] = self.plugin_id
+        if self.plugin_version is not None:
+            result["plugin_version"] = self.plugin_version
+        if self.parameters:
+            result["parameters"] = dict(self.parameters)
+        if self.custom_state:
+            result["custom_state"] = dict(self.custom_state)
+        return result
 
     def __getitem__(self, key: str) -> Any:
-        return getattr(self, key)
+        if hasattr(self, key):
+            return getattr(self, key)
+        if key in self.custom_state:
+            return self.custom_state[key]
+        raise KeyError(key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key) or key in self.custom_state
 
     def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.custom_state.get(key, default)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StationSnapshot:
+        custom_state = dict(data.get("custom_state", {}))
+        for legacy_k in ("is_micro", "active_stage_index", "stage_start_ns", "active_token", "stages"):
+            if legacy_k in data and legacy_k not in custom_state:
+                custom_state[legacy_k] = data[legacy_k]
+
         return cls(
             id=str(data["id"]),
             operations_completed=int(data["operations_completed"]),
@@ -241,6 +270,11 @@ class StationSnapshot:
             busy_start_ns=data.get("busy_start_ns"),
             blocked_start_ns=data.get("blocked_start_ns"),
             waiting_since_ns=data.get("waiting_since_ns"),
+            type_id=str(data.get("type_id", "macro_station")),
+            plugin_id=data.get("plugin_id"),
+            plugin_version=data.get("plugin_version"),
+            parameters=dict(data.get("parameters", {})),
+            custom_state=custom_state,
         )
 
 
