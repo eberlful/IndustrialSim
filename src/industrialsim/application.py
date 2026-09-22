@@ -787,32 +787,52 @@ class MaterialFlowTopology:
     routes_by_id: dict[str, RouteConfig]
     routes_from: dict[str, list[RouteConfig]]
     routes_to: dict[str, list[RouteConfig]]
+    _cached_adj_directed: dict[str, list[tuple[str, int]]] | None = field(default=None, init=False, repr=False)
+    _cached_adj_undirected: dict[str, list[tuple[str, int]]] | None = field(default=None, init=False, repr=False)
+    _cached_distances: dict[tuple[str, str, bool], int | None] = field(default_factory=dict, init=False, repr=False)
 
     def find_shortest_path_distance(self, from_node: str, to_node: str, directed: bool = True) -> int | None:
         if from_node == to_node:
             return 0
-        adj: dict[str, list[tuple[str, int]]] = {}
-        for r in self.routes:
-            adj.setdefault(r.source_node_id, []).append((r.target_node_id, r.transit_time_ns))
-            if not directed:
-                adj.setdefault(r.target_node_id, []).append((r.source_node_id, r.transit_time_ns))
+        cache_key = (from_node, to_node, directed)
+        if cache_key in self._cached_distances:
+            return self._cached_distances[cache_key]
+
+        if directed:
+            if self._cached_adj_directed is None:
+                adj: dict[str, list[tuple[str, int]]] = {}
+                for r in self.routes:
+                    adj.setdefault(r.source_node_id, []).append((r.target_node_id, r.transit_time_ns))
+                self._cached_adj_directed = adj
+            graph_adj = self._cached_adj_directed
+        else:
+            if self._cached_adj_undirected is None:
+                adj = {}
+                for r in self.routes:
+                    adj.setdefault(r.source_node_id, []).append((r.target_node_id, r.transit_time_ns))
+                    adj.setdefault(r.target_node_id, []).append((r.source_node_id, r.transit_time_ns))
+                self._cached_adj_undirected = adj
+            graph_adj = self._cached_adj_undirected
 
         distances: dict[str, int] = {from_node: 0}
         pq: list[tuple[int, str]] = [(0, from_node)]
+        result_dist: int | None = None
 
         while pq:
             d, u = heapq.heappop(pq)
             if d > distances.get(u, float("inf")):
                 continue
             if u == to_node:
-                return d
-            for v, weight in adj.get(u, []):
+                result_dist = d
+                break
+            for v, weight in graph_adj.get(u, []):
                 new_d = d + weight
                 if new_d < distances.get(v, float("inf")):
                     distances[v] = new_d
                     heapq.heappush(pq, (new_d, v))
 
-        return distances.get(to_node)
+        self._cached_distances[cache_key] = result_dist
+        return result_dist
 
     def compute_distance(self, from_node: str, to_node: str) -> int | None:
         if from_node == to_node:
@@ -1058,6 +1078,7 @@ class EpisodeEngine:
         }
         self._workers_by_qualification: dict[str, list[Worker]] = {}
         self._rebuild_worker_qualification_index()
+        self._pending_orders_sorted: bool = False
 
         self._setup_handlers()
 
@@ -2227,6 +2248,7 @@ class EpisodeEngine:
         self.transport_orders[order.id] = order
         self.pending_transport_orders.append(order.id)
         self._active_transport_orders_by_unit[unit_id] = order.id
+        self._pending_orders_sorted = False
         return order
 
     def _can_unit_depart(self, node_id: str, unit_id: str) -> bool:
@@ -2267,17 +2289,21 @@ class EpisodeEngine:
 
         dispatched_order_ids: list[str] = []
 
-        self.pending_transport_orders.sort(
-            key=lambda oid: (
-                self.transport_orders[oid].created_time_ns,
-                (
-                    (0, self.units[self.transport_orders[oid].unit_id].due_date_ns)
-                    if self.units[self.transport_orders[oid].unit_id].due_date_ns is not None
-                    else (1, 0)
-                ),
-                oid,
+        if not self._pending_orders_sorted:
+            orders = self.transport_orders
+            units = self.units
+            self.pending_transport_orders.sort(
+                key=lambda oid: (
+                    orders[oid].created_time_ns,
+                    (
+                        (0, units[orders[oid].unit_id].due_date_ns)
+                        if units[orders[oid].unit_id].due_date_ns is not None
+                        else (1, 0)
+                    ),
+                    oid,
+                )
             )
-        )
+            self._pending_orders_sorted = True
 
         for order_id in list(self.pending_transport_orders):
             order = self.transport_orders[order_id]
@@ -2318,9 +2344,11 @@ class EpisodeEngine:
             if not unconstrained and not available_vehicles:
                 break
 
-        for oid in dispatched_order_ids:
-            if oid in self.pending_transport_orders:
-                self.pending_transport_orders.remove(oid)
+        if dispatched_order_ids:
+            dispatched_set = set(dispatched_order_ids)
+            self.domain.pending_transport_orders[:] = [
+                oid for oid in self.domain.pending_transport_orders if oid not in dispatched_set
+            ]
 
     def _execute_dispatch_decision(self, k: EventKernel, decision: DispatchDecision) -> None:
         order = decision.order
@@ -4969,14 +4997,25 @@ def _compute_hard_constraints(
     }
 
 
-def _execute_single_branch_worker(task_data: dict[str, Any]) -> CounterfactualBranchResult:
-    checkpoint_data = task_data["checkpoint_data"]
-    alt_action = task_data["alt_action"]
-    config_data = task_data.get("config_data")
-    output_dir_str = task_data.get("output_dir")
-    parent_run_id = task_data.get("parent_run_id", "parent")
-    batch_id = task_data.get("batch_id", "unknown")
-    branch_index = task_data.get("branch_index", 0)
+@dataclass(frozen=True)
+class BranchWorkerTask:
+    checkpoint_data: str
+    alt_action: Any
+    config_data: dict[str, Any] | None = None
+    output_dir: str | None = None
+    parent_run_id: str = "parent"
+    batch_id: str = "unknown"
+    branch_index: int = 0
+
+
+def _execute_single_branch_worker(task: BranchWorkerTask) -> CounterfactualBranchResult:
+    checkpoint_data = task.checkpoint_data
+    alt_action = task.alt_action
+    config_data = task.config_data
+    output_dir_str = task.output_dir
+    parent_run_id = task.parent_run_id
+    batch_id = task.batch_id
+    branch_index = task.branch_index
 
     dummy_prov = DecisionProvenance(
         episode_id=parent_run_id,
@@ -4988,9 +5027,6 @@ def _execute_single_branch_worker(task_data: dict[str, Any]) -> CounterfactualBr
     applied_actions: list[dict[str, Any]] = []
 
     try:
-        if isinstance(alt_action, dict) and alt_action.get("__inject_worker_failure__"):
-            raise RuntimeError("Injected worker failure for testing")
-
         cp = deserialize_checkpoint(checkpoint_data)
         eff_cfg = (
             SimulationConfig.model_validate(config_data)
@@ -5176,9 +5212,9 @@ def branch_checkpoint(
     output_dir: str | Path | None = None,
     workers: int = 1,
 ) -> BranchComparisonResult:
-    if len(alternative_actions) < 2:
+    if len(alternative_actions) < 2 or len(alternative_actions) > 8:
         raise ValueError(
-            f"Counterfactual branching requires at least two alternative Action sets, got {len(alternative_actions)}"
+            f"Counterfactual branching requires between 2 and 8 alternative Action sets (at least two), got {len(alternative_actions)}"
         )
 
     out_p: Path | None = Path(output_dir) if output_dir is not None else None
@@ -5258,15 +5294,15 @@ def branch_checkpoint(
     parent_run_id = f"ep-{cp.root_seed}"
 
     tasks = [
-        {
-            "checkpoint_data": serialized_cp,
-            "alt_action": alt,
-            "config_data": serialized_cfg,
-            "output_dir": out_dir_str,
-            "parent_run_id": parent_run_id,
-            "batch_id": batch_id,
-            "branch_index": idx,
-        }
+        BranchWorkerTask(
+            checkpoint_data=serialized_cp,
+            alt_action=alt,
+            config_data=serialized_cfg,
+            output_dir=out_dir_str,
+            parent_run_id=parent_run_id,
+            batch_id=batch_id,
+            branch_index=idx,
+        )
         for idx, alt in enumerate(alternative_actions)
     ]
 
@@ -5355,7 +5391,7 @@ def branch_checkpoint(
             "plugin_metadata": cp.plugin_metadata,
         }
         (out_p / "manifest.json").write_text(json.dumps(root_manifest, indent=2), encoding="utf-8")
-        if (out_p / ".incomplete").exists():
+        if all_completed and (out_p / ".incomplete").exists():
             (out_p / ".incomplete").unlink()
 
     return comp_result
@@ -5441,11 +5477,6 @@ def compare_policies(
             (out_p / ".incomplete").unlink()
 
     return comp_result
-
-
-def run_benchmark(*args: Any, **kwargs: Any) -> Any:
-    from industrialsim.benchmark import run_benchmark as _run_benchmark
-    return _run_benchmark(*args, **kwargs)
 
 
 

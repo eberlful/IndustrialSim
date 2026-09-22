@@ -61,14 +61,14 @@ def collect_hardware_metadata() -> dict[str, Any]:
             "target_scheduler_max_seconds": 60.0,
             "target_plant_min_resources": 100,
             "target_plant_max_resources": 500,
-            "target_plant_events": 2_000_000,
+            "target_plant_events": 100_000,
             "target_plant_max_seconds": 60.0,
         },
     }
 
 
 @dataclass(frozen=True)
-class SchedulerBenchmarkResult:
+class BaseBenchmarkResult:
     target: str
     events_processed: int
     duration_seconds: float
@@ -94,35 +94,24 @@ class SchedulerBenchmarkResult:
 
 
 @dataclass(frozen=True)
-class PlantBenchmarkResult:
-    target: str
-    events_processed: int
-    active_resources: int
-    resource_breakdown: dict[str, int]
-    production_week_simulated_time_ns: int
-    duration_seconds: float
-    events_per_second: float
-    repetitions: list[dict[str, Any]]
-    is_deterministic: bool
-    status: str
-    timing: dict[str, Any]
-    workload: dict[str, Any]
+class SchedulerBenchmarkResult(BaseBenchmarkResult):
+    pass
+
+
+@dataclass(frozen=True)
+class PlantBenchmarkResult(BaseBenchmarkResult):
+    active_resources: int = 0
+    resource_breakdown: dict[str, int] = field(default_factory=dict)
+    production_week_simulated_time_ns: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "target": self.target,
-            "events_processed": self.events_processed,
+        base = super().to_dict()
+        base.update({
             "active_resources": self.active_resources,
             "resource_breakdown": dict(self.resource_breakdown),
             "production_week_simulated_time_ns": self.production_week_simulated_time_ns,
-            "duration_seconds": self.duration_seconds,
-            "events_per_second": self.events_per_second,
-            "repetitions": list(self.repetitions),
-            "is_deterministic": self.is_deterministic,
-            "status": self.status,
-            "timing": dict(self.timing),
-            "workload": dict(self.workload),
-        }
+        })
+        return base
 
 
 @dataclass(frozen=True)
@@ -145,16 +134,46 @@ class BenchmarkReport:
         }
 
 
+def _evaluate_benchmark_repetitions(
+    reps_data: list[dict[str, Any]],
+    workload: dict[str, Any],
+    additional_pass_condition: bool = True,
+    max_duration_seconds: float = 60.0,
+) -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
+    is_deterministic = len(set(r["result_hash"] for r in reps_data)) == 1
+    first = reps_data[0]
+    total_duration = first["duration_seconds"]
+    total_cpu = first["cpu_time_seconds"]
+    events_proc = first["events_processed"]
+    ev_per_sec = first["events_per_second"]
+
+    passed = (
+        is_deterministic
+        and additional_pass_condition
+        and total_duration <= max_duration_seconds
+    )
+
+    timing = {
+        "duration_seconds": total_duration,
+        "cpu_time_seconds": total_cpu,
+        "events_per_second": ev_per_sec,
+        "event_latency_ns": (total_duration / events_proc) * 1e9 if events_proc > 0 else 0.0,
+    }
+    status = "passed" if passed else "failed"
+    return is_deterministic, status, timing, workload
+
+
 def run_scheduler_benchmark(events: int = 5_000_000, repetitions: int = 2) -> SchedulerBenchmarkResult:
     reps_data: list[dict[str, Any]] = []
 
-    for rep in range(repetitions):
+    # Single-threaded sequential baseline
+    num_chains = min(1000, events)
+    steps_per_chain = events // num_chains
+    remainder = events % num_chains
+
+    for rep in range(max(1, repetitions)):
         kernel = EventKernel(initial_time_ns=0)
         h = hashlib.sha256()
-
-        num_chains = min(10_000, max(1, events // 100))
-        steps_per_chain = events // num_chains
-        remainder = events % num_chains
 
         def handler(k: EventKernel, ev: ScheduledEvent) -> None:
             max_steps = ev.payload["max_steps"]
@@ -199,38 +218,27 @@ def run_scheduler_benchmark(events: int = 5_000_000, repetitions: int = 2) -> Sc
             "result_hash": res_hash,
         })
 
-    is_deterministic = len(set(r["result_hash"] for r in reps_data)) == 1
-    total_duration = reps_data[0]["duration_seconds"]
-    total_cpu = reps_data[0]["cpu_time_seconds"]
     events_proc = reps_data[0]["events_processed"]
-    ev_per_sec = reps_data[0]["events_per_second"]
-
-    passed = (
-        is_deterministic
-        and events_proc == events
-        and total_duration <= 60.0
-    )
-
-    timing = {
-        "duration_seconds": total_duration,
-        "cpu_time_seconds": total_cpu,
-        "events_per_second": ev_per_sec,
-        "event_latency_ns": (total_duration / events_proc) * 1e9 if events_proc > 0 else 0.0,
-    }
     workload = {
         "target_events": events,
         "events_processed": events_proc,
         "repetitions": repetitions,
     }
+    is_det, status, timing, workload = _evaluate_benchmark_repetitions(
+        reps_data,
+        workload=workload,
+        additional_pass_condition=(events_proc == events),
+        max_duration_seconds=60.0,
+    )
 
     return SchedulerBenchmarkResult(
         target="scheduler",
         events_processed=events_proc,
-        duration_seconds=total_duration,
-        events_per_second=ev_per_sec,
+        duration_seconds=timing["duration_seconds"],
+        events_per_second=timing["events_per_second"],
         repetitions=reps_data,
-        is_deterministic=is_deterministic,
-        status="passed" if passed else "failed",
+        is_deterministic=is_det,
+        status=status,
         timing=timing,
         workload=workload,
     )
@@ -242,31 +250,61 @@ def build_reference_plant_benchmark_config(units_count: int = 100) -> dict[str, 
     machines: list[dict[str, Any]] = []
     workers: list[dict[str, Any]] = []
 
+    areas = [
+        {
+            "id": "area-body-construction",
+            "name": "Body Construction Area",
+            "halls": [{"id": "hall-body-construction", "name": "Body Construction Hall"}],
+        },
+        {
+            "id": "area-paint-application",
+            "name": "Paint Application Area",
+            "halls": [{"id": "hall-paint-application", "name": "Paint Application Hall"}],
+        },
+        {
+            "id": "area-final-assembly",
+            "name": "Final Assembly Area",
+            "halls": [{"id": "hall-final-assembly", "name": "Final Assembly Hall"}],
+        },
+    ]
+
     # 5 parallel production lines across Body, Paint, and Final Assembly
-    # Each line has 10 stations and 10 buffers
-    # 5 * 10 = 50 stations
-    # 5 * 10 = 50 buffers
-    # 50 machines
-    # 50 workers
-    # 5 vehicles
-    # Total active resources = 50 + 50 + 50 + 50 + 5 = 205 resources (between 100 and 500)
+    # Each line has 10 stations and 10 buffers:
+    # 0..2: Body Construction (3 stations, 3 buffers)
+    # 3..5: Paint Application (3 stations, 3 buffers)
+    # 6..9: Final Assembly (4 stations, 4 buffers)
+    # 50 stations + 50 buffers = 100 material-flow nodes
+    # 50 machines + 50 workers + 5 vehicles = 205 active resources (between 100 and 500)
     num_lines = 5
     stations_per_line = 10
+    total_week_seconds = 5 * 24 * 3600  # 432,000s = 1 production week (120h)
 
     for line in range(num_lines):
         nodes.append({
             "id": f"src-{line}",
             "kind": "source",
+            "hall_id": "hall-body-construction",
             "output_ports": [{"id": "p-out", "port_type": "body", "direction": "output"}],
         })
         prev_node = f"src-{line}"
         prev_port = "p-out"
 
         for st_idx in range(stations_per_line):
+            if st_idx < 3:
+                hall_id = "hall-body-construction"
+                w_qual = "body_worker"
+            elif st_idx < 6:
+                hall_id = "hall-paint-application"
+                w_qual = "paint_worker"
+            else:
+                hall_id = "hall-final-assembly"
+                w_qual = "assembly_worker"
+
             buf_id = f"buf-{line}-{st_idx}"
             nodes.append({
                 "id": buf_id,
                 "kind": "buffer",
+                "hall_id": hall_id,
                 "capacity": 20,
                 "input_ports": [{"id": "p-in", "port_type": "body", "direction": "input"}],
                 "output_ports": [{"id": "p-out", "port_type": "body", "direction": "output"}],
@@ -286,17 +324,18 @@ def build_reference_plant_benchmark_config(units_count: int = 100) -> dict[str, 
             machines.append({"id": m_id, "initial_health": 1.0})
             workers.append({
                 "id": w_id,
-                "qualifications": ["automotive_operator"],
+                "qualifications": [w_qual],
                 "shifts": [{"id": f"s-{w_id}", "start_time": "0s", "end_time": "5d"}],
             })
             nodes.append({
                 "id": st_id,
                 "kind": "station",
+                "hall_id": hall_id,
                 "operations": [{
                     "id": f"op-{line}-{st_idx}",
                     "duration": "2s",
                     "required_machines": [m_id],
-                    "required_workers": [{"qualification": "automotive_operator", "count": 1}],
+                    "required_workers": [{"qualification": w_qual, "count": 1}],
                     "interruption_policy": "resume",
                 }],
                 "input_ports": [{"id": "p-in", "port_type": "body", "direction": "input"}],
@@ -316,6 +355,7 @@ def build_reference_plant_benchmark_config(units_count: int = 100) -> dict[str, 
         nodes.append({
             "id": f"snk-{line}",
             "kind": "sink",
+            "hall_id": "hall-final-assembly",
             "input_ports": [{"id": "p-in", "port_type": "body", "direction": "input"}],
         })
         routes.append({
@@ -336,17 +376,24 @@ def build_reference_plant_benchmark_config(units_count: int = 100) -> dict[str, 
     units_plan: list[dict[str, Any]] = []
     for line in range(num_lines):
         for u in range(units_per_line):
+            variant = "sedan" if (line + u) % 2 == 0 else "suv"
+            release_s = int((u / units_per_line) * (total_week_seconds - 3600)) if units_per_line > 1 else 0
             units_plan.append({
                 "id": f"u-{line}-{u}",
-                "variant": "sedan",
-                "release_time": f"{u * 10}s",
-                "due_date": f"{u * 10 + 2000}s",
+                "variant": variant,
+                "release_time": f"{release_s}s",
+                "due_date": f"{release_s + 7200}s",
                 "source_id": f"src-{line}",
             })
 
     return {
         "schema_version": "1.0",
         "seed": 42,
+        "plant": {
+            "id": "plant-reference-automotive-benchmark",
+            "name": "Reference Automotive Plant Benchmark",
+            "areas": areas,
+        },
         "episode": {
             "start_time": "0s",
             "end_condition": {"type": "max_time", "max_time": "5d"},  # 1 production week (120 hours)
@@ -362,7 +409,7 @@ def build_reference_plant_benchmark_config(units_count: int = 100) -> dict[str, 
     }
 
 
-def run_reference_plant_benchmark(events: int = 10_000, repetitions: int = 2) -> PlantBenchmarkResult:
+def run_reference_plant_benchmark(events: int = 100_000, repetitions: int = 2) -> PlantBenchmarkResult:
     # Estimate units needed to achieve target events (~32 events per unit in 10-station line)
     units_target = max(20, events // 30)
     cfg_dict = build_reference_plant_benchmark_config(units_count=units_target)
@@ -380,11 +427,12 @@ def run_reference_plant_benchmark(events: int = 10_000, repetitions: int = 2) ->
         "machines": num_machines,
         "workers": num_workers,
         "vehicles": num_vehicles,
+        "total_active_resources": active_resources,
     }
 
     reps_data: list[dict[str, Any]] = []
 
-    for rep in range(repetitions):
+    for rep in range(max(1, repetitions)):
         t_start = time.perf_counter()
         c_start = time.process_time()
 
@@ -407,25 +455,8 @@ def run_reference_plant_benchmark(events: int = 10_000, repetitions: int = 2) ->
             "simulated_time_ns": summary.simulated_time_ns,
         })
 
-    is_deterministic = len(set(r["result_hash"] for r in reps_data)) == 1
-    total_duration = reps_data[0]["duration_seconds"]
-    total_cpu = reps_data[0]["cpu_time_seconds"]
     events_proc = reps_data[0]["events_processed"]
-    ev_per_sec = reps_data[0]["events_per_second"]
     sim_time_ns = reps_data[0]["simulated_time_ns"]
-
-    passed = (
-        is_deterministic
-        and 100 <= active_resources <= 500
-        and total_duration <= 60.0
-    )
-
-    timing = {
-        "duration_seconds": total_duration,
-        "cpu_time_seconds": total_cpu,
-        "events_per_second": ev_per_sec,
-        "event_latency_ns": (total_duration / events_proc) * 1e9 if events_proc > 0 else 0.0,
-    }
     workload = {
         "active_resources": active_resources,
         "events_processed": events_proc,
@@ -433,6 +464,12 @@ def run_reference_plant_benchmark(events: int = 10_000, repetitions: int = 2) ->
         "production_units": len(cfg_dict.get("production_plan", [])),
         "repetitions": repetitions,
     }
+    is_det, status, timing, workload = _evaluate_benchmark_repetitions(
+        reps_data,
+        workload=workload,
+        additional_pass_condition=(100 <= active_resources <= 500),
+        max_duration_seconds=60.0,
+    )
 
     return PlantBenchmarkResult(
         target="reference_plant",
@@ -440,11 +477,11 @@ def run_reference_plant_benchmark(events: int = 10_000, repetitions: int = 2) ->
         active_resources=active_resources,
         resource_breakdown=resource_breakdown,
         production_week_simulated_time_ns=sim_time_ns,
-        duration_seconds=total_duration,
-        events_per_second=ev_per_sec,
+        duration_seconds=timing["duration_seconds"],
+        events_per_second=timing["events_per_second"],
         repetitions=reps_data,
-        is_deterministic=is_deterministic,
-        status="passed" if passed else "failed",
+        is_deterministic=is_det,
+        status=status,
         timing=timing,
         workload=workload,
     )

@@ -201,8 +201,8 @@ def test_parallel_branch_worker_failure_is_structured_and_preserves_siblings() -
     cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
 
     action_valid = [BufferReorderAction(target_id="buf-1", new_order=["u-1", "u-2"])]
-    # An action payload that raises an execution error inside the branch worker:
-    action_failing = {"__inject_worker_failure__": True}
+    # An action payload that raises an execution / validation error inside the branch worker:
+    action_failing = [{"action_type": "invalid_action_type", "bad_field": 123}]
 
     comp = branch_checkpoint(cp, [action_failing, action_valid], workers=2)
 
@@ -220,3 +220,34 @@ def test_parallel_branch_worker_failure_is_structured_and_preserves_siblings() -
     assert successful_branch.error is None
     assert successful_branch.summary is not None
     assert successful_branch.result_hash != ""
+
+
+def test_branch_checkpoint_enforces_bounds() -> None:
+    import pytest
+
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    action = [BufferReorderAction(target_id="buf-1", new_order=["u-1", "u-2"])]
+
+    # Fewer than 2 alternative actions
+    with pytest.raises(ValueError, match="between 2 and 8"):
+        branch_checkpoint(cp, [action])
+
+    # More than 8 alternative actions
+    with pytest.raises(ValueError, match="between 2 and 8"):
+        branch_checkpoint(cp, [action] * 9)
+
+
+def test_failed_branch_preserves_incomplete_marker_per_adr0011(tmp_path: Path) -> None:
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    action_valid = [BufferReorderAction(target_id="buf-1", new_order=["u-1", "u-2"])]
+    action_failing = [{"action_type": "invalid_action_type", "bad_field": 123}]
+
+    out_dir = tmp_path / "failed_branch_run"
+    comp = branch_checkpoint(cp, [action_failing, action_valid], output_dir=out_dir, workers=2)
+
+    assert any(b.status == "failed" for b in comp.branches)
+    # Per ADR 0011, .incomplete must remain when the run contains failures
+    assert (out_dir / ".incomplete").exists()
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+

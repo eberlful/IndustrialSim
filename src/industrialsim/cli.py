@@ -176,9 +176,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "branch":
         def run_branch() -> Any:
-            if len(args.action_files) < 2:
+            if len(args.action_files) < 2 or len(args.action_files) > 8:
                 raise ValueError(
-                    f"Counterfactual branching requires at least two alternative Action sets, got {len(args.action_files)}"
+                    f"Counterfactual branching requires between 2 and 8 alternative Action sets (at least two), got {len(args.action_files)}"
                 )
             from pathlib import Path
 

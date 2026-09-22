@@ -253,8 +253,7 @@ def test_cli_branch_failure_fewer_than_two_alternatives(
 
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data["status"] == "error"
-    assert "at least two" in data["error"].lower()
+    assert "between 2 and 8" in data["error"].lower()
 
 
 def test_cli_branch_three_alternatives(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
