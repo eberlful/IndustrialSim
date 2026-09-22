@@ -1,0 +1,277 @@
+schema_version: "1.0"
+seed: 42
+
+calibration:
+  is_calibrated: false
+  notes: "Stress scenario with tight buffer bottleneck and heterogeneous express and heavy delivery deadlines."
+
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "max_time"
+    max_time: "30m"
+
+telemetry:
+  enabled: true
+  sample_interval: "15s"
+  domain_events:
+    - "operation_completed"
+    - "machine_state_change"
+
+plant:
+  id: "plant-stress"
+  name: "Bottleneck & Deadline Stress Plant"
+  areas:
+    - id: "area-main"
+      name: "Main Production Area"
+      halls:
+        - id: "hall-main"
+          name: "Main Hall"
+
+material_flow:
+  nodes:
+    - id: "src-raw"
+      kind: "source"
+      hall_id: "hall-main"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    - id: "st-prep"
+      kind: "station"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-prep"
+          duration: "15s"
+
+    - id: "buf-queue"
+      kind: "buffer"
+      capacity: 8
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    - id: "st-finish"
+      kind: "station"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-finish-express"
+          duration: "15s"
+          required_machines: ["m-finish-tool"]
+        - id: "op-finish-standard"
+          duration: "45s"
+          required_machines: ["m-finish-tool"]
+        - id: "op-finish-heavy"
+          duration: "90s"
+          required_machines: ["m-finish-tool"]
+
+    - id: "snk-end"
+      kind: "sink"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+
+  routes:
+    - id: "r-src-prep"
+      source_node_id: "src-raw"
+      source_port_id: "p-out"
+      target_node_id: "st-prep"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-prep-buf"
+      source_node_id: "st-prep"
+      source_port_id: "p-out"
+      target_node_id: "buf-queue"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-buf-finish"
+      source_node_id: "buf-queue"
+      source_port_id: "p-out"
+      target_node_id: "st-finish"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-finish-snk"
+      source_node_id: "st-finish"
+      source_port_id: "p-out"
+      target_node_id: "snk-end"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+machines:
+  - id: "m-finish-tool"
+    initial_health: 0.98
+    degradation:
+      use_rate_per_s: 0.0001
+      failure_hazard_rate_per_s: 0.00005
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.4
+      duration: "120s"
+
+production_plan:
+  # Wave 1: Heavy batch followed immediately by urgent Express batch
+  - id: "plan-heavy-1"
+    variant: "heavy"
+    quantity: 4
+    release_time: "0s"
+    due_date: "28m"
+    source_id: "src-raw"
+
+  - id: "plan-express-1"
+    variant: "express"
+    quantity: 5
+    release_time: "30s"
+    due_date: "5m"
+    source_id: "src-raw"
+
+  - id: "plan-standard-1"
+    variant: "standard"
+    quantity: 5
+    release_time: "60s"
+    due_date: "14m"
+    source_id: "src-raw"
+
+  # Wave 2: Urgent Express batch interleaved with heavy
+  - id: "plan-express-2"
+    variant: "express"
+    quantity: 5
+    release_time: "120s"
+    due_date: "8m"
+    source_id: "src-raw"
+
+  - id: "plan-heavy-2"
+    variant: "heavy"
+    quantity: 4
+    release_time: "180s"
+    due_date: "28m"
+    source_id: "src-raw"
+
+  # Wave 3: Final mixed rush
+  - id: "plan-express-3"
+    variant: "express"
+    quantity: 5
+    release_time: "240s"
+    due_date: "11m"
+    source_id: "src-raw"
+
+  - id: "plan-standard-2"
+    variant: "standard"
+    quantity: 6
+    release_time: "300s"
+    due_date: "18m"
+    source_id: "src-raw"
+
+process_plans:
+  - variant: "express"
+    steps:
+      - operation_id: "op-prep"
+        compatible_stations: ["st-prep"]
+      - operation_id: "op-finish-express"
+        compatible_stations: ["st-finish"]
+
+  - variant: "standard"
+    steps:
+      - operation_id: "op-prep"
+        compatible_stations: ["st-prep"]
+      - operation_id: "op-finish-standard"
+        compatible_stations: ["st-finish"]
+
+  - variant: "heavy"
+    steps:
+      - operation_id: "op-prep"
+        compatible_stations: ["st-prep"]
+      - operation_id: "op-finish-heavy"
+        compatible_stations: ["st-finish"]
+
+decision_triggers:
+  - id: "trig-buf-2"
+    buffer_id: "buf-queue"
+    threshold: 2
+    direction: "rising"
+    rearm_threshold: 1
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-3"
+    buffer_id: "buf-queue"
+    threshold: 3
+    direction: "rising"
+    rearm_threshold: 2
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-4"
+    buffer_id: "buf-queue"
+    threshold: 4
+    direction: "rising"
+    rearm_threshold: 3
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-5"
+    buffer_id: "buf-queue"
+    threshold: 5
+    direction: "rising"
+    rearm_threshold: 4
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-6"
+    buffer_id: "buf-queue"
+    threshold: 6
+    direction: "rising"
+    rearm_threshold: 5
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-fall-4"
+    buffer_id: "buf-queue"
+    threshold: 4
+    direction: "falling"
+    rearm_threshold: 5
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-fall-3"
+    buffer_id: "buf-queue"
+    threshold: 3
+    direction: "falling"
+    rearm_threshold: 4
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-buf-fall-2"
+    buffer_id: "buf-queue"
+    threshold: 2
+    direction: "falling"
+    rearm_threshold: 3
+    on_failure: "fallback"
+    fallback_policy: "fifo"

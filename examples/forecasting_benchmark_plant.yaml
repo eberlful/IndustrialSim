@@ -1,0 +1,261 @@
+schema_version: "1.0"
+seed: 42
+
+calibration:
+  is_calibrated: false
+  notes: "Forecasting benchmark scenario for TimesFM 3 with high-frequency telemetry and predictive triggers."
+
+episode:
+  start_time: "0s"
+  warm_up_time: "5m"
+  end_condition:
+    type: "max_time"
+    max_time: "2h"
+
+telemetry:
+  enabled: true
+  sample_interval: "30s"
+  domain_events:
+    - "operation_completed"
+    - "machine_state_change"
+
+plant:
+  id: "plant-forecast-benchmark"
+  name: "Forecasting Benchmark Plant"
+  areas:
+    - id: "area-production"
+      name: "Production Area"
+      halls:
+        - id: "hall-main"
+          name: "Main Manufacturing Hall"
+
+material_flow:
+  nodes:
+    - id: "src-raw"
+      kind: "source"
+      hall_id: "hall-main"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    - id: "st-weld-fast"
+      kind: "station"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-weld"
+          duration: "45s"
+          required_machines: ["m-welder-1"]
+          interruption_policy: "resume"
+
+    - id: "st-weld-robust"
+      kind: "station"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-weld"
+          duration: "70s"
+          required_machines: ["m-welder-2"]
+          interruption_policy: "resume"
+
+    - id: "buf-intermediate"
+      kind: "buffer"
+      capacity: 8
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in-1"
+          port_type: "chassis"
+          direction: "input"
+        - id: "p-in-2"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    - id: "st-paint"
+      kind: "station"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-paint"
+          duration: "60s"
+          required_machines: ["m-paint-robot"]
+          interruption_policy: "resume"
+
+    - id: "snk-finish"
+      kind: "sink"
+      hall_id: "hall-main"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+
+  routes:
+    - id: "r-src-to-weld-fast"
+      source_node_id: "src-raw"
+      source_port_id: "p-out"
+      target_node_id: "st-weld-fast"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-src-to-weld-robust"
+      source_node_id: "src-raw"
+      source_port_id: "p-out"
+      target_node_id: "st-weld-robust"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-weld-fast-to-buf"
+      source_node_id: "st-weld-fast"
+      source_port_id: "p-out"
+      target_node_id: "buf-intermediate"
+      target_port_id: "p-in-1"
+      transit_time: "5s"
+
+    - id: "r-weld-robust-to-buf"
+      source_node_id: "st-weld-robust"
+      source_port_id: "p-out"
+      target_node_id: "buf-intermediate"
+      target_port_id: "p-in-2"
+      transit_time: "5s"
+
+    - id: "r-buf-to-paint"
+      source_node_id: "buf-intermediate"
+      source_port_id: "p-out"
+      target_node_id: "st-paint"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-paint-to-finish"
+      source_node_id: "st-paint"
+      source_port_id: "p-out"
+      target_node_id: "snk-finish"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+machines:
+  - id: "m-welder-1"
+    initial_health: 0.95
+    degradation:
+      use_rate_per_s: 0.0003
+      failure_hazard_rate_per_s: 0.0002
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.4
+      duration: "180s"
+
+  - id: "m-welder-2"
+    initial_health: 1.0
+    degradation:
+      use_rate_per_s: 0.0001
+      failure_hazard_rate_per_s: 0.00005
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.4
+      duration: "120s"
+
+  - id: "m-paint-robot"
+    initial_health: 0.98
+    degradation:
+      use_rate_per_s: 0.00015
+      failure_hazard_rate_per_s: 0.0001
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.4
+      duration: "180s"
+
+production_plan:
+  - id: "plan-batch-sedan-1"
+    variant: "sedan"
+    quantity: 12
+    release_time: "0s"
+    due_date: "45m"
+    source_id: "src-raw"
+
+  - id: "plan-batch-suv-1"
+    variant: "suv"
+    quantity: 8
+    release_time: "15m"
+    due_date: "1h"
+    source_id: "src-raw"
+
+  - id: "plan-batch-sedan-2"
+    variant: "sedan"
+    quantity: 14
+    release_time: "35m"
+    due_date: "1h20m"
+    source_id: "src-raw"
+
+  - id: "plan-batch-compact-1"
+    variant: "compact"
+    quantity: 16
+    release_time: "55m"
+    due_date: "1h40m"
+    source_id: "src-raw"
+
+  - id: "plan-batch-suv-2"
+    variant: "suv"
+    quantity: 10
+    release_time: "1h15m"
+    due_date: "1h55m"
+    source_id: "src-raw"
+
+process_plans:
+  - variant: "sedan"
+    steps:
+      - operation_id: "op-weld"
+        compatible_stations: ["st-weld-fast", "st-weld-robust"]
+      - operation_id: "op-paint"
+        compatible_stations: ["st-paint"]
+
+  - variant: "suv"
+    steps:
+      - operation_id: "op-weld"
+        compatible_stations: ["st-weld-fast", "st-weld-robust"]
+      - operation_id: "op-paint"
+        compatible_stations: ["st-paint"]
+
+  - variant: "compact"
+    steps:
+      - operation_id: "op-weld"
+        compatible_stations: ["st-weld-fast", "st-weld-robust"]
+      - operation_id: "op-paint"
+        compatible_stations: ["st-paint"]
+
+decision_triggers:
+  - id: "trig-buf-intermediate"
+    buffer_id: "buf-intermediate"
+    threshold: 4
+    direction: "rising"
+    on_failure: "fallback"
+    fallback_policy: "fifo"
+
+  - id: "trig-welder1-maint"
+    machine_id: "m-welder-1"
+    health_threshold: 0.55
+    on_failure: "fallback"
+    fallback_policy: "baseline"

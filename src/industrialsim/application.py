@@ -1315,28 +1315,48 @@ class EpisodeEngine:
         self.kernel.register_handler("DEADLOCK_CHECK", self._handle_deadlock_check)
 
         if self.max_interval_without_progress_ns is not None:
-            self.kernel.schedule(
-                time_ns=self.cfg.episode.start_time_ns + self.max_interval_without_progress_ns,
-                priority=EventPriority.SAFETY,
-                event_type="DEADLOCK_CHECK",
-            )
+            deadlock_t = self.cfg.episode.start_time_ns + self.max_interval_without_progress_ns
+            has_deadlock = any(item[3].event_type == "DEADLOCK_CHECK" for item in self.kernel._queue)
+            if not has_deadlock:
+                target_t = max(deadlock_t, self.kernel.current_time_ns + self.max_interval_without_progress_ns)
+                self.kernel.schedule(
+                    time_ns=target_t,
+                    priority=EventPriority.SAFETY,
+                    event_type="DEADLOCK_CHECK",
+                )
 
         for t in self.cfg.decision_triggers:
             if isinstance(t, SafePointTriggerConfig):
                 for time_val in t.times_ns:
-                    self.kernel.schedule(
-                        time_ns=time_val,
-                        priority=EventPriority.RESOURCE,
-                        event_type="SAFE_POINT_TRIGGER",
-                        payload={"trigger_id": t.id, "target_id": t.target_id},
-                    )
+                    if time_val >= self.kernel.current_time_ns:
+                        has_ev = any(
+                            item[3].event_type == "SAFE_POINT_TRIGGER"
+                            and item[3].payload.get("trigger_id") == t.id
+                            and item[3].time_ns == time_val
+                            for item in self.kernel._queue
+                        )
+                        if not has_ev:
+                            self.kernel.schedule(
+                                time_ns=time_val,
+                                priority=EventPriority.RESOURCE,
+                                event_type="SAFE_POINT_TRIGGER",
+                                payload={"trigger_id": t.id, "target_id": t.target_id},
+                            )
                 if t.interval_ns and t.interval_ns > 0:
-                    self.kernel.schedule(
-                        time_ns=t.interval_ns,
-                        priority=EventPriority.RESOURCE,
-                        event_type="SAFE_POINT_TRIGGER",
-                        payload={"trigger_id": t.id, "target_id": t.target_id, "interval_ns": t.interval_ns},
+                    has_ev = any(
+                        item[3].event_type == "SAFE_POINT_TRIGGER" and item[3].payload.get("trigger_id") == t.id
+                        for item in self.kernel._queue
                     )
+                    if not has_ev:
+                        target_t = t.interval_ns
+                        if target_t < self.kernel.current_time_ns:
+                            target_t = ((self.kernel.current_time_ns // t.interval_ns) + 1) * t.interval_ns
+                        self.kernel.schedule(
+                            time_ns=target_t,
+                            priority=EventPriority.RESOURCE,
+                            event_type="SAFE_POINT_TRIGGER",
+                            payload={"trigger_id": t.id, "target_id": t.target_id, "interval_ns": t.interval_ns},
+                        )
 
         if (
             self.cfg.telemetry
@@ -1344,12 +1364,17 @@ class EpisodeEngine:
             and self.cfg.telemetry.sample_interval_ns
             and self.cfg.telemetry.sample_interval_ns > 0
         ):
-            self.kernel.schedule(
-                time_ns=self.cfg.episode.start_time_ns + self.cfg.telemetry.sample_interval_ns,
-                priority=EventPriority.TELEMETRY,
-                event_type="TELEMETRY_INTERVAL",
-                payload={"interval_ns": self.cfg.telemetry.sample_interval_ns},
-            )
+            has_telem = any(item[3].event_type == "TELEMETRY_INTERVAL" for item in self.kernel._queue)
+            if not has_telem:
+                telem_t = self.cfg.episode.start_time_ns + self.cfg.telemetry.sample_interval_ns
+                if telem_t < self.kernel.current_time_ns:
+                    telem_t = self.kernel.current_time_ns + self.cfg.telemetry.sample_interval_ns
+                self.kernel.schedule(
+                    time_ns=telem_t,
+                    priority=EventPriority.TELEMETRY,
+                    event_type="TELEMETRY_INTERVAL",
+                    payload={"interval_ns": self.cfg.telemetry.sample_interval_ns},
+                )
 
     def _handle_telemetry_interval(self, k: EventKernel, event: ScheduledEvent) -> None:
         self._sample_telemetry(sample_type="interval")
@@ -1580,7 +1605,7 @@ class EpisodeEngine:
     ) -> None:
         triggers = self.decision_triggers.get(buffer_id, [])
         for trig in triggers:
-            if trig.check_transition(buffer_id, old_occupancy, new_occupancy, time_ns):
+            if isinstance(trig, BufferTriggerRuntime) and trig.check_transition(buffer_id, old_occupancy, new_occupancy, time_ns):
                 obs = self._build_buffer_observation(buffer_id, time_ns)
                 req_id = f"req-{buffer_id}-{trig.config.id}-{time_ns}"
                 req = DecisionRequest(
@@ -1882,7 +1907,12 @@ class EpisodeEngine:
             if isinstance(action, BufferReorderAction):
                 buf = self.buffers.get(action.target_id)
                 if buf is not None:
-                    buf.occupants = list(action.new_order)
+                    current_set = set(buf.occupants)
+                    reordered = [uid for uid in action.new_order if uid in current_set]
+                    for uid in buf.occupants:
+                        if uid not in reordered:
+                            reordered.append(uid)
+                    buf.occupants = reordered
                 self._try_pull_upstream(self.kernel, action.target_id)
                 for r in self.routes_from.get(action.target_id, []):
                     self._try_pull_upstream(self.kernel, r.target_node_id)

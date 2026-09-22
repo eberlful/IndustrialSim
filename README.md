@@ -168,4 +168,6 @@ uv run industrialsim benchmark --target all
 - 🤖 **[Decision Provider & Agenten-Integration](file:///workspaces/IndustrialSim/docs/decision-providers.md)**: Schnittstellen für KI-Agenten, Decision Batches, Aktionen, Fallbacks und Counterfactual Branching.
 - 💻 **[CLI-Referenz](file:///workspaces/IndustrialSim/docs/cli-reference.md)**: Detaillierte Befehls-, Parameter- und Artefaktreferenz.
 - 📖 **[Domänenglossar (`CONTEXT.md`)](file:///workspaces/IndustrialSim/CONTEXT.md)**: Verbindliche Begriffsdefinitionen der Domäne.
+- 📈 **[Evaluierung von TimesFM 3 & Zeitreihen-Modellen](file:///workspaces/IndustrialSim/docs/timesfm-evaluation-guide.md)**: Leitfaden zum Testen multivariater Zeitreihen-Foundation-Modelle mit Telemetrie und Counterfactual Branching.
+- 🔬 **[Experimente & Modellergebnisse (`experiments/`)](file:///workspaces/IndustrialSim/experiments/README.md)**: Strukturierte Berichte durchgeführter Benchmarks und Vorlage für neue Experimente.
 - 🏛️ **[Architekturentscheidungen (`docs/adr/`)](file:///workspaces/IndustrialSim/docs/adr/)**: Die 15 verbindlichen Architecture Decision Records des Projekts.
