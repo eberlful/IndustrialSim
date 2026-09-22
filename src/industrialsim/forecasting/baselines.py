@@ -199,3 +199,97 @@ class NaiveLastValueForecaster(TimeSeriesForecaster):
             quantiles=self.quantiles,
             metadata={"model": "naive_last_value"},
         )
+
+
+class ExponentialSmoothingForecaster(TimeSeriesForecaster):
+    """
+    Holt's Linear / Damped Trend Exponential Smoothing baseline.
+    Standard time-series forecasting benchmark in manufacturing, supply-chain, and ERP systems.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.3,
+        beta: float = 0.1,
+        phi: float = 0.95,
+        quantiles: tuple[float, ...] = DEFAULT_QUANTILES,
+    ) -> None:
+        self.alpha = alpha
+        self.beta = beta
+        self.phi = phi
+        self.quantiles = quantiles
+
+    def forecast(
+        self,
+        past_targets: dict[str, np.ndarray],
+        past_covariates: dict[str, np.ndarray] | None = None,
+        future_covariates: dict[str, np.ndarray] | None = None,
+        horizon: int = 64,
+    ) -> ForecastResult:
+        point_preds: dict[str, np.ndarray] = {}
+        quantile_preds: dict[str, np.ndarray] = {}
+
+        for target_name, raw_series in past_targets.items():
+            series = np.asarray(raw_series, dtype=np.float64)
+            n_obs = len(series)
+            if n_obs == 0:
+                point_preds[target_name] = np.zeros(horizon, dtype=np.float64)
+                quantile_preds[target_name] = np.zeros((horizon, len(self.quantiles)), dtype=np.float64)
+                continue
+            if n_obs == 1:
+                point_preds[target_name] = np.full(horizon, series[0], dtype=np.float64)
+                quantile_preds[target_name] = np.zeros((horizon, len(self.quantiles)), dtype=np.float64)
+                continue
+
+            # Initialization of level and trend
+            level = float(series[0])
+            trend = float(series[1] - series[0])
+            errors = []
+
+            for t in range(1, n_obs):
+                y_t = float(series[t])
+                y_hat = level + self.phi * trend
+                error = y_t - y_hat
+                errors.append(error)
+
+                new_level = self.alpha * y_t + (1.0 - self.alpha) * (level + self.phi * trend)
+                new_trend = self.beta * (new_level - level) + (1.0 - self.beta) * self.phi * trend
+                level, trend = new_level, new_trend
+
+            # Extrapolate damped trend over horizon h
+            damp_factors = np.cumsum([self.phi ** i for i in range(1, horizon + 1)])
+            point_forecast = level + damp_factors * trend
+
+            if any(k in target_name.lower() for k in ("wip", "buffer", "output", "count", "busy", "scrap")):
+                point_forecast = np.maximum(point_forecast, 0.0)
+            point_preds[target_name] = point_forecast
+
+            # Residual variance for quantiles
+            res_std = float(np.std(errors)) if errors else 1.0
+            if res_std < 1e-6:
+                res_std = 1.0
+
+            time_steps = np.arange(1, horizon + 1, dtype=np.float64)
+            spread = res_std * np.sqrt(1.0 + self.alpha**2 * (time_steps - 1.0))
+
+            q_mat = np.zeros((horizon, len(self.quantiles)), dtype=np.float64)
+            for q_idx, q in enumerate(self.quantiles):
+                z_score = np.sqrt(2.0) * _erf_inv(2.0 * q - 1.0)
+                q_vals = point_forecast + z_score * spread
+                if any(k in target_name.lower() for k in ("wip", "buffer", "output", "count", "busy", "scrap")):
+                    q_vals = np.maximum(q_vals, 0.0)
+                q_mat[:, q_idx] = q_vals
+
+            quantile_preds[target_name] = q_mat
+
+        return ForecastResult(
+            point_forecast=point_preds,
+            quantile_forecast=quantile_preds,
+            quantiles=self.quantiles,
+            metadata={
+                "model": "exponential_smoothing",
+                "alpha": self.alpha,
+                "beta": self.beta,
+                "phi": self.phi,
+            },
+        )

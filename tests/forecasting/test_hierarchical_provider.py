@@ -22,7 +22,10 @@ from industrialsim.decisions import (
     RoutingObservation,
     StrategicObservation,
 )
-from industrialsim.forecasting.baselines import MovingAverageForecaster
+from industrialsim.forecasting.baselines import (
+    ExponentialSmoothingForecaster,
+    MovingAverageForecaster,
+)
 from industrialsim.forecasting.hierarchical_provider import HierarchicalPredictiveProvider
 from industrialsim.forecasting.timesfm_adapter import TimesFM3Adapter
 
@@ -195,3 +198,32 @@ def test_hierarchical_provider_simulation_run() -> None:
     assert not summary.is_aborted
     assert summary.raw_metrics["good_output"] == 45
     assert len(summary.decision_batches) > 0
+
+
+def test_exponential_smoothing_forecaster() -> None:
+    forecaster = ExponentialSmoothingForecaster(alpha=0.3, beta=0.1, phi=0.95)
+
+    # Empty and single-element tests
+    res_empty = forecaster.forecast({"wip": np.array([])}, horizon=16)
+    assert res_empty.point_forecast["wip"].shape == (16,)
+    assert np.all(res_empty.point_forecast["wip"] == 0.0)
+
+    res_single = forecaster.forecast({"wip": np.array([42.0])}, horizon=16)
+    assert res_single.point_forecast["wip"].shape == (16,)
+    assert np.all(res_single.point_forecast["wip"] == 42.0)
+
+    # Linear series test over horizon 128
+    series = np.array([10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0])
+    res = forecaster.forecast({"wip": series}, horizon=128)
+    preds = res.point_forecast["wip"]
+    assert len(preds) == 128
+    # With positive trend and phi=0.95, first step should exceed last observed value
+    assert preds[0] > 24.0
+    # Damped trend should be strictly non-negative and eventually level off
+    assert np.all(preds >= 0.0)
+    # Quantiles monotonicity
+    q_mat = res.quantile_forecast["wip"]
+    assert q_mat.shape == (128, len(forecaster.quantiles))
+    for t in range(128):
+        assert q_mat[t, 0] <= q_mat[t, 1] <= q_mat[t, 2] <= q_mat[t, 3] <= q_mat[t, 4]
+

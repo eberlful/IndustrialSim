@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from industrialsim.forecasting.baselines import (
+    ExponentialSmoothingForecaster,
     LinearTrendCovariateForecaster,
     MovingAverageForecaster,
     NaiveLastValueForecaster,
@@ -42,6 +43,7 @@ __all__ = [
     "DeterministicTimesFM3Engine",
     "TimesFM3Adapter",
     "MovingAverageForecaster",
+    "ExponentialSmoothingForecaster",
     "LinearTrendCovariateForecaster",
     "NaiveLastValueForecaster",
     "PredictiveDecisionProvider",

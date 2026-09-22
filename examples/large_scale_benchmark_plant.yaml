@@ -1,0 +1,758 @@
+schema_version: "1.0"
+seed: 42
+
+calibration:
+  is_calibrated: false
+  notes: "Large-scale 140-unit multi-area automotive manufacturing benchmark plant with 4 vehicle variants, 3 production areas, inter-area buffers (capacity 14), and hierarchical multi-level decisions."
+
+episode:
+  start_time: "0s"
+  end_condition:
+    type: "max_time"
+    max_time: "90m"
+
+telemetry:
+  enabled: true
+  sample_interval: "15s"
+  domain_events:
+    - "operation_completed"
+    - "machine_state_change"
+    - "decision_action"
+
+plant:
+  id: "plant-large-scale-benchmark"
+  name: "Large Scale Automotive Multi-Area Plant (140 Units)"
+  areas:
+    - id: "area-body"
+      name: "Body Shop Area"
+      halls:
+        - id: "hall-body"
+          name: "Body Shop Hall"
+    - id: "area-paint"
+      name: "Paint Shop Area"
+      halls:
+        - id: "hall-paint"
+          name: "Paint Shop Hall"
+    - id: "area-assembly"
+      name: "Assembly & QC Area"
+      halls:
+        - id: "hall-assembly"
+          name: "Assembly Hall"
+
+material_flow:
+  nodes:
+    # 1. Raw Material Source
+    - id: "src-raw"
+      kind: "source"
+      hall_id: "hall-body"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    # 2. Area 1: Body Shop (Parallel Stations 1 & 2)
+    - id: "st-body-1"
+      kind: "station"
+      hall_id: "hall-body"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-body-express"
+          duration: "15s"
+          required_machines: ["m-body-welder-1"]
+        - id: "op-body-standard"
+          duration: "25s"
+          required_machines: ["m-body-welder-1"]
+        - id: "op-body-heavy"
+          duration: "40s"
+          required_machines: ["m-body-welder-1"]
+        - id: "op-body-van"
+          duration: "45s"
+          required_machines: ["m-body-welder-1"]
+
+    - id: "st-body-2"
+      kind: "station"
+      hall_id: "hall-body"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-body-express"
+          duration: "15s"
+          required_machines: ["m-body-welder-2"]
+        - id: "op-body-standard"
+          duration: "25s"
+          required_machines: ["m-body-welder-2"]
+        - id: "op-body-heavy"
+          duration: "40s"
+          required_machines: ["m-body-welder-2"]
+        - id: "op-body-van"
+          duration: "45s"
+          required_machines: ["m-body-welder-2"]
+
+    # 3. Inter-Area Buffer 1: Body to Paint (Capacity: 14)
+    - id: "buf-body-paint"
+      kind: "buffer"
+      capacity: 14
+      hall_id: "hall-body"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    # 4. Area 2: Paint Shop (Parallel Stations 1 & 2)
+    - id: "st-paint-1"
+      kind: "station"
+      hall_id: "hall-paint"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-paint-express"
+          duration: "20s"
+          required_machines: ["m-paint-robot-1"]
+        - id: "op-paint-standard"
+          duration: "35s"
+          required_machines: ["m-paint-robot-1"]
+        - id: "op-paint-heavy"
+          duration: "55s"
+          required_machines: ["m-paint-robot-1"]
+        - id: "op-paint-van"
+          duration: "60s"
+          required_machines: ["m-paint-robot-1"]
+
+    - id: "st-paint-2"
+      kind: "station"
+      hall_id: "hall-paint"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-paint-express"
+          duration: "22s"
+          required_machines: ["m-paint-robot-2"]
+        - id: "op-paint-standard"
+          duration: "38s"
+          required_machines: ["m-paint-robot-2"]
+        - id: "op-paint-heavy"
+          duration: "58s"
+          required_machines: ["m-paint-robot-2"]
+        - id: "op-paint-van"
+          duration: "65s"
+          required_machines: ["m-paint-robot-2"]
+
+    # 5. Inter-Area Buffer 2: Paint to Assembly (Capacity: 14)
+    - id: "buf-paint-assy"
+      kind: "buffer"
+      capacity: 14
+      hall_id: "hall-paint"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+
+    # 6. Area 3: Assembly Stations (Parallel 1 & 2) and Quality Inspection
+    - id: "st-assy-1"
+      kind: "station"
+      hall_id: "hall-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-assy-express"
+          duration: "15s"
+          required_machines: ["m-assy-tool-1"]
+        - id: "op-assy-standard"
+          duration: "25s"
+          required_machines: ["m-assy-tool-1"]
+        - id: "op-assy-heavy"
+          duration: "40s"
+          required_machines: ["m-assy-tool-1"]
+        - id: "op-assy-van"
+          duration: "45s"
+          required_machines: ["m-assy-tool-1"]
+
+    - id: "st-assy-2"
+      kind: "station"
+      hall_id: "hall-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-assy-express"
+          duration: "15s"
+          required_machines: ["m-assy-tool-2"]
+        - id: "op-assy-standard"
+          duration: "25s"
+          required_machines: ["m-assy-tool-2"]
+        - id: "op-assy-heavy"
+          duration: "40s"
+          required_machines: ["m-assy-tool-2"]
+        - id: "op-assy-van"
+          duration: "45s"
+          required_machines: ["m-assy-tool-2"]
+
+    - id: "st-qc-1"
+      kind: "station"
+      hall_id: "hall-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+      output_ports:
+        - id: "p-out"
+          port_type: "chassis"
+          direction: "output"
+      operations:
+        - id: "op-qc-inspect"
+          duration: "15s"
+          required_machines: ["m-qc-scanner"]
+          inspection:
+            sensitivity: 0.98
+            false_positive_rate: 0.02
+            max_reworks: 1
+            disposition_on_defect: "rework"
+
+    # 7. Final Sink
+    - id: "snk-end"
+      kind: "sink"
+      hall_id: "hall-assembly"
+      input_ports:
+        - id: "p-in"
+          port_type: "chassis"
+          direction: "input"
+
+  routes:
+    # Source -> Body Stations
+    - id: "r-src-b1"
+      source_node_id: "src-raw"
+      source_port_id: "p-out"
+      target_node_id: "st-body-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-src-b2"
+      source_node_id: "src-raw"
+      source_port_id: "p-out"
+      target_node_id: "st-body-2"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # Body Stations -> Inter-Area Buffer 1
+    - id: "r-b1-buf1"
+      source_node_id: "st-body-1"
+      source_port_id: "p-out"
+      target_node_id: "buf-body-paint"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-b2-buf1"
+      source_node_id: "st-body-2"
+      source_port_id: "p-out"
+      target_node_id: "buf-body-paint"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # Inter-Area Buffer 1 -> Paint Stations
+    - id: "r-buf1-p1"
+      source_node_id: "buf-body-paint"
+      source_port_id: "p-out"
+      target_node_id: "st-paint-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-buf1-p2"
+      source_node_id: "buf-body-paint"
+      source_port_id: "p-out"
+      target_node_id: "st-paint-2"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # Paint Stations -> Inter-Area Buffer 2
+    - id: "r-p1-buf2"
+      source_node_id: "st-paint-1"
+      source_port_id: "p-out"
+      target_node_id: "buf-paint-assy"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-p2-buf2"
+      source_node_id: "st-paint-2"
+      source_port_id: "p-out"
+      target_node_id: "buf-paint-assy"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # Inter-Area Buffer 2 -> Assembly Stations
+    - id: "r-buf2-a1"
+      source_node_id: "buf-paint-assy"
+      source_port_id: "p-out"
+      target_node_id: "st-assy-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-buf2-a2"
+      source_node_id: "buf-paint-assy"
+      source_port_id: "p-out"
+      target_node_id: "st-assy-2"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # Assembly Stations -> QC
+    - id: "r-a1-qc"
+      source_node_id: "st-assy-1"
+      source_port_id: "p-out"
+      target_node_id: "st-qc-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    - id: "r-a2-qc"
+      source_node_id: "st-assy-2"
+      source_port_id: "p-out"
+      target_node_id: "st-qc-1"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+    # QC -> Sink
+    - id: "r-qc-snk"
+      source_node_id: "st-qc-1"
+      source_port_id: "p-out"
+      target_node_id: "snk-end"
+      target_port_id: "p-in"
+      transit_time: "5s"
+
+machines:
+  - id: "m-body-welder-1"
+    initial_health: 0.99
+    modes:
+      nominal:
+        cycle_time_multiplier: 1.0
+        degradation_multiplier: 1.0
+        defect_probability_multiplier: 1.0
+        hazard_multiplier: 1.0
+      boost:
+        cycle_time_multiplier: 0.75
+        degradation_multiplier: 1.8
+        defect_probability_multiplier: 1.2
+        hazard_multiplier: 1.5
+
+  - id: "m-body-welder-2"
+    initial_health: 0.99
+    modes:
+      nominal:
+        cycle_time_multiplier: 1.0
+        degradation_multiplier: 1.0
+        defect_probability_multiplier: 1.0
+        hazard_multiplier: 1.0
+      boost:
+        cycle_time_multiplier: 0.75
+        degradation_multiplier: 1.8
+        defect_probability_multiplier: 1.2
+        hazard_multiplier: 1.5
+
+  - id: "m-paint-robot-1"
+    initial_health: 0.95
+    operating_mode: "nominal"
+    modes:
+      nominal:
+        cycle_time_multiplier: 1.0
+        degradation_multiplier: 1.0
+        defect_probability_multiplier: 1.0
+        hazard_multiplier: 1.0
+      boost:
+        cycle_time_multiplier: 0.75
+        degradation_multiplier: 2.0
+        defect_probability_multiplier: 1.2
+        hazard_multiplier: 1.8
+      eco:
+        cycle_time_multiplier: 1.25
+        degradation_multiplier: 0.5
+        defect_probability_multiplier: 0.8
+        hazard_multiplier: 0.5
+    degradation:
+      use_rate_per_s: 0.00015
+      idle_rate_per_s: 0.00001
+      failure_hazard_rate_per_s: 0.00006
+      hazard_health_factor: 1.5
+    maintenance:
+      trigger: "condition_threshold"
+      health_threshold: 0.35
+      duration: "90s"
+
+  - id: "m-paint-robot-2"
+    initial_health: 0.98
+    modes:
+      nominal:
+        cycle_time_multiplier: 1.0
+        degradation_multiplier: 1.0
+        defect_probability_multiplier: 1.0
+        hazard_multiplier: 1.0
+
+  - id: "m-assy-tool-1"
+    initial_health: 1.0
+
+  - id: "m-assy-tool-2"
+    initial_health: 1.0
+
+  - id: "m-qc-scanner"
+    initial_health: 1.0
+
+production_plan:
+  # Wave 1: 30 units (0s - 300s)
+  - id: "plan-w1-express"
+    variant: "compact-express"
+    quantity: 10
+    release_time: "0s"
+    due_date: "15m"
+    source_id: "src-raw"
+
+  - id: "plan-w1-sedan"
+    variant: "standard-sedan"
+    quantity: 10
+    release_time: "45s"
+    due_date: "25m"
+    source_id: "src-raw"
+
+  - id: "plan-w1-suv"
+    variant: "luxury-suv"
+    quantity: 5
+    release_time: "150s"
+    due_date: "40m"
+    source_id: "src-raw"
+
+  - id: "plan-w1-van"
+    variant: "commercial-van"
+    quantity: 5
+    release_time: "240s"
+    due_date: "45m"
+    source_id: "src-raw"
+
+  # Wave 2: 35 units (600s - 900s)
+  - id: "plan-w2-express"
+    variant: "compact-express"
+    quantity: 12
+    release_time: "600s"
+    due_date: "30m"
+    source_id: "src-raw"
+
+  - id: "plan-w2-sedan"
+    variant: "standard-sedan"
+    quantity: 12
+    release_time: "700s"
+    due_date: "45m"
+    source_id: "src-raw"
+
+  - id: "plan-w2-suv"
+    variant: "luxury-suv"
+    quantity: 6
+    release_time: "800s"
+    due_date: "60m"
+    source_id: "src-raw"
+
+  - id: "plan-w2-van"
+    variant: "commercial-van"
+    quantity: 5
+    release_time: "900s"
+    due_date: "65m"
+    source_id: "src-raw"
+
+  # Wave 3: 35 units (1500s - 1800s)
+  - id: "plan-w3-express"
+    variant: "compact-express"
+    quantity: 12
+    release_time: "1500s"
+    due_date: "55m"
+    source_id: "src-raw"
+
+  - id: "plan-w3-sedan"
+    variant: "standard-sedan"
+    quantity: 11
+    release_time: "1600s"
+    due_date: "65m"
+    source_id: "src-raw"
+
+  - id: "plan-w3-suv"
+    variant: "luxury-suv"
+    quantity: 6
+    release_time: "1700s"
+    due_date: "75m"
+    source_id: "src-raw"
+
+  - id: "plan-w3-van"
+    variant: "commercial-van"
+    quantity: 6
+    release_time: "1800s"
+    due_date: "80m"
+    source_id: "src-raw"
+
+  # Wave 4: 40 units (2400s - 2700s)
+  - id: "plan-w4-express"
+    variant: "compact-express"
+    quantity: 14
+    release_time: "2400s"
+    due_date: "70m"
+    source_id: "src-raw"
+
+  - id: "plan-w4-sedan"
+    variant: "standard-sedan"
+    quantity: 14
+    release_time: "2500s"
+    due_date: "80m"
+    source_id: "src-raw"
+
+  - id: "plan-w4-suv"
+    variant: "luxury-suv"
+    quantity: 6
+    release_time: "2600s"
+    due_date: "85m"
+    source_id: "src-raw"
+
+  - id: "plan-w4-van"
+    variant: "commercial-van"
+    quantity: 6
+    release_time: "2700s"
+    due_date: "88m"
+    source_id: "src-raw"
+
+process_plans:
+  - variant: "compact-express"
+    steps:
+      - operation_id: "op-body-express"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-express"
+        compatible_stations: ["st-paint-1", "st-paint-2"]
+      - operation_id: "op-assy-express"
+        compatible_stations: ["st-assy-1", "st-assy-2"]
+      - operation_id: "op-qc-inspect"
+        compatible_stations: ["st-qc-1"]
+
+  - variant: "standard-sedan"
+    steps:
+      - operation_id: "op-body-standard"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-standard"
+        compatible_stations: ["st-paint-1", "st-paint-2"]
+      - operation_id: "op-assy-standard"
+        compatible_stations: ["st-assy-1", "st-assy-2"]
+      - operation_id: "op-qc-inspect"
+        compatible_stations: ["st-qc-1"]
+
+  - variant: "luxury-suv"
+    steps:
+      - operation_id: "op-body-heavy"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-heavy"
+        compatible_stations: ["st-paint-1", "st-paint-2"]
+      - operation_id: "op-assy-heavy"
+        compatible_stations: ["st-assy-1", "st-assy-2"]
+      - operation_id: "op-qc-inspect"
+        compatible_stations: ["st-qc-1"]
+
+  - variant: "commercial-van"
+    steps:
+      - operation_id: "op-body-van"
+        compatible_stations: ["st-body-1", "st-body-2"]
+      - operation_id: "op-paint-van"
+        compatible_stations: ["st-paint-1", "st-paint-2"]
+      - operation_id: "op-assy-van"
+        compatible_stations: ["st-assy-1", "st-assy-2"]
+      - operation_id: "op-qc-inspect"
+        compatible_stations: ["st-qc-1"]
+
+decision_triggers:
+  # --- MAKRO: Strategischer Safe-Point für Plant-Level QualityControl & Station Safe-Point ---
+  - id: "trig-safe-qc"
+    trigger_type: "safe_point"
+    target_id: "st-qc-1"
+    interval_ns: 120000000000
+    quality_bounds:
+      min_inspection_intensity: 0.5
+      max_inspection_intensity: 1.0
+      min_sampling_rate: 0.2
+      max_sampling_rate: 1.0
+      min_release_threshold: 0.0
+      max_release_threshold: 0.9
+    on_failure: "fallback"
+
+  - id: "trig-safe-paint"
+    trigger_type: "safe_point"
+    target_id: "st-paint-1"
+    interval_ns: 120000000000
+    on_failure: "fallback"
+
+  # --- MESO: Routing Decisions an den 3 Split-Knoten ---
+  - id: "trig-route-src"
+    trigger_type: "routing_decision"
+    node_id: "src-raw"
+    on_failure: "fallback"
+
+  - id: "trig-route-paint"
+    trigger_type: "routing_decision"
+    node_id: "buf-body-paint"
+    on_failure: "fallback"
+
+  - id: "trig-route-assy"
+    trigger_type: "routing_decision"
+    node_id: "buf-paint-assy"
+    on_failure: "fallback"
+
+  # --- MIKRO: Buffer Threshold Reordering an den beiden Inter-Area Puffern (Kapazität 14) ---
+  # Puffer 1: buf-body-paint
+  - id: "trig-buf1-3"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 3
+    direction: "rising"
+    rearm_threshold: 2
+    on_failure: "fallback"
+
+  - id: "trig-buf1-5"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 5
+    direction: "rising"
+    rearm_threshold: 4
+    on_failure: "fallback"
+
+  - id: "trig-buf1-7"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 7
+    direction: "rising"
+    rearm_threshold: 6
+    on_failure: "fallback"
+
+  - id: "trig-buf1-9"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 9
+    direction: "rising"
+    rearm_threshold: 8
+    on_failure: "fallback"
+
+  - id: "trig-buf1-11"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 11
+    direction: "rising"
+    rearm_threshold: 10
+    on_failure: "fallback"
+
+  - id: "trig-buf1-fall-8"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 8
+    direction: "falling"
+    rearm_threshold: 9
+    on_failure: "fallback"
+
+  - id: "trig-buf1-fall-5"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-body-paint"
+    threshold: 5
+    direction: "falling"
+    rearm_threshold: 6
+    on_failure: "fallback"
+
+  # Puffer 2: buf-paint-assy
+  - id: "trig-buf2-3"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 3
+    direction: "rising"
+    rearm_threshold: 2
+    on_failure: "fallback"
+
+  - id: "trig-buf2-5"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 5
+    direction: "rising"
+    rearm_threshold: 4
+    on_failure: "fallback"
+
+  - id: "trig-buf2-7"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 7
+    direction: "rising"
+    rearm_threshold: 6
+    on_failure: "fallback"
+
+  - id: "trig-buf2-9"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 9
+    direction: "rising"
+    rearm_threshold: 8
+    on_failure: "fallback"
+
+  - id: "trig-buf2-11"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 11
+    direction: "rising"
+    rearm_threshold: 10
+    on_failure: "fallback"
+
+  - id: "trig-buf2-fall-8"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 8
+    direction: "falling"
+    rearm_threshold: 9
+    on_failure: "fallback"
+
+  - id: "trig-buf2-fall-5"
+    trigger_type: "buffer_threshold"
+    buffer_id: "buf-paint-assy"
+    threshold: 5
+    direction: "falling"
+    rearm_threshold: 6
+    on_failure: "fallback"
+
+  # --- MIKRO: Machine Health Trigger für m-paint-robot-1 ---
+  - id: "trig-mach-paint1"
+    trigger_type: "machine_decision"
+    machine_id: "m-paint-robot-1"
+    health_threshold: 0.35
+    on_failure: "fallback"
