@@ -95,6 +95,53 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to directory where branch artifacts should be written",
     )
+    branch_parser.add_argument(
+        "--workers",
+        dest="workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for parallel branch execution (default: 1)",
+    )
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run scheduler or reference plant benchmarks",
+    )
+    benchmark_parser.add_argument(
+        "--target",
+        dest="target",
+        choices=["all", "scheduler", "plant", "reference_plant"],
+        default="all",
+        help="Benchmark target to execute (default: all)",
+    )
+    benchmark_parser.add_argument(
+        "--scheduler-events",
+        "--events",
+        dest="scheduler_events",
+        type=int,
+        default=5_000_000,
+        help="Number of simple events for Scheduler benchmark (default: 5,000,000)",
+    )
+    benchmark_parser.add_argument(
+        "--plant-events",
+        dest="plant_events",
+        type=int,
+        default=100_000,
+        help="Target events for Reference Plant benchmark (default: 100,000)",
+    )
+    benchmark_parser.add_argument(
+        "--repetitions",
+        dest="repetitions",
+        type=int,
+        default=2,
+        help="Number of repetitions to verify determinism (default: 2)",
+    )
+    benchmark_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        default=None,
+        help="Optional path to directory where benchmark report should be written",
+    )
 
     return parser
 
@@ -146,9 +193,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 alternative_actions=alternatives,
                 config_source=args.config_path,
                 output_dir=args.output_dir,
+                workers=args.workers,
             )
 
         return _execute_cli_action(run_branch)
+
+    if args.command == "benchmark":
+        from industrialsim.benchmark import run_benchmark
+
+        return _execute_cli_action(
+            lambda: run_benchmark(
+                target=args.target,
+                scheduler_events=args.scheduler_events,
+                plant_events=args.plant_events,
+                repetitions=args.repetitions,
+                output_dir=args.output_dir,
+            )
+        )
 
     return 1
 

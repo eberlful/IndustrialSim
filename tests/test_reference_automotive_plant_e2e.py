@@ -473,6 +473,8 @@ def test_reference_plant_counterfactual_branching_artifacts(tmp_path: Path) -> N
     b2 = comp_result.branches[1]
 
     # Both branches run to completion
+    assert b1.summary is not None
+    assert b2.summary is not None
     assert b1.summary.status == "completed"
     assert b2.summary.status == "completed"
     assert b1.summary.simulated_time_ns == 432_000_000_000_000

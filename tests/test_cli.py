@@ -291,5 +291,65 @@ def test_cli_branch_three_alternatives(tmp_path: Path, capsys: pytest.CaptureFix
     assert len(data["branches"]) == 3
 
 
+def test_cli_branch_with_workers(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from test_branch_counterfactual_decisions_e2e import BASE_DECISION_YAML
+    from industrialsim.application import create_checkpoint, save_checkpoint
+
+    cp = create_checkpoint(BASE_DECISION_YAML, pause_at_decision_batch=True)
+    cp_file = tmp_path / "decision_cp.json"
+    save_checkpoint(cp, cp_file)
+
+    act1_file = tmp_path / "actions1.json"
+    act1_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-1", "u-2"]}]),
+        encoding="utf-8",
+    )
+
+    act2_file = tmp_path / "actions2.json"
+    act2_file.write_text(
+        json.dumps([{"action_type": "buffer_reorder", "target_id": "buf-1", "new_order": ["u-2", "u-1"]}]),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["branch", str(cp_file), str(act1_file), str(act2_file), "--workers", "2"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert "branches" in data
+    assert len(data["branches"]) == 2
+    assert data["branches"][0]["status"] == "completed"
+
+
+def test_cli_benchmark_scheduler(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["benchmark", "--target", "scheduler", "--scheduler-events", "1000", "--repetitions", "2"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "passed"
+    assert "scheduler" in data
+    assert data["scheduler"] is not None
+    assert "timing" in data["scheduler"]
+    assert "hardware" in data
+    assert "runtime" in data
+
+
+def test_cli_benchmark_with_output_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out_dir = tmp_path / "bench_report"
+    exit_code = main([
+        "benchmark",
+        "--target", "scheduler",
+        "--scheduler-events", "1000",
+        "--output-dir", str(out_dir),
+    ])
+    assert exit_code == 0
+    report_file = out_dir / "benchmark_report.json"
+    assert report_file.exists()
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["status"] == "passed"
+
+
+
+
 
 

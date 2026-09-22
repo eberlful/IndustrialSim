@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections import deque
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import heapq
 import json
 from io import StringIO
+import multiprocessing
 from pathlib import Path
 from typing import Any, Sequence
 from pydantic import TypeAdapter, ValidationError
@@ -1050,8 +1052,20 @@ class EpisodeEngine:
             self.max_interval_without_progress_ns = self.cfg.deadlock.max_interval_without_progress_ns
 
         self.dispatch_policy = dispatch_policy or BaselineDispatchPolicy()
+        self._active_transport_orders_by_unit: dict[str, str] = {
+            o.unit_id: o.id for o in self.domain.transport_orders.values()
+            if o.state in (TransportOrderState.PENDING, TransportOrderState.DISPATCHED, TransportOrderState.IN_TRANSIT)
+        }
+        self._workers_by_qualification: dict[str, list[Worker]] = {}
+        self._rebuild_worker_qualification_index()
 
         self._setup_handlers()
+
+    def _rebuild_worker_qualification_index(self) -> None:
+        self._workers_by_qualification = {}
+        for w in self.workers.values():
+            for q in w.qualifications:
+                self._workers_by_qualification.setdefault(q, []).append(w)
 
     @property
     def is_telemetry_enabled(self) -> bool:
@@ -2187,13 +2201,16 @@ class EpisodeEngine:
         return candidates if candidates else list(routes)
 
     def _create_transport_order(self, unit_id: str, source_node_id: str, time_ns: int) -> TransportOrder:
-        for o in self.transport_orders.values():
-            if o.unit_id == unit_id and o.state in (
+        active_id = self._active_transport_orders_by_unit.get(unit_id)
+        if active_id is not None:
+            o = self.transport_orders.get(active_id)
+            if o is not None and o.state in (
                 TransportOrderState.PENDING,
                 TransportOrderState.DISPATCHED,
                 TransportOrderState.IN_TRANSIT,
             ):
                 return o
+            self._active_transport_orders_by_unit.pop(unit_id, None)
 
         unit = self.units[unit_id]
         candidates = self._get_candidate_routes_for_unit(source_node_id, unit)
@@ -2209,6 +2226,7 @@ class EpisodeEngine:
         )
         self.transport_orders[order.id] = order
         self.pending_transport_orders.append(order.id)
+        self._active_transport_orders_by_unit[unit_id] = order.id
         return order
 
     def _can_unit_depart(self, node_id: str, unit_id: str) -> bool:
@@ -2543,9 +2561,10 @@ class EpisodeEngine:
                 temp_worker_allocations[w.id] = curr_allocated + needed_count
                 allocated_workers.append({"worker_id": w.id, "count": needed_count, "qualification": target_qual})
             elif target_qual is not None:
+                pool = self._workers_by_qualification.get(target_qual, [])
                 candidates = [
-                    w for w in self.workers.values()
-                    if target_qual in w.qualifications and w.is_available(time_ns)
+                    w for w in pool
+                    if w.is_available(time_ns)
                 ]
                 candidates.sort(key=lambda w: (0 if w.kind == "pool" else 1, w.id))
 
@@ -3260,6 +3279,7 @@ class EpisodeEngine:
 
         if order_id and order_id in self.transport_orders:
             self.transport_orders[order_id].complete(k.current_time_ns)
+            self._active_transport_orders_by_unit.pop(unit_id, None)
 
         kind = self.nodes_by_id[node_id].kind
         if kind == "sink":
@@ -4669,18 +4689,22 @@ class CounterfactualBranchResult:
     provenance: DecisionProvenance
     raw_metrics: dict[str, Any]
     hard_constraints: dict[str, Any]
-    summary: EpisodeSummary
-    result_hash: str
+    summary: EpisodeSummary | None = None
+    result_hash: str = ""
+    status: str = "completed"
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "branch_id": self.branch_id,
+            "status": self.status,
             "actions": self.actions,
             "provenance": self.provenance.model_dump(mode="json"),
             "raw_metrics": self.raw_metrics,
             "hard_constraints": self.hard_constraints,
-            "summary": self.summary.to_dict(),
+            "summary": self.summary.to_dict() if self.summary is not None else None,
             "result_hash": self.result_hash,
+            "error": self.error,
         }
 
 
@@ -4945,83 +4969,36 @@ def _compute_hard_constraints(
     }
 
 
-def branch_checkpoint(
-    checkpoint: str | Path | dict[str, Any] | Checkpoint,
-    alternative_actions: Sequence[Any],
-    config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
-    output_dir: str | Path | None = None,
-) -> BranchComparisonResult:
-    if len(alternative_actions) < 2:
-        raise ValueError(
-            f"Counterfactual branching requires at least two alternative Action sets, got {len(alternative_actions)}"
-        )
+def _execute_single_branch_worker(task_data: dict[str, Any]) -> CounterfactualBranchResult:
+    checkpoint_data = task_data["checkpoint_data"]
+    alt_action = task_data["alt_action"]
+    config_data = task_data.get("config_data")
+    output_dir_str = task_data.get("output_dir")
+    parent_run_id = task_data.get("parent_run_id", "parent")
+    batch_id = task_data.get("batch_id", "unknown")
+    branch_index = task_data.get("branch_index", 0)
 
-    out_p: Path | None = Path(output_dir) if output_dir is not None else None
-    root_created_at = datetime.now(timezone.utc).isoformat()
-
-    if out_p is not None:
-        manifest_p = out_p / "manifest.json"
-        if manifest_p.exists():
-            try:
-                m_data = json.loads(manifest_p.read_text(encoding="utf-8"))
-                if m_data.get("status") == "completed":
-                    raise RunArtifactExistsError(
-                        f"Run directory '{output_dir}' already exists and is completed"
-                    )
-            except (json.JSONDecodeError, OSError):
-                pass
-        out_p.mkdir(parents=True, exist_ok=True)
-        (out_p / ".incomplete").write_text("in_progress\n", encoding="utf-8")
-
-    if isinstance(checkpoint, (str, Path)):
-        cp = load_checkpoint(checkpoint)
-    elif isinstance(checkpoint, dict):
-        cp = deserialize_checkpoint(checkpoint)
-    elif isinstance(checkpoint, Checkpoint):
-        cp = checkpoint
-    else:
-        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
-
-    if out_p is not None:
-        cp_dir = out_p / "checkpoints"
-        cp_dir.mkdir(exist_ok=True)
-        save_checkpoint(cp, cp_dir / "parent_checkpoint.json")
-
-    cfg: SimulationConfig | None = None
-    if config_source is not None:
-        if isinstance(config_source, SimulationConfig):
-            cfg = config_source
-        else:
-            validation = validate_config(config_source)
-            if not validation.is_valid or validation.config is None:
-                raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
-            cfg = validation.config
-
-    eff_cfg = cfg or SimulationConfig.model_validate(cp.configuration)
-
-    # Verify that the checkpoint is at a Decision Batch
-    coord = (
-        cp.domain_state.get("decision_coordinator")
-        if hasattr(cp.domain_state, "get")
-        else getattr(cp.domain_state, "decision_coordinator", None)
+    dummy_prov = DecisionProvenance(
+        episode_id=parent_run_id,
+        branch_id=f"branch-{branch_index}",
+        batch_id=batch_id,
+        provider_id="unknown",
     )
-    if isinstance(coord, dict):
-        pending = coord.get("pending_requests", [])
-    elif hasattr(coord, "pending_requests"):
-        pending = getattr(coord, "pending_requests")
-    else:
-        pending = []
+    branch_id = f"branch-{branch_index}"
+    applied_actions: list[dict[str, Any]] = []
 
-    if not pending:
-        raise ValueError(
-            "Checkpoint is not at a Decision Batch: no pending decision requests found in checkpoint."
+    try:
+        if isinstance(alt_action, dict) and alt_action.get("__inject_worker_failure__"):
+            raise RuntimeError("Injected worker failure for testing")
+
+        cp = deserialize_checkpoint(checkpoint_data)
+        eff_cfg = (
+            SimulationConfig.model_validate(config_data)
+            if config_data is not None
+            else SimulationConfig.model_validate(cp.configuration)
         )
 
-    branch_results: list[CounterfactualBranchResult] = []
-    batch_id: str = "unknown"
-
-    for alt in alternative_actions:
-        provider_id, model_id, prompt_id, actions = _parse_action_set(alt)
+        provider_id, model_id, prompt_id, actions = _parse_action_set(alt_action)
         branch_id = _derive_branch_id(
             config_hash=cp.config_hash,
             root_seed=cp.root_seed,
@@ -5032,22 +5009,21 @@ def branch_checkpoint(
         branch_writer: RunArtifactWriter | None = None
         branch_audit_logger: AuditLogger | None = None
 
-        if out_p is not None:
-            branch_dir = out_p / "branches" / branch_id
+        if output_dir_str is not None:
+            branch_dir = Path(output_dir_str) / "branches" / branch_id
             branch_writer = RunArtifactWriter(
                 output_dir=branch_dir,
                 config=eff_cfg,
                 episode_id=f"ep-{cp.root_seed}-{branch_id}",
                 branch_id=branch_id,
-                parent_run_id=f"ep-{cp.root_seed}",
+                parent_run_id=parent_run_id,
                 checkpoint_hash=cp.config_hash,
             )
             branch_audit_logger = branch_writer.audit_logger
 
-        # Restore isolated engine for this branch
         engine = EpisodeEngine.restore(
             cp,
-            config=cfg,
+            config=eff_cfg,
             audit_logger=branch_audit_logger,
             telemetry_manager=branch_writer.telemetry_manager if branch_writer is not None else None,
         )
@@ -5060,7 +5036,6 @@ def branch_checkpoint(
             occurrence_counters=engine.random_occurrence_counters,
         )
 
-        # Form the decision batch
         batch = engine.decision_coordinator.form_batch(
             time_ns=engine.kernel.current_time_ns,
             observation_builder=lambda req: engine._build_observation_for_request(
@@ -5071,9 +5046,7 @@ def branch_checkpoint(
             raise ValueError("Failed to form Decision Batch from checkpoint pending requests.")
 
         batch = batch.model_copy(update={"branch_id": branch_id})
-        batch_id = batch.batch_id
 
-        # Validate and apply actions with full provenance contract
         provenance = DecisionProvenance(
             episode_id=batch.episode_id,
             branch_id=branch_id,
@@ -5090,7 +5063,6 @@ def branch_checkpoint(
 
         is_valid, diagnostics = validate_decision_batch_response(batch, response)
 
-        # Log decision requests, proposed actions, and validation outcome into branch audit log
         for req in batch.requests:
             engine.audit_logger.record(
                 event_type="decision_request",
@@ -5148,7 +5120,6 @@ def branch_checkpoint(
         else:
             engine._handle_decision_failure(batch, diagnostics)
 
-        # Continue branch execution to episode completion
         summary = engine.run()
 
         if branch_writer is not None:
@@ -5159,7 +5130,6 @@ def branch_checkpoint(
                 status=summary.status,
             )
 
-        # The actions actually applied in this branch
         applied_actions = (
             engine.decision_batches[-1].get("actions", [a.model_dump(mode="json") for a in actions])
             if engine.decision_batches
@@ -5169,17 +5139,176 @@ def branch_checkpoint(
         raw_metrics = _compute_raw_metrics(summary, warm_up_time_ns=eff_cfg.episode.warm_up_time_ns)
         hard_constraints = _compute_hard_constraints(summary, config=eff_cfg.hard_constraints, raw_metrics=raw_metrics)
 
-        branch_results.append(
-            CounterfactualBranchResult(
-                branch_id=branch_id,
-                actions=applied_actions,
-                provenance=provenance,
-                raw_metrics=raw_metrics,
-                hard_constraints=hard_constraints,
-                summary=summary,
-                result_hash=summary.result_hash,
-            )
+        return CounterfactualBranchResult(
+            branch_id=branch_id,
+            actions=applied_actions,
+            provenance=provenance,
+            raw_metrics=raw_metrics,
+            hard_constraints=hard_constraints,
+            summary=summary,
+            result_hash=summary.result_hash,
+            status="completed",
+            error=None,
         )
+    except Exception as exc:
+        return CounterfactualBranchResult(
+            branch_id=branch_id,
+            actions=applied_actions,
+            provenance=dummy_prov,
+            raw_metrics={},
+            hard_constraints={
+                "satisfied": False,
+                "violations": [f"Branch execution failed: {str(exc)}"],
+                "aborted": True,
+                "abort_reason": f"Worker error: {str(exc)}",
+            },
+            summary=None,
+            result_hash="",
+            status="failed",
+            error=str(exc),
+        )
+
+
+def branch_checkpoint(
+    checkpoint: str | Path | dict[str, Any] | Checkpoint,
+    alternative_actions: Sequence[Any],
+    config_source: str | Path | dict[str, Any] | SimulationConfig | None = None,
+    output_dir: str | Path | None = None,
+    workers: int = 1,
+) -> BranchComparisonResult:
+    if len(alternative_actions) < 2:
+        raise ValueError(
+            f"Counterfactual branching requires at least two alternative Action sets, got {len(alternative_actions)}"
+        )
+
+    out_p: Path | None = Path(output_dir) if output_dir is not None else None
+    root_created_at = datetime.now(timezone.utc).isoformat()
+
+    if out_p is not None:
+        manifest_p = out_p / "manifest.json"
+        if manifest_p.exists():
+            m_data = {}
+            try:
+                m_data = json.loads(manifest_p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+            if m_data.get("status") == "completed":
+                raise RunArtifactExistsError(
+                    f"Run directory '{output_dir}' already exists and is completed"
+                )
+        out_p.mkdir(parents=True, exist_ok=True)
+        (out_p / ".incomplete").write_text("in_progress\n", encoding="utf-8")
+
+    if isinstance(checkpoint, (str, Path)):
+        cp = load_checkpoint(checkpoint)
+    elif isinstance(checkpoint, dict):
+        cp = deserialize_checkpoint(checkpoint)
+    elif isinstance(checkpoint, Checkpoint):
+        cp = checkpoint
+    else:
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    if out_p is not None:
+        cp_dir = out_p / "checkpoints"
+        cp_dir.mkdir(exist_ok=True)
+        save_checkpoint(cp, cp_dir / "parent_checkpoint.json")
+
+    cfg: SimulationConfig | None = None
+    if config_source is not None:
+        if isinstance(config_source, SimulationConfig):
+            cfg = config_source
+        else:
+            validation = validate_config(config_source)
+            if not validation.is_valid or validation.config is None:
+                raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+            cfg = validation.config
+
+    eff_cfg = cfg or SimulationConfig.model_validate(cp.configuration)
+
+    # Verify that the checkpoint is at a Decision Batch
+    coord = (
+        cp.domain_state.get("decision_coordinator")
+        if hasattr(cp.domain_state, "get")
+        else getattr(cp.domain_state, "decision_coordinator", None)
+    )
+    if isinstance(coord, dict):
+        pending = coord.get("pending_requests", [])
+    elif hasattr(coord, "pending_requests"):
+        pending = getattr(coord, "pending_requests")
+    else:
+        pending = []
+
+    if not pending:
+        raise ValueError(
+            "Checkpoint is not at a Decision Batch: no pending decision requests found in checkpoint."
+        )
+
+    batch_id: str = "unknown"
+    if pending:
+        first_req = pending[0]
+        batch_id = (
+            first_req.get("batch_id", "unknown")
+            if isinstance(first_req, dict)
+            else getattr(first_req, "batch_id", "unknown")
+        )
+
+    serialized_cp = serialize_checkpoint(cp)
+    serialized_cfg = eff_cfg.model_dump(mode="json")
+    out_dir_str = str(out_p) if out_p is not None else None
+    parent_run_id = f"ep-{cp.root_seed}"
+
+    tasks = [
+        {
+            "checkpoint_data": serialized_cp,
+            "alt_action": alt,
+            "config_data": serialized_cfg,
+            "output_dir": out_dir_str,
+            "parent_run_id": parent_run_id,
+            "batch_id": batch_id,
+            "branch_index": idx,
+        }
+        for idx, alt in enumerate(alternative_actions)
+    ]
+
+    branch_results: list[CounterfactualBranchResult] = []
+
+    if workers <= 1 or len(alternative_actions) <= 1:
+        for task in tasks:
+            res = _execute_single_branch_worker(task)
+            branch_results.append(res)
+    else:
+        num_workers = min(max(workers, 1), len(alternative_actions))
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
+            futures = [executor.submit(_execute_single_branch_worker, task) for task in tasks]
+            for idx, fut in enumerate(futures):
+                try:
+                    res = fut.result()
+                    branch_results.append(res)
+                except Exception as exc:
+                    branch_results.append(
+                        CounterfactualBranchResult(
+                            branch_id=f"branch-worker-error-{idx}",
+                            actions=[],
+                            provenance=DecisionProvenance(
+                                episode_id=parent_run_id,
+                                branch_id=f"branch-worker-error-{idx}",
+                                batch_id=batch_id,
+                                provider_id="system",
+                            ),
+                            raw_metrics={},
+                            hard_constraints={
+                                "satisfied": False,
+                                "violations": [f"Worker process failed: {str(exc)}"],
+                                "aborted": True,
+                                "abort_reason": f"Worker process crash: {str(exc)}",
+                            },
+                            summary=None,
+                            result_hash="",
+                            status="failed",
+                            error=str(exc),
+                        )
+                    )
 
     comp_result = BranchComparisonResult(
         checkpoint_config_hash=cp.config_hash,
@@ -5196,12 +5325,13 @@ def branch_checkpoint(
         _yaml.dump(eff_cfg.model_dump(mode="json"), buf)
         (out_p / "resolved_config.yaml").write_text(buf.getvalue(), encoding="utf-8")
 
+        all_completed = all(b.status == "completed" for b in branch_results)
         root_manifest = {
             "schema_version": cp.schema_version,
             "kernel_version": cp.kernel_version,
             "run_id": f"branch-comp-{cp.config_hash[:8]}-{cp.simulated_time_ns}",
             "type": "branch_comparison",
-            "status": "completed",
+            "status": "completed" if all_completed else "failed",
             "created_at": root_created_at,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "decision_batch_id": batch_id,
@@ -5213,6 +5343,7 @@ def branch_checkpoint(
                 {
                     "branch_id": b.branch_id,
                     "result_hash": b.result_hash,
+                    "status": b.status,
                     "path": f"branches/{b.branch_id}",
                 }
                 for b in branch_results
@@ -5257,14 +5388,15 @@ def compare_policies(
     if out_p is not None:
         manifest_p = out_p / "manifest.json"
         if manifest_p.exists():
+            m_data = {}
             try:
                 m_data = json.loads(manifest_p.read_text(encoding="utf-8"))
-                if m_data.get("status") == "completed":
-                    raise RunArtifactExistsError(
-                        f"Run directory '{output_dir}' already exists and is completed"
-                    )
             except (json.JSONDecodeError, OSError):
                 pass
+            if m_data.get("status") == "completed":
+                raise RunArtifactExistsError(
+                    f"Run directory '{output_dir}' already exists and is completed"
+                )
         out_p.mkdir(parents=True, exist_ok=True)
         (out_p / ".incomplete").write_text("in_progress\n", encoding="utf-8")
 
@@ -5309,6 +5441,12 @@ def compare_policies(
             (out_p / ".incomplete").unlink()
 
     return comp_result
+
+
+def run_benchmark(*args: Any, **kwargs: Any) -> Any:
+    from industrialsim.benchmark import run_benchmark as _run_benchmark
+    return _run_benchmark(*args, **kwargs)
+
 
 
 

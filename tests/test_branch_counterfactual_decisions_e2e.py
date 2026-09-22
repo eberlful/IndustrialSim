@@ -238,6 +238,9 @@ def test_branch_state_isolation() -> None:
     assert cp.random_occurrence_counters == orig_counters
     assert cp.domain_state["buffers"]["buf-1"].occupants == ["u-1", "u-2"]
 
+    assert comp.branches[0].summary is not None
+    assert comp.branches[1].summary is not None
+
     # In Branch 1 (FIFO order u-1, u-2):
     # u-1 exits st-2 first (at 10s), u-2 exits st-2 second (at 15s)
     b1_u1 = next(u for u in comp.branches[0].summary.production_units if u.id == "u-1")
