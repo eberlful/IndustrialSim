@@ -123,6 +123,11 @@ class BenchmarkReport:
     scheduler: SchedulerBenchmarkResult | None = None
     plant: PlantBenchmarkResult | None = None
 
+    @property
+    def kernel(self) -> SchedulerBenchmarkResult | None:
+        """Domain alias for discrete-event engine benchmark (EventKernel)."""
+        return self.scheduler
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -130,6 +135,7 @@ class BenchmarkReport:
             "runtime": dict(self.runtime),
             "hardware": dict(self.hardware),
             "scheduler": self.scheduler.to_dict() if self.scheduler is not None else None,
+            "kernel": self.scheduler.to_dict() if self.scheduler is not None else None,
             "plant": self.plant.to_dict() if self.plant is not None else None,
         }
 
@@ -503,7 +509,7 @@ def run_benchmark(
     sched_res: SchedulerBenchmarkResult | None = None
     plant_res: PlantBenchmarkResult | None = None
 
-    if target in ("all", "scheduler"):
+    if target in ("all", "scheduler", "kernel"):
         sched_res = run_scheduler_benchmark(events=scheduler_events, repetitions=repetitions)
 
     if target in ("all", "plant", "reference_plant"):
@@ -532,3 +538,10 @@ def run_benchmark(
         )
 
     return report
+
+
+# Domain aliases (CONTEXT.md specifies "Dispatch Policy: Avoid: Scheduler, Router";
+# the discrete-event stepping engine is the EventKernel, while Issue 16 refers to it as "Scheduler benchmark").
+KernelBenchmarkResult = SchedulerBenchmarkResult
+run_kernel_benchmark = run_scheduler_benchmark
+

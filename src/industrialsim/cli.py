@@ -110,17 +110,18 @@ def create_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--target",
         dest="target",
-        choices=["all", "scheduler", "plant", "reference_plant"],
+        choices=["all", "scheduler", "kernel", "plant", "reference_plant"],
         default="all",
-        help="Benchmark target to execute (default: all)",
+        help="Benchmark target to execute: all, kernel (scheduler), or plant (default: all)",
     )
     benchmark_parser.add_argument(
+        "--kernel-events",
         "--scheduler-events",
         "--events",
         dest="scheduler_events",
         type=int,
         default=5_000_000,
-        help="Number of simple events for Scheduler benchmark (default: 5,000,000)",
+        help="Number of simple events for EventKernel benchmark (default: 5,000,000)",
     )
     benchmark_parser.add_argument(
         "--plant-events",

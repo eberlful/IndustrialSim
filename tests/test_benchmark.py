@@ -83,5 +83,19 @@ def test_run_benchmark_unified_report(tmp_path: Path) -> None:
     data = json.loads(report_file.read_text(encoding="utf-8"))
     assert data["status"] == "passed"
     assert "timing" in data["scheduler"]
+    assert "kernel" in data
     assert "hardware" in data
     assert "runtime" in data
+
+
+def test_benchmark_kernel_domain_aliases() -> None:
+    from industrialsim.benchmark import KernelBenchmarkResult, run_kernel_benchmark
+
+    assert KernelBenchmarkResult is SchedulerBenchmarkResult
+    assert run_kernel_benchmark is run_scheduler_benchmark
+
+    rep = run_benchmark(target="kernel", scheduler_events=1_000, repetitions=1)
+    assert rep.kernel is not None
+    assert rep.scheduler is not None
+    assert rep.kernel.target == "scheduler"
+

@@ -348,6 +348,16 @@ def test_cli_benchmark_with_output_dir(tmp_path: Path, capsys: pytest.CaptureFix
     assert data["status"] == "passed"
 
 
+def test_cli_benchmark_kernel_alias(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["benchmark", "--target", "kernel", "--kernel-events", "1000", "--repetitions", "1"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "passed"
+    assert "kernel" in data
+
+
+
 
 
 

@@ -4207,6 +4207,33 @@ class EpisodeEngine:
             configuration=self.cfg.model_dump(mode="json"),
         )
 
+    def configure_branch(
+        self,
+        branch_id: str,
+        random_occurrence_counters: dict[str, int] | None = None,
+    ) -> None:
+        self.decision_coordinator.branch_id = branch_id
+        if random_occurrence_counters is not None:
+            self.random_occurrence_counters = dict(random_occurrence_counters)
+        self.random_stream = SemanticRandomStream(
+            root_seed=self.cfg.seed,
+            occurrence_counters=self.random_occurrence_counters,
+        )
+
+    def form_branch_batch(self, branch_id: str) -> DecisionBatch:
+        batch = self.decision_coordinator.form_batch(
+            time_ns=self.kernel.current_time_ns,
+            observation_builder=lambda req: self._build_observation_for_request(
+                req, self.kernel.current_time_ns
+            ),
+        )
+        if batch is None:
+            raise ValueError("Failed to form Decision Batch from checkpoint pending requests.")
+        return batch.model_copy(update={"branch_id": branch_id})
+
+    def attach_branch_writer(self, writer: RunArtifactWriter) -> None:
+        writer.plugin_metadata.update(self.plugin_metadata)
+
     def _check_runtime_hard_constraints(self) -> None:
         if self.is_aborted or not self.cfg.hard_constraints:
             return
@@ -5064,24 +5091,12 @@ def _execute_single_branch_worker(task: BranchWorkerTask) -> CounterfactualBranc
             telemetry_manager=branch_writer.telemetry_manager if branch_writer is not None else None,
         )
         if branch_writer is not None:
-            branch_writer.plugin_metadata.update(engine.plugin_metadata)
-        engine.decision_coordinator.branch_id = branch_id
-        engine.random_occurrence_counters = dict(cp.random_occurrence_counters)
-        engine.random_stream = SemanticRandomStream(
-            root_seed=engine.cfg.seed,
-            occurrence_counters=engine.random_occurrence_counters,
+            engine.attach_branch_writer(branch_writer)
+        engine.configure_branch(
+            branch_id=branch_id,
+            random_occurrence_counters=cp.random_occurrence_counters,
         )
-
-        batch = engine.decision_coordinator.form_batch(
-            time_ns=engine.kernel.current_time_ns,
-            observation_builder=lambda req: engine._build_observation_for_request(
-                req, engine.kernel.current_time_ns
-            ),
-        )
-        if batch is None:
-            raise ValueError("Failed to form Decision Batch from checkpoint pending requests.")
-
-        batch = batch.model_copy(update={"branch_id": branch_id})
+        batch = engine.form_branch_batch(branch_id=branch_id)
 
         provenance = DecisionProvenance(
             episode_id=batch.episode_id,
