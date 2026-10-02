@@ -123,9 +123,10 @@ class ProjectSession:
         for node in graph['nodes']:
             node.setdefault('input_ports', [])
             node.setdefault('output_ports', [])
-        # JSON numbers cannot carry every Python integer exactly. Editable graph
+        # JSON numbers cannot carry every Python integer exactly. Editable
         # values outside JavaScript's safe range travel as decimal text.
-        for element in [*graph['nodes'], *graph['routes']]:
+        for element in [*graph['nodes'], *graph['routes'],
+                        *config.get('machines', []), *config.get('workers', [])]:
             for field in ('capacity', 'output_capacity', 'transit_time'):
                 value = element.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
@@ -134,6 +135,14 @@ class ProjectSession:
                 value = operation.get('duration')
                 if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
                     operation['duration'] = str(value)
+                requirements = operation.get('required_workers', [])
+                if isinstance(requirements, list):
+                    for requirement in requirements:
+                        if not isinstance(requirement, dict):
+                            continue
+                        count = requirement.get('count')
+                        if isinstance(count, int) and not isinstance(count, bool) and abs(count) > 2**53 - 1:
+                            requirement['count'] = str(count)
         if text is None:
             buffer = StringIO()
             YAML(typ='safe', pure=True).dump(draft, buffer)
@@ -153,9 +162,13 @@ class ProjectSession:
                 return self._rejected(['Open a model before editing'])
             draft = deepcopy(self._draft)
             flow = draft.get('material_flow')
-            if kind not in {'node', 'route'}:
+            if kind not in {'node', 'route', 'machine', 'worker'}:
                 return self._rejected([f"Unknown element kind '{kind}'"])
-            if flow:
+            if kind in {'machine', 'worker'}:
+                collection = 'machines' if kind == 'machine' else 'workers'
+                elements = list(draft.get(collection, []))
+                draft[collection] = elements
+            elif flow:
                 flow = dict(flow)
                 draft['material_flow'] = flow
                 collection = 'routes' if kind == 'route' else 'nodes'
@@ -181,8 +194,14 @@ class ProjectSession:
                     allowed.add('capacity')
                 elif node_kind == 'station':
                     allowed.add('output_capacity')
+            if kind == 'machine':
+                allowed = {'name', 'capacity'}
+            elif kind == 'worker':
+                allowed = {'name', 'kind', 'capacity', 'qualifications'}
             if operation_id is not None:
-                allowed = {'duration'}
+                if kind != 'node':
+                    return self._rejected(['Operations can only be edited on nodes'])
+                allowed = {'duration', 'required_machines', 'required_workers'}
                 element['operations'] = [dict(op) for op in element.get('operations', [])]
                 element = next((op for op in element.get('operations', [])
                                 if op['id'] == operation_id), None)

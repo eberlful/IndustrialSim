@@ -1,14 +1,7 @@
 import { useState } from 'react';
-import type { FlowNode, Model, Route } from './types';
-
-export type ParameterEdit = { kind: 'node' | 'route'; element_id: string; changes: Record<string, unknown>; operation_id?: string };
-// Keep duration text intact: integer YAML durations are nanoseconds, while strings
-// may include units. The authoritative Python validator decides validity.
-function integerOrText(value: string): number | string | null {
-  if (!value.trim()) return null;
-  if (/^-?\d+$/.test(value) && Number.isSafeInteger(Number(value))) return Number(value);
-  return value;
-}
+import type { FlowNode, Model, Operation, Route } from './types';
+import { integerOrText, type ParameterEdit } from './parameterEditing';
+import { OperationResources } from './Resources';
 
 export function Properties({ element, kind, model, busy, edit }: {
   element: FlowNode | Route; kind: 'node' | 'route'; model: Model; busy: boolean;
@@ -20,12 +13,12 @@ export function Properties({ element, kind, model, busy, edit }: {
   const [transit, setTransit] = useState(String(element.transit_time ?? 0));
   const [capabilities, setCapabilities] = useState((element.required_capabilities as string[] | undefined)?.join('\n') ?? '');
   const [pool, setPool] = useState(String(element.pool_id ?? ''));
-  const operations = (element.operations as { id: string; duration: string | number }[] | undefined) ?? [];
+  const operations = (element.operations as Operation[] | undefined) ?? [];
   const [durations, setDurations] = useState<Record<string, string>>(
     Object.fromEntries(operations.map(op => [op.id, String(op.duration)])));
   const index = kind === 'node' ? model.graph.nodes.findIndex(node => node.id === element.id) : model.graph.routes.findIndex(route => route.id === element.id);
   const prefix = model.configuration.material_flow ? `material_flow.${kind === 'node' ? 'nodes' : 'routes'}.${index}` : `stations.${index}`;
-  const errors = model.diagnostics.filter(error => error.includes(element.id) || error.startsWith(prefix + '.') || error.startsWith(prefix + ':'));
+  const errors = model.diagnostics.filter(error => error.includes(element.id) || operations.some(operation => error.includes(`Operation '${operation.id}'`)) || error.startsWith(prefix + '.') || error.startsWith(prefix + ':'));
   async function apply() {
     const changes: Record<string, unknown> = {};
     if (kind === 'route') {
@@ -69,6 +62,7 @@ export function Properties({ element, kind, model, busy, edit }: {
       <label>Duration · {op.id}<input value={durations[op.id]} disabled={busy} onChange={event => setDurations(previous => ({ ...previous, [op.id]: event.target.value }))}/></label>
       <button disabled={busy}>Apply duration · {op.id}</button>
     </form>)}
+    {operations.map(op => <OperationResources key={op.id} operation={op} nodeId={element.id} model={model} busy={busy} edit={edit}/>)}
     <p className="hint">Durations accept units such as 10s or 2m. Bare integers are nanoseconds.</p>
     <details><summary>All element properties</summary><pre>{JSON.stringify(element, null, 2)}</pre></details>
   </>;

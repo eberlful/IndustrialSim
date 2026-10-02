@@ -32,7 +32,7 @@ class ImportModel(BaseModel):
 
 class EditParameters(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    kind: Literal['node', 'route']
+    kind: Literal['node', 'route', 'machine', 'worker']
     element_id: str
     changes: dict[str, Any]
     operation_id: str | None = None

@@ -55,3 +55,7 @@ textarea { display: block; width: 100%; height: 160px; margin-top: 8px; border: 
 .save-panel label { max-width: 600px; }
 .property-form textarea { height: 80px; }
 .property-form small { color: #64748b; font-size: 11px; }
+.resource-selector { display: grid; gap: 5px; }
+.resource-selector select { min-width: 0; width: 100%; }
+.property-form fieldset { min-width: 0; display: grid; gap: 10px; border: 1px solid #ced8e4; border-radius: 5px; padding: 10px; }
+.property-form legend { font-size: 12px; }

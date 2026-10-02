@@ -279,3 +279,93 @@ material_flow:
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
 });
+
+test('edit resources and Operation requirements, correct errors and reload saved YAML', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content').fill(reference);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await expect(page.getByLabel('Hall assignment')).toHaveCount(0);
+  await page.getByLabel('Resource name').fill('Updated welder');
+  await page.getByLabel('Resource capacity').fill('0');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await expect(page.getByLabel('Selected resource diagnostics')).toContainText('capacity');
+  await expect(page.getByRole('button', { name: 'Download YAML' })).toBeDisabled();
+  await page.getByLabel('Resource capacity').fill('2');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByLabel('Resource definition').selectOption('worker:w-body-1');
+  await page.getByLabel('Worker kind').selectOption('pool');
+  await page.getByLabel('Resource capacity').fill('3');
+  await page.getByLabel('Worker qualifications').fill('body_operator\nbackup,weld');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.locator('.react-flow__node').filter({ hasText: 'st-body-1' }).click();
+  const requirements = page.getByRole('form', { name: 'Resource requirements · op-body-weld' });
+  await requirements.getByLabel('Required Machines').selectOption('m-body-welder-2');
+  await requirements.getByLabel('Assigned Worker').selectOption('w-body-1');
+  await requirements.getByLabel('Required qualification').fill('missing-qualification');
+  await requirements.getByRole('button', { name: 'Apply requirements' }).click();
+  await expect(page.getByLabel('Selected element diagnostics')).toContainText('missing-qualification');
+  await expect(page.getByRole('button', { name: 'Save YAML', exact: true })).toBeDisabled();
+  await requirements.getByLabel('Required qualification').fill('body_operator');
+  await requirements.getByLabel('Worker count').fill('2');
+  await requirements.getByRole('button', { name: 'Apply requirements' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByLabel('Save as project path').fill('resource-edits.yaml');
+  await page.getByRole('button', { name: 'Save YAML', exact: true }).click();
+  await expect(page.getByText('Saved: resource-edits.yaml', { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByLabel('Project model').selectOption('resource-edits.yaml');
+  await page.getByRole('button', { name: 'Open model', exact: true }).click();
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await expect(page.getByLabel('Resource name')).toHaveValue('Updated welder');
+  await expect(page.getByLabel('Resource capacity')).toHaveValue('2');
+  await page.getByText('All resource properties', { exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Properties' })).toContainText('condition_threshold');
+  await page.getByLabel('Resource definition').selectOption('worker:w-body-1');
+  await expect(page.getByLabel('Worker kind')).toHaveValue('pool');
+  await expect(page.getByLabel('Worker qualifications')).toHaveValue('body_operator\nbackup,weld');
+  await page.locator('.react-flow__node').filter({ hasText: 'st-body-1' }).click();
+  await expect(requirements.getByLabel('Required Machines')).toHaveValues(['m-body-welder-2']);
+  await expect(requirements.getByLabel('Assigned Worker')).toHaveValue('w-body-1');
+  await expect(requirements.getByLabel('Worker count')).toHaveValue('2');
+});
+
+test('resource forms preserve exact capacities and unchanged Worker counts', async ({ page }) => {
+  const yaml = `
+episode: {end_condition: {type: all_units_terminal}}
+production_units: [{id: unit, variant: sedan}]
+machines: [{id: machine, capacity: 9007199254740993}]
+workers: [{id: worker, kind: pool, capacity: 9007199254740993, qualifications: [weld]}]
+stations:
+  - id: station
+    operations:
+      - id: weld
+        duration: 1s
+        required_workers: [{worker_id: worker, count: 9007199254740993}]
+`;
+  await page.goto('/');
+  await page.getByLabel('YAML content').fill(yaml);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await page.getByLabel('Resource definition').selectOption('machine:machine');
+  await expect(page.getByLabel('Resource capacity')).toHaveValue('9007199254740993');
+  await page.getByLabel('Resource name').fill('Named machine');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await page.getByLabel('Resource definition').selectOption('worker:worker');
+  await expect(page.getByLabel('Resource capacity')).toHaveValue('9007199254740993');
+  await page.locator('.react-flow__node').filter({ hasText: 'station' }).click();
+  await expect(page.getByLabel('Worker count')).toHaveValue('9007199254740993');
+  await page.getByLabel('Required qualification').fill('weld');
+  await page.getByRole('button', { name: 'Apply requirements', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download YAML' }).click();
+  const exported = readFileSync((await (await downloading).path())!, 'utf8');
+  expect(exported).toMatch(/count: '?9007199254740993'?(?:,|\n)/);
+  expect(exported.match(/capacity: 9007199254740993/g)).toHaveLength(2);
+});

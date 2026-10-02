@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Graph, arrangedPositions } from './Graph';
 import { GraphTools, PortEditor, RouteConnections } from './GraphEditing';
-import { Properties, type ParameterEdit } from './Properties';
+import { Properties } from './Properties';
+import { ResourceProperties, resourceDefinitions } from './Resources';
+import type { ParameterEdit } from './parameterEditing';
 import type { FlowNode, Model, Project, Route } from './types';
 import './style.css';
 
@@ -13,7 +15,7 @@ function App() {
   const [name, setName] = useState('Imported YAML');
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const [selection, setSelection] = useState<{ kind: 'node' | 'route'; id: string } | null>(null);
+  const [selection, setSelection] = useState<{ kind: 'node' | 'route' | 'machine' | 'worker'; id: string } | null>(null);
   const [savePath, setSavePath] = useState('plant.yaml');
   const [overwrite, setOverwrite] = useState(false);
   const [saved, setSaved] = useState('');
@@ -51,7 +53,9 @@ function App() {
   const model: Model | null = project.model;
   const selectedElement = selection?.kind === 'node'
     ? model?.graph.nodes.find(node => node.id === selection.id)
-    : model?.graph.routes.find(route => route.id === selection?.id);
+    : selection?.kind === 'route' ? model?.graph.routes.find(route => route.id === selection.id) : undefined;
+  const selectedResource = model && (selection?.kind === 'machine' || selection?.kind === 'worker')
+    ? resourceDefinitions(model, selection.kind).find(resource => resource.id === selection.id) : undefined;
   async function download() {
     setBusy(true);
     try {
@@ -94,8 +98,13 @@ function App() {
         <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
-        <section className="panel"><h2>Properties</h2>{selectedElement && model && selection ? <Properties key={selection.kind + selection.id + model.yaml} element={selectedElement} kind={selection.kind} model={model} busy={busy} edit={(command: ParameterEdit) => load('edit', command)}/> : <p>Select a node or route in the graph.</p>}
-          {selectedElement && model && model.configuration.material_flow != null && selection && <>
+        <section className="panel" aria-label="Properties"><h2>Properties</h2>{model && <label className="resource-selector">Resource definition<select disabled={busy} value={selectedResource && selection ? `${selection.kind}:${selection.id}` : ''} onChange={event => {
+          const value = event.target.value;
+          if (!value) setSelection(null);
+          else { const colon = value.indexOf(':'); setSelection({ kind: value.slice(0, colon) as 'machine' | 'worker', id: value.slice(colon + 1) }); }
+        }}><option value="">Choose a Machine or Worker…</option>{(['machine', 'worker'] as const).map(kind => <optgroup key={kind} label={kind === 'machine' ? 'Machines' : 'Workers'}>{resourceDefinitions(model, kind).map(resource => <option key={resource.id} value={`${kind}:${resource.id}`}>{resource.name ?? resource.id} ({resource.id})</option>)}</optgroup>)}</select></label>}
+          {selectedResource && model && selection && (selection.kind === 'machine' || selection.kind === 'worker') && <ResourceProperties key={selection.kind + selection.id + model.yaml} resource={selectedResource} kind={selection.kind} model={model} busy={busy} edit={command => load('edit', command)}/>}{selectedElement && model && selection && (selection.kind === 'node' || selection.kind === 'route') ? <Properties key={selection.kind + selection.id + model.yaml} element={selectedElement} kind={selection.kind} model={model} busy={busy} edit={(command: ParameterEdit) => load('edit', command)}/> : !selectedResource && <p>Select a node or route in the graph, or choose a resource.</p>}
+          {selectedElement && model && model.configuration.material_flow != null && selection && (selection.kind === 'node' || selection.kind === 'route') && <>
             {selection.kind === 'node' ? <PortEditor key={`ports:${selectedElement.id}:${model.yaml}`} node={selectedElement as FlowNode} busy={busy} command={command => load('structure', command)}/>
               : <RouteConnections key={`connection:${selectedElement.id}:${model.yaml}`} model={model} route={selectedElement as Route} busy={busy} command={command => load('structure', command)}/>}
             <button disabled={busy} onClick={() => void load('structure', { action: 'delete', kind: selection.kind, element_id: selection.id })}>Delete {selection.kind}</button>
