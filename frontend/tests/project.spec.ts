@@ -197,3 +197,85 @@ test('move, group, undo and reopen a separately saved layout', async ({ page }) 
   await expect(page.locator('.display-group-label').filter({ hasText: 'Area:' }).first()).toBeVisible();
   await expect(page.locator('.react-flow__edge')).toHaveCount(16);
 });
+
+test('save an unconnected Station draft, reopen, connect and export', async ({ page }) => {
+  const yaml = `
+seed: 42
+episode:
+  end_condition: {type: all_units_terminal}
+production_units: [{id: unit-1, variant: sedan, source_id: source}]
+material_flow:
+  nodes:
+    - id: source
+      kind: source
+      output_ports: [{id: out, direction: output, port_type: body}]
+    - id: sink
+      kind: sink
+      input_ports: [{id: in, direction: input, port_type: body}]
+  routes:
+    - {id: direct, source_node_id: source, source_port_id: out, target_node_id: sink, target_port_id: in, transit_time: 3s}
+`;
+  await page.goto('/');
+  await page.getByLabel('YAML content').fill(yaml);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByLabel('New node ID').fill('new-station');
+  await page.getByLabel('Node type').selectOption('station');
+  await page.getByRole('button', { name: 'Add node', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByRole('alert')).toContainText('new-station');
+  await expect(page.getByRole('alert')).toContainText('disconnected');
+  await expect(page.getByRole('button', { name: 'Download YAML' })).toBeDisabled();
+  await page.getByLabel('Draft filename').fill('unfinished-station.json');
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved: unfinished-station.json', { exact: true })).toBeVisible();
+  // Leave the draft before reopening it from disk, rather than just reconnecting.
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.reload();
+  await page.getByLabel('Saved draft').selectOption('unfinished-station.json');
+  await page.getByRole('button', { name: 'Open draft', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByRole('alert')).toContainText('new-station');
+  await expect(page.locator('.react-flow__node-plant')).toHaveCount(3);
+  await page.getByText('Create directed route', { exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Graph editing' });
+  await editor.getByLabel('New route ID').fill('incoming');
+  await editor.getByLabel('Source node').selectOption('source');
+  await editor.getByLabel('Target node').selectOption('new-station');
+  await editor.getByRole('button', { name: 'Add route', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await editor.getByLabel('New route ID').fill('outgoing');
+  await editor.getByLabel('Source node').selectOption('new-station');
+  await editor.getByLabel('Target node').selectOption('sink');
+  await editor.getByRole('button', { name: 'Add route', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await expect(page.locator('.react-flow__edge')).toHaveCount(3);
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download YAML' }).click();
+  const download = await downloading;
+  const exported = readFileSync((await download.path())!, 'utf8');
+  expect(exported).toContain('new-station');
+  expect(exported).toContain('transit_time: 3s');
+  await page.getByLabel('YAML content').fill(exported);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await expect(page.locator('.react-flow__node-plant')).toHaveCount(3);
+  await page.locator('.react-flow__node-plant').filter({ hasText: 'new-station' }).locator('small').first().click();
+  const ports = page.getByRole('form', { name: 'Typed Ports' });
+  await ports.getByLabel('Port type', { exact: true }).first().fill('painted-body');
+  await ports.getByRole('button', { name: 'Apply Ports', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByLabel('Selected element diagnostics')).toContainText('Incompatible port types');
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByRole('button', { name: 'Delete node', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByRole('alert')).toContainText('incoming');
+  await expect(page.getByRole('alert')).toContainText('missing node');
+  await page.getByText('All routes (3)', { exact: true }).click();
+  await editor.getByRole('button', { name: 'Inspect incoming', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'incoming', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+});

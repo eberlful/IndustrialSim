@@ -38,6 +38,14 @@ class EditParameters(BaseModel):
     operation_id: str | None = None
 
 
+class EditStructure(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['add', 'update', 'delete']
+    kind: Literal['node', 'route']
+    element_id: str
+    changes: dict[str, Any] = {}
+
+
 class EditLayout(BaseModel):
     model_config = ConfigDict(extra='forbid')
     positions: dict[str, Any] | None = None
@@ -75,7 +83,7 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
 
     @app.get('/api/project')
     def project() -> dict[str, Any]:
-        return {**session.snapshot(), 'models': session.models()}
+        return {**session.snapshot(), 'models': session.models(), 'drafts': session.drafts()}
 
     @app.post('/api/project/open')
     def open_model(body: OpenModel) -> JSONResponse:
@@ -91,6 +99,21 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
     def edit_parameters(body: EditParameters) -> JSONResponse:
         result = session.edit_parameters(body.kind, body.element_id, body.changes,
                                          operation_id=body.operation_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/structure')
+    def edit_structure(body: EditStructure) -> JSONResponse:
+        result = session.edit_structure(body.action, body.kind, body.element_id, body.changes)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/draft/save')
+    def save_draft(body: SaveModel) -> JSONResponse:
+        result = session.save_draft(body.path, overwrite=body.overwrite)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/draft/open')
+    def open_draft(body: OpenModel) -> JSONResponse:
+        result = session.open_draft(body.path)
         return JSONResponse(result, status_code=200 if result['accepted'] else 422)
 
     @app.post('/api/project/layout')

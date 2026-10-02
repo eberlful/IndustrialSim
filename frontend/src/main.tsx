@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Graph, arrangedPositions } from './Graph';
+import { GraphTools, PortEditor, RouteConnections } from './GraphEditing';
 import { Properties, type ParameterEdit } from './Properties';
-import type { Model, Project } from './types';
+import type { FlowNode, Model, Project, Route } from './types';
 import './style.css';
 
 function App() {
@@ -16,11 +17,15 @@ function App() {
   const [savePath, setSavePath] = useState('plant.yaml');
   const [overwrite, setOverwrite] = useState(false);
   const [saved, setSaved] = useState('');
+  const [draftName, setDraftName] = useState('work.json');
+  const [draftPath, setDraftPath] = useState('');
+  const [draftOverwrite, setDraftOverwrite] = useState(false);
+  const [draftSaved, setDraftSaved] = useState('');
   useEffect(() => {
     fetch('/api/project').then(async (response) => {
       if (!response.ok) throw new Error(`Project request failed (${response.status})`);
       return response.json() as Promise<Project>;
-    }).then((result) => { setProject(result); setPath(result.models?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); })
+    }).then((result) => { setProject(result); setPath(result.models?.[0] ?? ''); setDraftPath(result.drafts?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); })
       .catch((error: Error) => setDiagnostics([error.message]));
   }, []);
   async function load(endpoint: string, body: object) {
@@ -30,9 +35,11 @@ function App() {
       const result: Project = await response.json();
       if (result.accepted) {
         setProject((previous) => ({ ...previous, ...result }));
-        if (endpoint === 'open' || endpoint === 'import') setSelection(null);
+        if (endpoint === 'open' || endpoint === 'import' || endpoint === 'draft/open') setSelection(null);
         if (endpoint !== 'save') setSaved('');
         setDiagnostics(result.diagnostics ?? []);
+        if (result.saved_draft) { setDraftSaved(`Draft saved: ${result.saved_draft}`); setDraftPath(result.saved_draft); setDraftOverwrite(false); }
+        else setDraftSaved('');
         if (result.saved_path) { setSaved(`Saved: ${result.saved_path}`); setPath(result.saved_path); setOverwrite(false); }
       } else {
         setDiagnostics(result.diagnostics ?? [`Request failed (${response.status}). Check the YAML and retry.`]);
@@ -79,7 +86,7 @@ function App() {
       <button disabled={busy || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
       <button disabled={busy || !model?.valid} onClick={() => void download()}>Download YAML</button>
     </section>
-    {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Saving and executable export require a valid draft.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
+    {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
     <div className="workspace">
       <section className="graph-panel" aria-label="Material Flow Graph">
         <div className="panel-title"><h2>Material Flow Graph</h2><span>{model ? `${model.graph.nodes.length} nodes · ${model.graph.routes.length} routes` : 'No topology yet'}</span></div>
@@ -87,7 +94,15 @@ function App() {
         <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
-        <section className="panel"><h2>Properties</h2>{selectedElement && model && selection ? <Properties key={selection.kind + selection.id + model.yaml} element={selectedElement} kind={selection.kind} model={model} busy={busy} edit={(command: ParameterEdit) => load('edit', command)}/> : <p>Select a node or route in the graph.</p>}</section>
+        <section className="panel"><h2>Properties</h2>{selectedElement && model && selection ? <Properties key={selection.kind + selection.id + model.yaml} element={selectedElement} kind={selection.kind} model={model} busy={busy} edit={(command: ParameterEdit) => load('edit', command)}/> : <p>Select a node or route in the graph.</p>}
+          {selectedElement && model && model.configuration.material_flow != null && selection && <>
+            {selection.kind === 'node' ? <PortEditor key={`ports:${selectedElement.id}:${model.yaml}`} node={selectedElement as FlowNode} busy={busy} command={command => load('structure', command)}/>
+              : <RouteConnections key={`connection:${selectedElement.id}:${model.yaml}`} model={model} route={selectedElement as Route} busy={busy} command={command => load('structure', command)}/>}
+            <button disabled={busy} onClick={() => void load('structure', { action: 'delete', kind: selection.kind, element_id: selection.id })}>Delete {selection.kind}</button>
+            <p className="hint">References are retained and reported for correction. Undo restores the element.</p>
+          </>}
+        </section>
+        {model && <section className="panel" aria-label="Graph editing"><h2>Graph editing</h2><GraphTools model={model} busy={busy} command={command => load('structure', command)} select={route => setSelection({ kind: 'route', id: route.id })}/></section>}
         <section className="panel" aria-label="Episode controls"><h2>Episode</h2><p>○ Not started</p><button disabled>Start Episode</button><p className="hint">Execution controls will be available in a subsequent implementation issue.</p>{model && <details><summary>Loaded Episode inputs</summary><pre>{JSON.stringify({ seed: model.configuration.seed, episode: model.configuration.episode }, null, 2)}</pre></details>}</section>
         <section className="panel"><h2>Plant organization</h2><p className="hint">Area and Hall locations are separate from material flow.</p>{model?.plant ? <><h3>{model.plant.name}</h3>{model.plant.areas.map((area) => <details key={area.id}><summary>{area.name}</summary><ul>{area.halls.map((hall) => <li key={hall.id}>{hall.name} <small>({hall.id})</small></li>)}</ul></details>)}</> : <p>No Plant hierarchy declared.</p>}</section>
       </aside>
@@ -99,6 +114,17 @@ function App() {
       <button disabled={busy || !model.valid || !savePath.trim()} onClick={() => void load('save', { path: savePath, overwrite })}>Save YAML</button>
       {saved && <p>{saved}</p>}
     </section>}
+    <section className="import-panel save-panel" aria-label="Project drafts">
+      <h2>Incomplete drafts</h2><p>Save unfinished work separately, including validation errors and presentation.</p>
+      <label>Draft filename<input value={draftName} disabled={busy} onChange={event => { setDraftName(event.target.value); setDraftOverwrite(false); setDraftSaved(''); }}/></label>
+      <label><input type="checkbox" checked={draftOverwrite} disabled={busy} onChange={event => setDraftOverwrite(event.target.checked)}/>Overwrite existing draft</label>
+      <button disabled={busy || !model || !draftName.trim()} onClick={() => void load('draft/save', { path: draftName, overwrite: draftOverwrite })}>Save draft</button>
+      <label>Saved draft<select value={draftPath} disabled={busy} onChange={event => setDraftPath(event.target.value)}>
+        <option value="">Choose a draft…</option>{project.drafts?.map(file => <option key={file}>{file}</option>)}
+      </select></label>
+      <button disabled={busy || !draftPath} onClick={() => void load('draft/open', { path: draftPath })}>Open draft</button>
+      {draftSaved && <p>{draftSaved}</p>}
+    </section>
     <details className="import-panel" open><summary>Import simulation YAML</summary>
       <p>Imports are validated in memory. Original files are preserved.</p>
       <label>YAML file <input type="file" accept=".yaml,.yml,text/yaml" disabled={busy} onChange={async (event) => {

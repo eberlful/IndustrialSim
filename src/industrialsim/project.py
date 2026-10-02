@@ -15,6 +15,26 @@ from typing import Any
 from ruamel.yaml import YAML
 
 from industrialsim.application import validate_config
+from industrialsim.project_graph import check_graph_shape, graph_diagnostics
+
+
+def _atomic_write(path: Path, text: str, *, overwrite: bool) -> None:
+    """Publish a complete file, with exclusive creation unless overwrite is explicit."""
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                prefix='.industrialsim-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class ProjectSession:
@@ -89,10 +109,11 @@ class ProjectSession:
                 warnings.append(f'Layout could not be restored; using initial arrangement: {exc}')
             self._undo.clear()
             self._redo.clear()
-            return {**self.snapshot(), 'accepted': True, 'diagnostics': warnings}
+            return {**self.snapshot(), 'accepted': True, 'diagnostics': [*self._model['diagnostics'], *warnings]}
 
     def _set_draft(self, draft: dict[str, Any], name: str, text: str | None = None) -> None:
         result = validate_config(draft)
+        errors = list(dict.fromkeys([*result.errors, *graph_diagnostics(draft)]))
         config = result.config.model_dump(mode='json') if result.config else deepcopy(draft)
         flow = config.get('material_flow')
         graph = deepcopy(flow) if flow else {
@@ -121,7 +142,7 @@ class ProjectSession:
         layout = deepcopy(self._model['layout']) if self._model else {'positions': {}, 'grouping': 'none'}
         self._model = {'layout': layout, 'name': name, 'yaml': text, 'configuration': config,
                        'graph': graph, 'plant': config.get('plant'),
-                       'valid': result.is_valid, 'diagnostics': result.errors}
+                       'valid': result.is_valid and not errors, 'diagnostics': errors}
 
     def edit_parameters(
         self, kind: str, element_id: str, changes: dict[str, Any],
@@ -178,6 +199,130 @@ class ProjectSession:
             self._set_draft(draft, self._model['name'])
             return {**self.snapshot(), 'accepted': True}
 
+    def edit_structure(
+        self, action: str, kind: str, element_id: str, changes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add, update or delete one graph element without cascading references."""
+        with self._lock:
+            if self._model is None or self._draft is None:
+                return self._rejected(['Open a model before editing'])
+            if action not in {'add', 'update', 'delete'} or kind not in {'node', 'route'}:
+                return self._rejected(['Unknown structural command'])
+            if not isinstance(element_id, str) or not element_id.strip():
+                return self._rejected(['Provide a nonempty element ID'])
+            if not self._draft.get('material_flow'):
+                return self._rejected(['Structural editing requires a material_flow model'])
+            changes = deepcopy(changes or {})
+            allowed = ({'kind'} if action == 'add' and kind == 'node' else
+                       {'input_ports', 'output_ports'} if kind == 'node' else
+                       {'source_node_id', 'source_port_id', 'target_node_id', 'target_port_id'})
+            if set(changes) - allowed or (action == 'delete' and changes):
+                return self._rejected(['Unsupported structural properties'])
+            draft = deepcopy(self._draft)
+            # Detach lists and the edited mapping from any YAML aliases.
+            flow = dict(draft['material_flow'])
+            draft['material_flow'] = flow
+            collection = 'nodes' if kind == 'node' else 'routes'
+            elements = list(flow.get(collection, []))
+            flow[collection] = elements
+            index = next((i for i, item in enumerate(elements) if item['id'] == element_id), None)
+            if action == 'add':
+                if index is not None:
+                    return self._rejected([f'{kind} {element_id!r} already exists'])
+                if kind == 'node':
+                    node_kind = changes.get('kind')
+                    element: dict[str, Any] = {'id': element_id, 'kind': node_kind}
+                    if node_kind != 'source':
+                        element['input_ports'] = [{'id': 'in', 'port_type': 'body', 'direction': 'input'}]
+                    if node_kind != 'sink':
+                        element['output_ports'] = [{'id': 'out', 'port_type': 'body', 'direction': 'output'}]
+                    if node_kind == 'station':
+                        element['operations'] = [{'id': f'op-{element_id}', 'duration': '1s'}]
+                    if node_kind == 'buffer':
+                        element['capacity'] = 1
+                else:
+                    element = {'id': element_id, 'transit_time': 0, **changes}
+                elements.append(element)
+            else:
+                if index is None:
+                    return self._rejected([f'Unknown {kind} {element_id!r}'])
+                if action == 'delete':
+                    elements.pop(index)
+                else:
+                    elements[index] = {**elements[index], **changes}
+            try:
+                check_graph_shape(draft)
+            except (ValueError, TypeError) as exc:
+                return self._rejected([str(exc)])
+            self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
+            self._redo.clear()
+            self._set_draft(draft, self._model['name'])
+            if action == 'delete' and kind == 'node':
+                self._model['layout']['positions'].pop(element_id, None)
+            return {**self.snapshot(), 'accepted': True}
+
+    def drafts(self) -> list[str]:
+        with self._lock:
+            root = self.directory / '.drafts'
+            if not root.resolve().is_relative_to(self.directory):
+                return []
+            return sorted(path.name for path in root.glob('*.json')
+                          if path.is_file() and path.resolve().is_relative_to(root.resolve()))
+
+    def _draft_path(self, name: str) -> Path:
+        if Path(name).name != name or not name.endswith('.json'):
+            raise ValueError('Use a draft filename ending in .json')
+        root = self.directory / '.drafts'
+        path = root / name
+        if not root.resolve().is_relative_to(self.directory) or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError('Drafts must stay inside the project draft directory')
+        return path
+
+    def save_draft(self, name: str, *, overwrite: bool = False) -> dict[str, Any]:
+        """Save incomplete configuration and presentation as a project draft."""
+        with self._lock:
+            if self._model is None:
+                return self._rejected(['Open a model before saving a draft'])
+            try:
+                path = self._draft_path(name)
+                path.parent.mkdir(exist_ok=True)
+                document = {'version': 1, 'kind': 'industrialsim-project-draft',
+                            'name': self._model['name'], 'yaml': self._model['yaml'],
+                            'layout': self._model['layout'], 'layout_identity': self._layout_identity}
+                _atomic_write(path, json.dumps(document, allow_nan=False), overwrite=overwrite)
+                return {**self.snapshot(), 'accepted': True, 'saved_draft': name, 'drafts': self.drafts()}
+            except (OSError, ValueError) as exc:
+                return self._rejected([f'Could not save draft: {exc}'])
+
+    def open_draft(self, name: str) -> dict[str, Any]:
+        """Restore an editable document transactionally, retaining validation errors."""
+        with self._lock:
+            previous = (deepcopy(self._draft), deepcopy(self._model), self._layout_identity)
+            try:
+                document = json.loads(self._draft_path(name).read_text(encoding='utf-8'))
+                if document['version'] != 1 or document['kind'] != 'industrialsim-project-draft':
+                    raise ValueError('Unsupported draft format')
+                if not isinstance(document['name'], str) or not isinstance(document['yaml'], str):
+                    raise ValueError('Draft name and YAML must be text')
+                identity = document['layout_identity']
+                if not isinstance(identity, str) or len(identity) != 64 or any(c not in '0123456789abcdef' for c in identity):
+                    raise ValueError('Invalid draft layout identity')
+                draft = YAML(typ='safe', pure=True).load(document['yaml'])
+                if not isinstance(draft, dict):
+                    raise ValueError('Draft configuration must be a mapping')
+                check_graph_shape(draft)
+                self._set_draft(draft, document['name'], document['yaml'])
+                self._validate_layout(document['layout'])
+                assert self._model is not None
+                self._model['layout'] = document['layout']
+                self._layout_identity = identity
+            except Exception as exc:
+                self._draft, self._model, self._layout_identity = previous
+                return self._rejected([f'Could not open draft: {exc}'])
+            self._undo.clear()
+            self._redo.clear()
+            return {**self.snapshot(), 'accepted': True}
+
     def undo(self) -> dict[str, Any]:
         with self._lock:
             return self._restore(self._undo, self._redo)
@@ -201,8 +346,9 @@ class ProjectSession:
             if self._model is None or self._draft is None:
                 return self._rejected(['Open a model before exporting'])
             result = validate_config(self._draft)
-            if not result.is_valid:
-                return self._rejected(result.errors)
+            errors = list(dict.fromkeys([*result.errors, *graph_diagnostics(self._draft)]))
+            if not result.is_valid or errors:
+                return self._rejected(errors)
             return {'accepted': True, 'diagnostics': [], 'yaml': self._model['yaml']}
 
     def save_model(self, relative_path: str, *, overwrite: bool = False) -> dict[str, Any]:
@@ -210,7 +356,6 @@ class ProjectSession:
             exported = self.export_yaml()
             if not exported['accepted']:
                 return exported
-            temporary: Path | None = None
             try:
                 if Path(relative_path).is_absolute():
                     raise ValueError('Save with a project-relative YAML path')
@@ -221,17 +366,7 @@ class ProjectSession:
                     raise ValueError('Save to a .yaml or .yml file')
                 if path.exists() and not overwrite:
                     raise ValueError('File already exists. Explicitly enable overwrite or choose a new filename.')
-                with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
-                                        prefix='.industrialsim-', delete=False) as stream:
-                    temporary = Path(stream.name)
-                    stream.write(exported['yaml'])
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if overwrite:
-                    os.replace(temporary, path)
-                else:
-                    # Exclusive creation also protects against a concurrent save.
-                    os.link(temporary, path)
+                _atomic_write(path, exported['yaml'], overwrite=overwrite)
                 assert self._model is not None
                 self._layout_identity = self._identity(str(path.relative_to(self.directory)), self._model['configuration'])
                 layout_result = self.save_layout()
@@ -239,9 +374,6 @@ class ProjectSession:
                         'diagnostics': layout_result['diagnostics']}
             except (OSError, ValueError) as exc:
                 return self._rejected([str(exc)])
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _identity(name: str, configuration: dict[str, Any]) -> str:
@@ -299,25 +431,15 @@ class ProjectSession:
         with self._lock:
             if self._model is None:
                 return self._rejected(['Open a model before saving layout'])
-            temporary: Path | None = None
             try:
                 path = self._layout_path()
                 path.parent.mkdir(exist_ok=True)
                 document = {'version': 1, 'model_identity': self._layout_identity,
                             'layout': self._model['layout']}
-                with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
-                                        prefix='.layout-', delete=False) as stream:
-                    temporary = Path(stream.name)
-                    json.dump(document, stream, allow_nan=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
+                _atomic_write(path, json.dumps(document, allow_nan=False), overwrite=True)
                 return {**self.snapshot(), 'accepted': True}
             except (OSError, ValueError) as exc:
                 return self._rejected([f'Could not save layout: {exc}'])
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
 
     def _rejected(self, diagnostics: list[str]) -> dict[str, Any]:
         return {**self.snapshot(), "accepted": False, "diagnostics": diagnostics}

@@ -12,7 +12,7 @@ function MaterialNode({ data }: NodeProps<PlantNode>) {
     <strong>{node.id}</strong>
     {node.hall_id && <span className="hall">Hall: {node.hall_id}</span>}
     <div className="ports">
-      {[...node.input_ports, ...node.output_ports].map((port) => <div key={`${port.direction}:${port.id}`} className={`port ${port.direction}`}>
+      {[...node.input_ports, ...node.output_ports].map((port, index) => <div key={`${index}:${port.direction}:${port.id}`} className={`port ${port.direction}`}>
         <Handle id={`${port.direction}:${port.id}`} type={port.direction === 'input' ? 'target' : 'source'}
           position={port.direction === 'input' ? Position.Left : Position.Right} isConnectable={false}/>
         <span>{port.direction === 'input' ? '→' : '↗'} {port.id} · {port.port_type}</span>
@@ -89,7 +89,12 @@ export function Graph({ model, onSelect, onMove, busy }: { model: Model; onSelec
     setNodes([...backgrounds, ...material]);
   }, [model, setNodes]);
   const lanes = new Map<string, number>();
-  const edges: MaterialEdge[] = model.graph.routes.map((route) => {
+  const edges: MaterialEdge[] = model.graph.routes.filter(route => {
+    const source = model.graph.nodes.find(node => node.id === route.source_node_id);
+    const target = model.graph.nodes.find(node => node.id === route.target_node_id);
+    return source?.output_ports.some(port => port.id === route.source_port_id)
+      && target?.input_ports.some(port => port.id === route.target_port_id);
+  }).map((route) => {
     const pair = JSON.stringify([route.source_node_id, route.target_node_id]);
     const lane = lanes.get(pair) ?? 0;
     lanes.set(pair, lane + 1);
