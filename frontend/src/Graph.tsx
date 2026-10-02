@@ -1,15 +1,19 @@
 import { useEffect } from 'react';
 import { ReactFlow, Background, Controls, Handle, Position, BaseEdge, EdgeLabelRenderer, MarkerType, useNodesState,
   type Node, type NodeProps, type Edge, type EdgeProps } from '@xyflow/react';
-import type { FlowNode, Layout, Model, Route } from './types';
+import type { FlowNode, Layout, Model, Route, Observation, LiveNode } from './types';
 import '@xyflow/react/dist/style.css';
+import { resourcesAtNode } from './episodeResources';
 
-type PlantNode = Node<{ model: FlowNode }, 'plant'>;
+type PlantNode = Node<{ model: FlowNode; live?: LiveNode; resources?: string }, 'plant'>;
 function MaterialNode({ data }: NodeProps<PlantNode>) {
   const node = data.model;
   return <article className={`material-node ${node.kind}`}>
     <small>{node.kind === 'station' ? 'Station' : node.kind === 'buffer' ? 'Buffer' : node.kind}</small>
     <strong>{node.id}</strong>
+    {data.live && <span className="occupancy">Occupancy: {data.live.occupancy}{data.live.capacity != null ? ` / ${data.live.capacity}` : ''}
+      {data.live.busy ? ' · busy' : ''}{data.live.blocked ? ' · blocked' : ''}</span>}
+    {data.resources && <span>{data.resources}</span>}
     {node.hall_id && <span className="hall">Hall: {node.hall_id}</span>}
     <div className="ports">
       {[...node.input_ports, ...node.output_ports].map((port, index) => <div key={`${index}:${port.direction}:${port.id}`} className={`port ${port.direction}`}>
@@ -65,7 +69,7 @@ export function arrangedPositions(model: Model, grouping: Layout['grouping']) {
 }
 const edgeTypes = { route: MaterialRoute };
 
-export function Graph({ model, onSelect, onMove, busy }: { model: Model; onSelect: (value: FlowNode | Route) => void;
+export function Graph({ model, onSelect, onMove, busy, observation }: { observation?: Observation | null; model: Model; onSelect: (value: FlowNode | Route) => void;
   onMove: (positions: Layout['positions']) => void; busy: boolean }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   useEffect(() => {
@@ -88,6 +92,15 @@ export function Graph({ model, onSelect, onMove, busy }: { model: Model; onSelec
     }
     setNodes([...backgrounds, ...material]);
   }, [model, setNodes]);
+  useEffect(() => {
+    setNodes(current => current.map(node => {
+      if (node.type !== 'plant') return node;
+      const live = observation?.stations[node.id] ?? observation?.buffers[node.id];
+      const resources = resourcesAtNode(observation, node.id).map(({ resource }) =>
+        `${resource.id}: ${resource.failed ? 'failed' : resource.in_maintenance ? 'maintenance' : `${resource.available_capacity}/${resource.capacity} available`}`).join(' · ');
+      return { ...node, data: { ...node.data, live, resources } };
+    }));
+  }, [observation, model, setNodes]);
   const lanes = new Map<string, number>();
   const edges: MaterialEdge[] = model.graph.routes.filter(route => {
     const source = model.graph.nodes.find(node => node.id === route.source_node_id);

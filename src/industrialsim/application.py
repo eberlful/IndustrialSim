@@ -4729,6 +4729,63 @@ class EpisodeSession:
         """Return an isolated observation without advancing or recording outcomes."""
         return deepcopy(self._summary)
 
+    def observe(self) -> dict[str, Any]:
+        """Project authoritative entity state at the last settled boundary.
+
+        History is paged separately. Resource reads never integrate metrics
+        or health into the live engine.
+        """
+        engine = self._engine
+        now = self._summary.simulated_time_ns
+        stations = {}
+        for station in engine.stations.values():
+            unit_ids = list(dict.fromkeys([
+                *([station.current_unit_id] if station.current_unit_id else []),
+                *([station.blocked_unit_id] if station.blocked_unit_id else []),
+                *station.output_buffer,
+            ]))
+            stations[station.id] = {
+                'id': station.id, 'occupancy': len(unit_ids), 'unit_ids': unit_ids,
+                'busy': station.is_busy, 'blocked': station.is_blocked,
+                'reconfiguring': station.is_reconfiguring,
+                'machine_ids': sorted({mid for op in station.operations.values() for mid in op.required_machines}),
+            }
+        resources = {}
+        for kind, collection in (('machines', engine.machines), ('workers', engine.workers)):
+            resources[kind] = {
+                resource.id: {
+                    'id': resource.id, 'capacity': resource.capacity,
+                    'available_capacity': resource.available_capacity(now),
+                    'on_shift': resource.is_on_shift(now), 'on_break': resource.is_on_break(now),
+                    'allocations': deepcopy(resource.active_allocations),
+                    **({'failed': resource.is_failed, 'in_maintenance': resource.is_in_maintenance,
+                        'health': resource.health, 'operating_mode': resource.operating_mode}
+                       if isinstance(resource, Machine) else {}),
+                } for resource in collection.values()
+            }
+        return {
+            'simulated_time_ns': str(now), 'stations': stations,
+            'graph': (engine.cfg.material_flow.model_dump(mode='json') if engine.cfg.material_flow else {
+                'nodes': [{**s.model_dump(mode='json'), 'kind': 'station',
+                           'input_ports': [], 'output_ports': []} for s in engine.cfg.stations],
+                'routes': [],
+            }),
+            'plant': engine.cfg.plant.model_dump(mode='json') if engine.cfg.plant else None,
+            'buffers': {b.id: {'id': b.id, 'capacity': b.capacity, 'occupancy': len(b.occupants),
+                               'unit_ids': list(b.occupants)} for b in engine.buffers.values()},
+            **resources,
+            'production_units': {u.id: {'id': u.id, 'variant': u.variant, 'state': str(u.state),
+                                       'location': u.location, 'quality_state': u.quality_state,
+                                       'process_step_index': u.process_step_index,
+                                       'findings': [f.to_dict() for f in u.findings]}
+                                 for u in engine.units.values()},
+            'raw_metrics': deepcopy(self._summary.raw_metrics),
+        }
+
+    def events(self, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Read ordered audit records; reads do not advance or finalize."""
+        return self._engine.audit_logger.page(cursor, limit)
+
     def advance(
         self, until_time_ns: int | None = None, pause_at_decision_batch: bool = False,
         max_events: int | None = None,

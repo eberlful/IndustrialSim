@@ -1,16 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 
-type Episode = {
-  id: string; state: 'running' | 'finished' | 'failed' | 'interrupted'; provider: string;
-  seed: string; result_path: string; simulated_time_ns: string; events_processed: number;
-  diagnostics: string[];
-  summary: { status: string; result_hash: string; raw_metrics: Record<string, number>; reward: number | null } | null;
-};
+import type { Episode } from './types';
+
 type Response = { episode: Episode | null; accepted?: boolean; diagnostics?: string[] };
 
-export function EpisodeControl({ canStart }: { canStart: boolean }) {
-  const [episode, setEpisode] = useState<Episode | null>(null);
-  const [starting, setStarting] = useState(false);
+export function EpisodeControl({ canStart, episode, onChange: setEpisode }: { canStart: boolean; episode: Episode | null; onChange: (episode: Episode | null) => void }) {
+  const [pending, setStarting] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
   const revision = useRef(0);
@@ -33,27 +28,30 @@ export function EpisodeControl({ canStart }: { canStart: boolean }) {
     }
     void poll();
     return () => { disposed = true; controller.abort(); clearTimeout(timer); };
-  }, []);
-  async function start() {
+  }, [setEpisode]);
+  async function command(action: 'start' | 'pause' | 'continue') {
     revision.current += 1;
     setStarting(true); setErrors([]);
     try {
-      const response = await fetch('/api/episode/start', { method: 'POST' });
+      const response = await fetch(`/api/episode/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: action === 'start' ? undefined : JSON.stringify({ episode_id: episode?.id }) });
       const result: Response = await response.json();
       setEpisode(result.episode);
-      if (!response.ok || !result.accepted) setErrors(result.diagnostics ?? ['Episode start was rejected.']);
-    } catch { setErrors(['Could not reach the service to start the Episode.']); }
+      if (!response.ok || !result.accepted) setErrors(result.diagnostics ?? ['Episode command was rejected.']);
+    } catch { setErrors(['Could not reach the service to control the Episode.']); }
     finally { revision.current += 1; setStarting(false); }
   }
   return <section className="import-panel" aria-label="Episode execution">
     <h2>Episode execution</h2>
     <p>Decision Provider: Baseline</p>
-    <button disabled={!canStart || !connected || starting || episode?.state === 'running'} onClick={() => void start()}>Start Episode</button>
-    <p aria-live="polite" aria-label="Episode status">{starting ? 'Starting Episode…' : !connected ? 'Connecting to Episode service…' : episode ? `${episode.state === 'running' ? '◷ Running' : episode.state === 'finished' ? `✓ ${episode.summary?.status}` : `⚠ ${episode.state}`} · ${episode.id}` : '○ Not started'}</p>
+    <button disabled={!canStart || !connected || pending || ['running', 'pausing', 'paused'].includes(episode?.state ?? '')} onClick={() => void command('start')}>Start Episode</button>
+    <button disabled={!connected || pending || episode?.state !== 'running'} onClick={() => void command('pause')}>Pause Episode</button>
+    <button disabled={!connected || pending || episode?.state !== 'paused'} onClick={() => void command('continue')}>Continue Episode</button>
+    <p aria-live="polite" aria-label="Episode status">{pending ? 'Applying Episode command…' : !connected ? 'Connecting to Episode service…' : episode ? `${episode.state === 'running' ? '◷ Running' : episode.state === 'pausing' ? '◷ Pausing' : episode.state === 'paused' ? 'Ⅱ Paused' : episode.state === 'finished' ? `✓ ${episode.summary?.status}` : `⚠ ${episode.state}`} · ${episode.id}` : '○ Not started'}</p>
     <p className="hint">The local service runs independently of this browser. Plant and setup edits apply to the next Episode. Execution requires applied, valid configuration.</p>
     {errors.length > 0 && <ul role="alert">{errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
     {episode && <>
       <p>Frozen seed: {episode.seed} · Simulated time: {episode.simulated_time_ns} ns · Events processed: {episode.events_processed}</p>
+      <p>Wall-clock elapsed: {episode.wall_clock_seconds.toFixed(1)} s (includes pauses)</p>
       <p>Result directory: <code>{episode.result_path}</code></p>
       {episode.diagnostics.length > 0 && <ul role="alert">{episode.diagnostics.map((error, index) => <li key={index}>{error}</li>)}</ul>}
       {episode.summary && <div aria-label="Episode outcome"><h3>Outcome: {episode.summary.status}</h3>

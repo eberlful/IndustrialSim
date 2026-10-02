@@ -1,17 +1,25 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Graph, arrangedPositions } from './Graph';
 import { GraphTools, PortEditor, RouteConnections } from './GraphEditing';
 import { EpisodeControl } from './EpisodeControl';
+import { EpisodeEvents, EpisodeInspection, EpisodeMetrics } from './EpisodeObservation';
 import { EpisodeSetup, ProductionPlan } from './EpisodeInputs';
 import { Properties } from './Properties';
 import { ResourceProperties, resourceDefinitions } from './Resources';
 import type { ParameterEdit } from './parameterEditing';
-import type { FlowNode, Model, Project, Route } from './types';
+import type { FlowNode, Model, Project, Route, Episode, LiveSelection } from './types';
 import './style.css';
 
 function App() {
   const projectRevision = useRef(0);
+  const [episode, setEpisode] = useState<Episode | null>(null);
+  const [observeEpisode, setObserveEpisode] = useState(false);
+  const [liveSelection, setLiveSelection] = useState<LiveSelection | null>(null);
+  useEffect(() => {
+    setLiveSelection(null);
+    if (episode && ['running', 'pausing', 'paused'].includes(episode.state)) setObserveEpisode(true);
+  }, [episode?.id]);
   const [project, setProject] = useState<Project>({ project: '', model: null });
   const [path, setPath] = useState('');
   const [yaml, setYaml] = useState('');
@@ -70,6 +78,8 @@ function App() {
     } finally { setBusy(false); }
   }
   const model: Model | null = project.model;
+  const live = observeEpisode ? episode?.observation : null;
+  const graphModel = useMemo(() => model && live ? { ...model, graph: live.graph, plant: live.plant } : model, [model, live?.graph, live?.plant]);
   const yamlDirty = !!model && editorYaml !== model.yaml;
   async function submitYaml(): Promise<boolean> {
     if (!yamlDirty || !model) return true;
@@ -136,7 +146,7 @@ function App() {
       <button disabled={busy || yamlDirty || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
       <button disabled={busy || inputsDirty || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
     </section>
-    <EpisodeControl canStart={!!model?.valid && !inputsDirty && !yamlDirty && !busy}/>
+    <EpisodeControl episode={episode} onChange={setEpisode} canStart={!!model?.valid && !inputsDirty && !yamlDirty && !busy}/>
     {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
     {model && view === 'yaml' && <section className="import-panel yaml-editor" aria-label="Advanced YAML editor">
       <h2>Advanced YAML editor</h2>
@@ -146,8 +156,8 @@ function App() {
       <button disabled={busy} onClick={() => void reloadYaml()}>Reload current YAML</button>
       {yamlDirty && <p role="note">YAML changes await validation.</p>}
     </section>}
-    {model && view === 'visual' && !model.graph_available && <section className="import-panel" aria-label="Unavailable visual editor"><h2>Visual editing unavailable</h2><p>The current YAML draft has validation errors. Its text is retained. Use the YAML editor to correct it or undo the edit.</p></section>}
-    {view === 'visual' && (!model || model.graph_available) && <div className="workspace" onChangeCapture={event => {
+    {model && view === 'visual' && !live && !model.graph_available && <section className="import-panel" aria-label="Unavailable visual editor"><h2>Visual editing unavailable</h2><p>The current YAML draft has validation errors. Its text is retained. Use the YAML editor to correct it or undo the edit.</p></section>}
+    {view === 'visual' && (live || !model || model.graph_available) && <div className="workspace" onChangeCapture={event => {
       if (event.target instanceof HTMLElement && event.target.closest('form')?.getAttribute('aria-label') !== 'Episode setup' && event.target.closest('form')) setFormDirty(true);
     }} onClickCapture={event => {
       if (!(event.target instanceof HTMLElement)) return;
@@ -155,11 +165,14 @@ function App() {
       if (button?.type === 'button' && button.closest('form')) setFormDirty(true);
     }}>
       <section className="graph-panel" aria-label="Material Flow Graph">
-        <div className="panel-title"><h2>Material Flow Graph</h2><span>{model ? `${model.graph.nodes.length} nodes · ${model.graph.routes.length} routes` : 'No topology yet'}</span></div>
-        <div className="graph-canvas">{model ? <Graph key={model.name} model={model} busy={busy} onMove={positions => void load('layout', { positions })} onSelect={element => setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id })}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
+        {episode && <div><button aria-pressed={observeEpisode} onClick={() => setObserveEpisode(true)}>Episode graph</button><button aria-pressed={!observeEpisode} onClick={() => setObserveEpisode(false)}>Draft graph</button></div>}
+        <div className="panel-title"><h2>Material Flow Graph</h2><span>{graphModel ? `${graphModel.graph.nodes.length} nodes · ${graphModel.graph.routes.length} routes` : 'No topology yet'}</span></div>
+        <div className="graph-canvas">{graphModel ? <Graph key={live ? episode?.id : model?.name} model={graphModel} observation={live} busy={busy || !!live} onMove={positions => void load('layout', { positions })} onSelect={element => { if (live && 'kind' in element && (element.kind === 'station' || element.kind === 'buffer')) setLiveSelection({ kind: element.kind === 'station' ? 'stations' : 'buffers', id: element.id }); else if (!live) setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id }); }}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
         <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
+        {episode && live && <><EpisodeInspection episode={episode} selection={liveSelection} onSelect={setLiveSelection}/><EpisodeMetrics episode={episode}/><EpisodeEvents key={episode.id} episodeId={episode.id}/></>}
+
         <section className="panel" aria-label="Properties"><h2>Properties</h2>{model && <label className="resource-selector">Resource definition<select disabled={busy} value={selectedResource && selection ? `${selection.kind}:${selection.id}` : ''} onChange={event => {
           const value = event.target.value;
           if (!value) setSelection(null);

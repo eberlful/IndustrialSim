@@ -38,6 +38,15 @@ class AuditRecord(BaseModel):
         return json.dumps(self.model_dump(mode="json"), separators=(",", ":"))
 
 
+def event_page_end(record_count: int, cursor: int, limit: int) -> int:
+    """Validate a bounded audit cursor and return its exclusive page end."""
+    if type(cursor) is not int or not 0 <= cursor <= record_count:
+        raise ValueError('Audit cursor outside recorded range')
+    if type(limit) is not int or not 1 <= limit <= 500:
+        raise ValueError('Event page limit must be between 1 and 500')
+    return min(cursor + limit, record_count)
+
+
 class AuditLogger:
     def __init__(self, file_path: Path | None = None) -> None:
         self.file_path = file_path
@@ -51,6 +60,12 @@ class AuditLogger:
     @property
     def records(self) -> list[AuditRecord]:
         return list(self._records)
+
+    def page(self, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Read a bounded page without copying the entire audit history."""
+        end = event_page_end(len(self._records), cursor, limit)
+        return {'records': [r.model_dump(mode='json') for r in self._records[cursor:end]],
+                'next_cursor': end, 'has_more': end < len(self._records)}
 
     def record(
         self,

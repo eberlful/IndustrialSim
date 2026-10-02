@@ -73,3 +73,9 @@ button[aria-pressed=true] { background: #17345e; outline: 2px solid #6c91da; }
 .outcome-metrics { display: flex; flex-wrap: wrap; gap: 1rem 2rem; }
 .outcome-metrics dt { color: #566779; }
 .outcome-metrics dd { margin: .25rem 0; font-weight: 600; }
+.occupancy { color: #174bc0; font-weight: 600; }
+.episode-events table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.episode-events th, .episode-events td { text-align: left; padding: 6px; border-bottom: 1px solid #d5dfe9; vertical-align: top; }
+.event-scroll { overflow: auto; max-height: 420px; }
+aside pre { overflow: auto; max-height: 350px; font-size: 12px; }
+[aria-label="Live entity details"] button { margin: 3px; }

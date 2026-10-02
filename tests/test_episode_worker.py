@@ -59,3 +59,63 @@ def test_invalid_start_does_not_allocate_output_or_replace_outcome(tmp_path: Pat
         assert rejected['diagnostics']
         assert rejected['episode'] is None
         assert not (tmp_path / 'runs').exists()
+
+
+def wait_for_state(worker: EpisodeWorker, state: str) -> dict:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        episode = worker.snapshot()['episode']
+        if episode and episode['state'] == state:
+            return episode
+        assert not episode or episode['state'] not in {'failed', 'finished', 'interrupted'}, episode
+        time.sleep(.005)
+    raise AssertionError(f'Episode did not reach {state}')
+
+
+def test_pause_continue_preserve_episode_and_lossless_pages_under_reads(tmp_path: Path) -> None:
+    model = MODEL.replace('quantity: 2000', 'quantity: 1000') + '\ntelemetry: {enabled: true, sample_interval: 1s}\n'
+    with EpisodeWorker(tmp_path) as worker:
+        started = worker.start(model)['episode']
+        deadline = time.monotonic() + 30
+        while worker.snapshot()['episode']['events_processed'] == 0:
+            assert time.monotonic() < deadline
+            worker.events(started['id'], cursor=0, limit=1)
+            time.sleep(.005)
+        assert worker.pause(started['id'])['accepted']
+        paused = wait_for_state(worker, 'paused')
+        assert paused['observation'] is not None
+        assert paused['events_processed'] > 0
+        for _ in range(25):
+            snapshot = worker.snapshot()['episode']
+            assert snapshot['simulated_time_ns'] == paused['simulated_time_ns']
+            assert snapshot['events_processed'] == paused['events_processed']
+            worker.events(started['id'], cursor=0, limit=1)
+        assert not worker.start(model)['accepted']
+        assert not worker.continue_episode('stale-id')['accepted']
+        assert not (tmp_path / paused['result_path'] / 'summary.json').exists()
+        assert worker.continue_episode(started['id'])['accepted']
+        assert worker.pause(started['id'])['accepted']
+        wait_for_state(worker, 'paused')
+        assert worker.continue_episode(started['id'])['accepted']
+        outcome = wait_for_outcome(worker)
+        direct_dir = tmp_path / 'direct'
+        assert outcome['summary'] == run_episode(model, decision_provider=BaselineDecisionProvider(), output_dir=direct_dir).to_dict()
+        records = []
+        cursor = 0
+        while True:
+            page = worker.events(started['id'], cursor, 7)
+            records.extend(page['records'])
+            cursor = page['next_cursor']
+            if not page['has_more']:
+                break
+        from industrialsim.audit import load_audit_log
+        assert records == [r.model_dump(mode='json') for r in load_audit_log(direct_dir)]
+        assert [r['record_id'] for r in records] == list(range(len(records)))
+        import pyarrow.parquet as pq
+        def telemetry(directory: Path) -> list:
+            return [pq.read_table(p).to_pylist() for p in sorted((directory / 'telemetry').glob('metrics_fragment_*.parquet'))]
+        assert telemetry(tmp_path / outcome['result_path']) == telemetry(direct_dir)
+        assert not worker.pause(started['id'])['accepted']
+        compact = worker.snapshot(include_history=False)['episode']['summary']
+        assert 'production_units' not in compact
+        assert compact['raw_metrics'] == outcome['summary']['raw_metrics']

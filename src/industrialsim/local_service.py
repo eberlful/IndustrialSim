@@ -10,7 +10,7 @@ import threading
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Sequence
 import webbrowser
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -44,6 +44,11 @@ class EditParameters(BaseModel):
     element_id: str
     changes: dict[str, Any]
     operation_id: str | None = None
+
+
+class EpisodeCommand(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    episode_id: str
 
 
 class EditEpisode(BaseModel):
@@ -101,16 +106,37 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
 
     @app.get('/api/episode')
     def episode() -> dict[str, Any]:
-        return episodes.snapshot()
+        return episodes.snapshot(include_history=False)
 
     @app.post('/api/episode/start')
     def start_episode() -> JSONResponse:
         exported = session.export_yaml()
         if not exported['accepted']:
-            return JSONResponse({**episodes.snapshot(), 'accepted': False,
+            return JSONResponse({**episodes.snapshot(include_history=False), 'accepted': False,
                                  'diagnostics': exported['diagnostics']}, status_code=422)
         result = episodes.start(exported['yaml'])
         return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+
+    @app.post('/api/episode/pause')
+    def pause_episode(body: EpisodeCommand) -> JSONResponse:
+        result = episodes.pause(body.episode_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+
+    @app.post('/api/episode/continue')
+    def continue_episode(body: EpisodeCommand) -> JSONResponse:
+        result = episodes.continue_episode(body.episode_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+
+    @app.get('/api/episode/events')
+    def episode_events(episode_id: str, cursor: int = Query(0, ge=0),
+                       limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+        try:
+            result = episodes.events(episode_id, cursor, limit)
+            for record in result['records']:
+                record['simulated_time_ns'] = str(record['simulated_time_ns'])
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get('/api/project')
     def project() -> dict[str, Any]:
