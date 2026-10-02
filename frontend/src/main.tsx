@@ -15,6 +15,7 @@ function App() {
   const [name, setName] = useState('Imported YAML');
   const [view, setView] = useState<'visual' | 'yaml'>('visual');
   const [editorYaml, setEditorYaml] = useState('');
+  const [formDirty, setFormDirty] = useState(false);
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [selection, setSelection] = useState<{ kind: 'node' | 'route' | 'machine' | 'worker'; id: string } | null>(null);
@@ -40,6 +41,7 @@ function App() {
       if (result.accepted) {
         setProject((previous) => ({ ...previous, ...result }));
         setEditorYaml(result.model?.yaml ?? '');
+        if (result.model?.yaml !== model?.yaml || ['edit', 'structure', 'open', 'import', 'draft/open', 'undo', 'redo'].includes(endpoint)) setFormDirty(false);
         if (endpoint === 'draft/open' && result.model && !result.model.graph_available) setView('yaml');
         if (endpoint === 'open' || endpoint === 'import' || endpoint === 'draft/open') setSelection(null);
         if (endpoint !== 'save') setSaved('');
@@ -68,6 +70,7 @@ function App() {
     await request(endpoint, body);
   }
   async function switchView(next: 'visual' | 'yaml') {
+    if (next === 'yaml' && formDirty) return;
     if (next === 'visual' && !await submitYaml()) return;
     setView(next);
   }
@@ -116,11 +119,12 @@ function App() {
         onChange={event => { const grouping = event.target.value as 'none' | 'area' | 'hall'; void load('layout', { grouping, positions: arrangedPositions(model, grouping) }); }}>
         <option value="none">None</option><option value="area">Area</option><option value="hall">Hall</option>
       </select></label><button disabled={busy || view === 'yaml'} onClick={() => void load('layout/save', {})}>Save layout</button></>}
-      {model && <><button disabled={busy} aria-pressed={view === 'visual'} onClick={() => void switchView('visual')}>Visual editor</button><button disabled={busy} aria-pressed={view === 'yaml'} onClick={() => void switchView('yaml')}>YAML editor</button></>}
+      {model && <><button disabled={busy} aria-pressed={view === 'visual'} onClick={() => void switchView('visual')}>Visual editor</button><button disabled={busy || formDirty} aria-pressed={view === 'yaml'} onClick={() => void switchView('yaml')}>YAML editor</button></>}
+      {formDirty && <span role="note">Apply form changes before switching to YAML or saving.</span>}
       <span>{model ? `Loaded: ${model.name}` : 'Open a project model or import YAML below'}</span>
       <button disabled={busy || (!project.can_undo && !yamlDirty)} onClick={() => void load('undo', {})}>Undo</button>
       <button disabled={busy || yamlDirty || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
-      <button disabled={busy || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
+      <button disabled={busy || formDirty || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
     </section>
     {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
     {model && view === 'yaml' && <section className="import-panel yaml-editor" aria-label="Advanced YAML editor">
@@ -132,7 +136,13 @@ function App() {
       {yamlDirty && <p role="note">YAML changes await validation.</p>}
     </section>}
     {model && view === 'visual' && !model.graph_available && <section className="import-panel" aria-label="Unavailable visual editor"><h2>Visual editing unavailable</h2><p>The current YAML draft has validation errors. Its text is retained. Use the YAML editor to correct it or undo the edit.</p></section>}
-    {view === 'visual' && (!model || model.graph_available) && <div className="workspace">
+    {view === 'visual' && (!model || model.graph_available) && <div className="workspace" onChangeCapture={event => {
+      if (event.target instanceof HTMLElement && event.target.closest('form')) setFormDirty(true);
+    }} onClickCapture={event => {
+      if (!(event.target instanceof HTMLElement)) return;
+      const button = event.target.closest('button');
+      if (button?.type === 'button' && button.closest('form')) setFormDirty(true);
+    }}>
       <section className="graph-panel" aria-label="Material Flow Graph">
         <div className="panel-title"><h2>Material Flow Graph</h2><span>{model ? `${model.graph.nodes.length} nodes · ${model.graph.routes.length} routes` : 'No topology yet'}</span></div>
         <div className="graph-canvas">{model ? <Graph key={model.name} model={model} busy={busy} onMove={positions => void load('layout', { positions })} onSelect={element => setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id })}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
@@ -161,14 +171,14 @@ function App() {
       <h2>Save validated YAML</h2><p>Save explicitly to a project-local file. Existing files require overwrite to be enabled.</p>
       <label>Save as project path<input value={savePath} disabled={busy} onChange={event => { setSavePath(event.target.value); setOverwrite(false); setSaved(''); }}/></label>
       <label><input type="checkbox" checked={overwrite} disabled={busy} onChange={event => setOverwrite(event.target.checked)}/>Overwrite existing file at this path</label>
-      <button disabled={busy || (!model.valid && !yamlDirty) || !savePath.trim()} onClick={() => void load('save', { path: savePath, overwrite })}>Save YAML</button>
+      <button disabled={busy || formDirty || (!model.valid && !yamlDirty) || !savePath.trim()} onClick={() => void load('save', { path: savePath, overwrite })}>Save YAML</button>
       {saved && <p>{saved}</p>}
     </section>}
     <section className="import-panel save-panel" aria-label="Project drafts">
       <h2>Incomplete drafts</h2><p>Save unfinished work separately, including validation errors and presentation.</p>
       <label>Draft filename<input value={draftName} disabled={busy} onChange={event => { setDraftName(event.target.value); setDraftOverwrite(false); setDraftSaved(''); }}/></label>
       <label><input type="checkbox" checked={draftOverwrite} disabled={busy} onChange={event => setDraftOverwrite(event.target.checked)}/>Overwrite existing draft</label>
-      <button disabled={busy || !model || !draftName.trim()} onClick={() => void load('draft/save', { path: draftName, overwrite: draftOverwrite })}>Save draft</button>
+      <button disabled={busy || formDirty || !model || !draftName.trim()} onClick={() => void load('draft/save', { path: draftName, overwrite: draftOverwrite })}>Save draft</button>
       <label>Saved draft<select value={draftPath} disabled={busy} onChange={event => setDraftPath(event.target.value)}>
         <option value="">Choose a draft…</option>{project.drafts?.map(file => <option key={file}>{file}</option>)}
       </select></label>
@@ -184,7 +194,7 @@ function App() {
       <label>YAML content <textarea spellCheck={false} value={yaml} disabled={busy || yamlDirty} onChange={(event) => { setYaml(event.target.value); setName('Imported YAML'); }}/></label>
       <button disabled={busy || yamlDirty || !yaml.trim()} onClick={() => void load('import', { yaml, name })}>Validate and import</button>
     </details>
-    {model && <details className="import-panel"><summary>Complete project draft</summary><p>Includes sections outside the graph. Edits and export use this project draft.</p><pre>{JSON.stringify(model.configuration, null, 2)}</pre></details>}
+    {model && <details className="import-panel"><summary>Complete project draft</summary><p>Includes sections outside the graph. Edits and export use this project draft.</p><pre>{model.graph_available ? JSON.stringify(model.configuration, null, 2) : model.yaml}</pre></details>}
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App/>);

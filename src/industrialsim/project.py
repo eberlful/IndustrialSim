@@ -163,8 +163,7 @@ class ProjectSession:
                 return self._rejected(['The draft changed since this YAML was loaded. Reload the current draft before applying edits.'])
             if text == self._model['yaml']:
                 return {**self.snapshot(), 'accepted': True}
-            self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
-            self._redo.clear()
+            self._remember_draft()
             self._set_text(text, self._model['name'])
             return {**self.snapshot(), 'accepted': True}
 
@@ -244,8 +243,7 @@ class ProjectSession:
             if not changes:
                 return {**self.snapshot(), 'accepted': True}
             element.update(deepcopy(changes))
-            self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
-            self._redo.clear()
+            self._remember_draft()
             self._set_draft(draft, self._model['name'])
             return {**self.snapshot(), 'accepted': True}
 
@@ -304,8 +302,7 @@ class ProjectSession:
                 check_graph_shape(draft)
             except (ValueError, TypeError) as exc:
                 return self._rejected([str(exc)])
-            self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
-            self._redo.clear()
+            self._remember_draft()
             self._set_draft(draft, self._model['name'])
             if action == 'delete' and kind == 'node':
                 self._model['layout']['positions'].pop(element_id, None)
@@ -376,6 +373,11 @@ class ProjectSession:
             self._undo.clear()
             self._redo.clear()
             return {**self.snapshot(), 'accepted': True}
+
+    def _remember_draft(self) -> None:
+        assert self._model is not None
+        self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
+        self._redo.clear()
 
     def undo(self) -> dict[str, Any]:
         with self._lock:
@@ -477,8 +479,7 @@ class ProjectSession:
             except (ValueError, TypeError) as exc:
                 return self._rejected([str(exc)])
             if layout != self._model['layout']:
-                self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
-                self._redo.clear()
+                self._remember_draft()
                 self._model['layout'] = layout
             return {**self.snapshot(), 'accepted': True}
 

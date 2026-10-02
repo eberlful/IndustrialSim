@@ -399,6 +399,10 @@ test('advanced YAML shares the form draft, preserves invalid text and reloads ex
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
   await page.locator('.react-flow__node').filter({ hasText: 'buf-body-out' }).click();
   await page.getByLabel('Buffer capacity').fill('8');
+  await expect(page.getByRole('button', { name: 'YAML editor', exact: true })).toBeDisabled();
+  await expect(page.getByText('Apply form changes before switching to YAML or saving.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save YAML', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Download YAML', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Apply parameters', exact: true }).click();
   await page.getByRole('button', { name: 'YAML editor', exact: true }).click();
   const editor = page.getByLabel('Advanced YAML content');
