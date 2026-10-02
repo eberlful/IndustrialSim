@@ -171,3 +171,51 @@ uv run industrialsim benchmark --target all
 - 📈 **[Evaluierung von TimesFM 3 & Zeitreihen-Modellen](file:///workspaces/IndustrialSim/docs/timesfm-evaluation-guide.md)**: Leitfaden zum Testen multivariater Zeitreihen-Foundation-Modelle mit Telemetrie und Counterfactual Branching.
 - 🔬 **[Experimente & Modellergebnisse (`experiments/`)](file:///workspaces/IndustrialSim/experiments/README.md)**: Strukturierte Berichte durchgeführter Benchmarks und Vorlage für neue Experimente.
 - 🏛️ **[Architekturentscheidungen (`docs/adr/`)](file:///workspaces/IndustrialSim/docs/adr/)**: Die 15 verbindlichen Architecture Decision Records des Projekts.
+## Local Plant browser
+
+From a source checkout with Node.js 20.19+ (or 22.12+) and npm installed, run:
+
+```bash
+uv run --no-default-groups --extra frontend industrialsim-ui ./examples --model reference_automotive_plant.yaml
+```
+
+This single command installs the locked browser dependencies, typechecks and builds
+React/TypeScript and React Flow, serves them through FastAPI at
+`http://127.0.0.1:8765`, and opens the browser with the selected project and model.
+The first launch requires internet access for dependencies. Use `--port 8766` to
+choose another loopback port or `--no-browser` to open the displayed address yourself.
+Omit `--model` to choose a project-local YAML file in the UI. Stop the service with
+Ctrl+C. The launcher currently requires this source checkout; browser assets are
+not bundled into Python wheels.
+
+The workspace displays sources, sinks, Stations, Buffers, typed input/output Ports
+and all routes, including cycles and parallel routes. Select a node or route to
+inspect its full properties, and use zoom, pan and temporary node dragging to
+inspect a large graph. The Plant's Area/Hall organization is shown separately.
+Legacy `stations` models display their Stations without invented Ports or routes.
+
+Choose a YAML file or paste YAML in **Import simulation YAML**, then select
+**Validate and import**. Diagnostics identify parsing, schema and domain errors;
+a failed import leaves the accepted model visible. Imports retain the original
+YAML and full validated configuration in the service's memory without writing to
+any source file. Reopening the browser reconnects to that accepted model; restarting
+the service requires opening/importing it again. Saving, persistent layouts, editing
+and Episode execution are covered by subsequent frontend issues. The Episode panel
+currently shows the loaded inputs and an explicit **Not started** status.
+
+Frontend developer checks:
+
+```bash
+npm --prefix frontend ci
+npm --prefix frontend run typecheck
+uv run --no-default-groups --extra frontend pytest tests/test_project_session.py
+# After installing Playwright's Chromium once:
+cd frontend
+npx playwright install chromium
+npm run test:e2e
+```
+
+Browser tests start the real loopback service against a temporary project. Set
+`INDUSTRIALSIM_PYTHON` to a Python interpreter with the project and `frontend` extra
+installed if `uv` is unavailable. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to an existing
+Chromium executable to use it instead of Playwright's downloaded browser.

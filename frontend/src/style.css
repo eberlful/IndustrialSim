@@ -1,0 +1,50 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #22334a; background: #f3f6fa; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1900px; margin: auto; padding: 24px; }
+header, .toolbar, .panel-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+header { margin-bottom: 24px; }
+h1 { font-size: 28px; margin: 5px 0; } h2 { font-size: 16px; margin: 0 0 12px; } h3 { font-size: 14px; }
+p { line-height: 1.5; }
+.eyebrow { font-size: 11px; letter-spacing: .16em; color: #52647a; margin: 0; }
+.project-path, .hint, .hall { color: #64748b; font-size: 12px; overflow-wrap: anywhere; }
+.project-path { margin: 0; }
+.status { border: 1px solid #bcd4c7; background: #eef8f2; padding: 9px 14px; border-radius: 6px; white-space: nowrap; }
+.toolbar { justify-content: flex-start; padding: 14px; background: white; border: 1px solid #d8e0e9; border-radius: 8px; margin-bottom: 16px; flex-wrap: wrap; font-size: 13px; }
+label { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+button, select, input, textarea { font: inherit; }
+button { border: 1px solid #264b82; border-radius: 5px; padding: 9px 14px; color: white; background: #264b82; cursor: pointer; }
+button:disabled { background: #edf1f6; color: #68798f; border-color: #d2dbe6; cursor: default; }
+select { max-width: 400px; padding: 8px; border: 1px solid #ced8e4; border-radius: 5px; }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 16px; }
+.graph-panel, .panel, .import-panel { background: white; border: 1px solid #d8e0e9; border-radius: 8px; }
+.panel-title { padding: 16px; border-bottom: 1px solid #e4eaf1; font-size: 12px; }
+.panel-title h2 { margin: 0; }
+.graph-canvas { height: 610px; }
+.graph-panel > .hint { margin: 12px 16px; }
+.panel { padding: 16px; margin-bottom: 16px; }
+.panel p { font-size: 13px; }
+pre { font: 12px/1.6 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 350px; overflow: auto; background: #f6f8fb; padding: 10px; }
+.material-node { width: 230px; border: 1px solid #b7c6d8; border-top: 4px solid #506fa1; border-radius: 6px; background: white; padding: 13px; box-shadow: 0 3px 9px #203c5912; }
+.material-node.source { border-top-color: #338463; } .material-node.sink { border-top-color: #67788b; } .material-node.buffer { border-top-color: #ae7e32; }
+.material-node > small, .material-node > strong, .hall { display: block; }
+.material-node > small { text-transform: uppercase; font-size: 10px; letter-spacing: .1em; color: #52647a; margin-bottom: 5px; }
+.material-node > strong { font-size: 13px; overflow-wrap: anywhere; }
+.hall { margin: 5px 0; font-size: 10px; }
+.ports { margin-top: 10px; border-top: 1px solid #e8edf3; }
+.port { position: relative; font-size: 10px; padding: 4px 0; }
+.port.output { text-align: right; }
+.port .react-flow__handle-left { left: -13px; } .port .react-flow__handle-right { right: -13px; }
+.react-flow__node.selected .material-node { outline: 2px solid #174bc0; }
+.empty { display: grid; place-content: center; height: 100%; text-align: center; padding: 24px; }
+.empty p { max-width: 350px; color: #64748b; }
+.import-panel { padding: 16px; margin-top: 16px; }
+summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.import-panel p { font-size: 13px; }
+.import-panel label { margin: 14px 0; }
+.import-panel label:has(textarea) { display: block; }
+textarea { display: block; width: 100%; height: 160px; margin-top: 8px; border: 1px solid #c6d2df; border-radius: 5px; padding: 12px; font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+.diagnostics { border: 1px solid #dcab68; background: #fff8ed; padding: 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; overflow-wrap: anywhere; }
+:focus-visible { outline: 3px solid #6c91da; outline-offset: 2px; }
+@media (max-width: 950px) { .workspace { grid-template-columns: minmax(0, 1fr); } aside { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; } .graph-canvas { height: 500px; } }
+.route-label { position: absolute; pointer-events: all; z-index: 10; padding: 3px 6px; background: white; color: #22334a; border: 1px solid #d8e0e9; font-size: 11px; }

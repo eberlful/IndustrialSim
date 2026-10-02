@@ -16,6 +16,10 @@ dependencies = [
 
 [project.scripts]
 industrialsim = "industrialsim:main"
+industrialsim-ui = "industrialsim.local_service:main"
+
+[project.optional-dependencies]
+frontend = ["fastapi>=0.115", "uvicorn>=0.34"]
 
 [project.entry-points."industrialsim.plugins"]
 micro_subgraph = "industrialsim.plugins:MicroSubgraphPlugin"
