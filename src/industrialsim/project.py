@@ -5,6 +5,9 @@ from copy import deepcopy
 from pathlib import Path
 from io import StringIO
 import os
+import hashlib
+import json
+import math
 from tempfile import NamedTemporaryFile
 from threading import RLock
 from typing import Any
@@ -29,6 +32,7 @@ class ProjectSession:
         self._model: dict[str, Any] | None = None
         self._lock = RLock()
         self._draft: dict[str, Any] | None = None
+        self._layout_identity = ''
         self._undo: list[tuple[dict[str, Any], dict[str, Any]]] = []
         self._redo: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
@@ -58,7 +62,7 @@ class ProjectSession:
                 text = path.read_text(encoding='utf-8')
             except (OSError, ValueError, UnicodeError) as exc:
                 return self._rejected([str(exc)])
-            return self.import_yaml(text, relative_path)
+            return self.import_yaml(text, str(path.relative_to(self.directory)))
 
     def import_yaml(self, text: str, name: str = 'Imported YAML') -> dict[str, Any]:
         with self._lock:
@@ -69,9 +73,23 @@ class ProjectSession:
                 return self._rejected(result.errors)
             draft = YAML(typ='safe', pure=True).load(text)
             self._set_draft(draft, name, text)
+            assert self._model is not None
+            self._layout_identity = self._identity(name, self._model['configuration'])
+            self._model['layout'] = {'positions': {}, 'grouping': 'none'}
+            warnings: list[str] = []
+            try:
+                path = self._layout_path()
+                if path.exists():
+                    document = json.loads(path.read_text(encoding='utf-8'))
+                    if document['version'] != 1 or document['model_identity'] != self._layout_identity:
+                        raise ValueError('Layout identity or version does not match')
+                    self._validate_layout(document['layout'])
+                    self._model['layout'] = document['layout']
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                warnings.append(f'Layout could not be restored; using initial arrangement: {exc}')
             self._undo.clear()
             self._redo.clear()
-            return {**self.snapshot(), 'accepted': True}
+            return {**self.snapshot(), 'accepted': True, 'diagnostics': warnings}
 
     def _set_draft(self, draft: dict[str, Any], name: str, text: str | None = None) -> None:
         result = validate_config(draft)
@@ -100,7 +118,8 @@ class ProjectSession:
             YAML(typ='safe', pure=True).dump(draft, buffer)
             text = buffer.getvalue()
         self._draft = draft
-        self._model = {'name': name, 'yaml': text, 'configuration': config,
+        layout = deepcopy(self._model['layout']) if self._model else {'positions': {}, 'grouping': 'none'}
+        self._model = {'layout': layout, 'name': name, 'yaml': text, 'configuration': config,
                        'graph': graph, 'plant': config.get('plant'),
                        'valid': result.is_valid, 'diagnostics': result.errors}
 
@@ -172,7 +191,7 @@ class ProjectSession:
         destination: list[tuple[dict[str, Any], dict[str, Any]]],
     ) -> dict[str, Any]:
         if not source or self._draft is None or self._model is None:
-            return self._rejected(['No parameter change to restore'])
+            return self._rejected(['No change to restore'])
         destination.append((deepcopy(self._draft), deepcopy(self._model)))
         self._draft, self._model = source.pop()
         return {**self.snapshot(), 'accepted': True}
@@ -213,9 +232,89 @@ class ProjectSession:
                 else:
                     # Exclusive creation also protects against a concurrent save.
                     os.link(temporary, path)
-                return {**self.snapshot(), 'accepted': True, 'saved_path': relative_path}
+                assert self._model is not None
+                self._layout_identity = self._identity(str(path.relative_to(self.directory)), self._model['configuration'])
+                layout_result = self.save_layout()
+                return {**self.snapshot(), 'accepted': True, 'saved_path': relative_path,
+                        'diagnostics': layout_result['diagnostics']}
             except (OSError, ValueError) as exc:
                 return self._rejected([str(exc)])
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _identity(name: str, configuration: dict[str, Any]) -> str:
+        content = json.dumps([name, configuration], sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _layout_path(self) -> Path:
+        path = self.directory / '.layouts' / f'{self._layout_identity}.json'
+        if not path.resolve().is_relative_to(self.directory):
+            raise ValueError('Layout must remain inside the project directory')
+        return path
+
+    def _validate_layout(self, layout: dict[str, Any]) -> None:
+        if not isinstance(layout, dict) or set(layout) != {'positions', 'grouping'}:
+            raise ValueError('Layout requires positions and grouping')
+        if layout['grouping'] not in ('none', 'area', 'hall'):
+            raise ValueError('Grouping must be none, area or hall')
+        if not isinstance(layout['positions'], dict):
+            raise ValueError('Positions must be a node mapping')
+        assert self._model is not None
+        ids = {node['id'] for node in self._model['graph']['nodes']}
+        for node_id, position in layout['positions'].items():
+            if node_id not in ids:
+                raise ValueError(f'Unknown layout node {node_id}')
+            if not isinstance(position, dict) or set(position) != {'x', 'y'} or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) for value in position.values()
+            ):
+                raise ValueError('Positions require finite x and y coordinates')
+
+    def edit_layout(
+        self, *, positions: dict[str, Any] | None = None, grouping: str | None = None,
+    ) -> dict[str, Any]:
+        """Edit presentation only; one command is one undoable gesture."""
+        with self._lock:
+            if self._model is None or self._draft is None:
+                return self._rejected(['Open a model before arranging it'])
+            layout = deepcopy(self._model['layout'])
+            if positions is not None:
+                layout['positions'].update(deepcopy(positions))
+            if grouping is not None:
+                layout['grouping'] = grouping
+            try:
+                self._validate_layout(layout)
+            except (ValueError, TypeError) as exc:
+                return self._rejected([str(exc)])
+            if layout != self._model['layout']:
+                self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
+                self._redo.clear()
+                self._model['layout'] = layout
+            return {**self.snapshot(), 'accepted': True}
+
+    def save_layout(self) -> dict[str, Any]:
+        """Explicitly persist presentation separately, including for invalid drafts."""
+        with self._lock:
+            if self._model is None:
+                return self._rejected(['Open a model before saving layout'])
+            temporary: Path | None = None
+            try:
+                path = self._layout_path()
+                path.parent.mkdir(exist_ok=True)
+                document = {'version': 1, 'model_identity': self._layout_identity,
+                            'layout': self._model['layout']}
+                with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                        prefix='.layout-', delete=False) as stream:
+                    temporary = Path(stream.name)
+                    json.dump(document, stream, allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                return {**self.snapshot(), 'accepted': True}
+            except (OSError, ValueError) as exc:
+                return self._rejected([f'Could not save layout: {exc}'])
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)

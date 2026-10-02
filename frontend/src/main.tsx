@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Graph } from './Graph';
+import { Graph, arrangedPositions } from './Graph';
 import { Properties, type ParameterEdit } from './Properties';
 import type { Model, Project } from './types';
 import './style.css';
@@ -70,6 +70,10 @@ function App() {
         {project.models?.map((file) => <option key={file}>{file}</option>)}
       </select></label>
       <button disabled={busy || !path} onClick={() => void load('open', { path })}>Open model</button>
+      {model && <><label>Display grouping<select aria-label="Display grouping" value={model.layout.grouping} disabled={busy}
+        onChange={event => { const grouping = event.target.value as 'none' | 'area' | 'hall'; void load('layout', { grouping, positions: arrangedPositions(model, grouping) }); }}>
+        <option value="none">None</option><option value="area">Area</option><option value="hall">Hall</option>
+      </select></label><button disabled={busy} onClick={() => void load('layout/save', {})}>Save layout</button></>}
       <span>{model ? `Loaded: ${model.name}` : 'Open a project model or import YAML below'}</span>
       <button disabled={busy || !project.can_undo} onClick={() => void load('undo', {})}>Undo</button>
       <button disabled={busy || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
@@ -79,8 +83,8 @@ function App() {
     <div className="workspace">
       <section className="graph-panel" aria-label="Material Flow Graph">
         <div className="panel-title"><h2>Material Flow Graph</h2><span>{model ? `${model.graph.nodes.length} nodes · ${model.graph.routes.length} routes` : 'No topology yet'}</span></div>
-        <div className="graph-canvas">{model ? <Graph key={model.name + model.yaml} model={model} onSelect={element => setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id })}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
-        <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; positions are temporary.</p>
+        <div className="graph-canvas">{model ? <Graph key={model.name} model={model} busy={busy} onMove={positions => void load('layout', { positions })} onSelect={element => setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id })}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
+        <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
         <section className="panel"><h2>Properties</h2>{selectedElement && model && selection ? <Properties key={selection.kind + selection.id + model.yaml} element={selectedElement} kind={selection.kind} model={model} busy={busy} edit={(command: ParameterEdit) => load('edit', command)}/> : <p>Select a node or route in the graph.</p>}</section>

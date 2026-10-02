@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { ReactFlow, Background, Controls, Handle, Position, BaseEdge, EdgeLabelRenderer, MarkerType, useNodesState,
   type Node, type NodeProps, type Edge, type EdgeProps } from '@xyflow/react';
-import type { FlowNode, Model, Route } from './types';
+import type { FlowNode, Layout, Model, Route } from './types';
 import '@xyflow/react/dist/style.css';
 
 type PlantNode = Node<{ model: FlowNode }, 'plant'>;
@@ -36,14 +36,57 @@ function MaterialRoute({ sourceX, sourceY, targetX, targetY, data, markerEnd, se
       onClick={data?.select}>{data?.route.id}</button>
   </EdgeLabelRenderer></>;
 }
-const nodeTypes = { plant: MaterialNode };
+function DisplayGroup({ data }: NodeProps<Node<{ label: string }, 'group'>>) {
+  return <strong className="display-group-label">{data.label}</strong>;
+}
+const nodeTypes = { plant: MaterialNode, group: DisplayGroup };
+
+export function locationGroups(model: Model, grouping: Layout['grouping']) {
+  const groups = new Map<string, { label: string; nodes: FlowNode[] }>();
+  for (const node of model.graph.nodes) {
+    const area = model.plant?.areas.find(area => area.halls.some(hall => hall.id === node.hall_id));
+    const hall = area?.halls.find(hall => hall.id === node.hall_id);
+    const key = grouping === 'none' ? 'all' : grouping === 'area' ? area?.id ?? 'unassigned' : hall?.id ?? 'unassigned';
+    const label = grouping === 'area' ? `Area: ${area?.name ?? 'Unassigned'}` : `Hall: ${hall?.name ?? 'Unassigned'}`;
+    if (!groups.has(key)) groups.set(key, { label, nodes: [] });
+    groups.get(key)!.nodes.push(node);
+  }
+  return groups;
+}
+
+export function arrangedPositions(model: Model, grouping: Layout['grouping']) {
+  const positions: Layout['positions'] = {};
+  let offsetY = 0;
+  for (const group of locationGroups(model, grouping).values()) {
+    group.nodes.forEach((node, index) => { positions[node.id] = { x: (index % 5) * 340, y: offsetY + Math.floor(index / 5) * 330 }; });
+    offsetY += Math.ceil(group.nodes.length / 5) * 330 + 120;
+  }
+  return positions;
+}
 const edgeTypes = { route: MaterialRoute };
 
-export function Graph({ model, onSelect }: { model: Model; onSelect: (value: FlowNode | Route) => void }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState<PlantNode>([]);
+export function Graph({ model, onSelect, onMove, busy }: { model: Model; onSelect: (value: FlowNode | Route) => void;
+  onMove: (positions: Layout['positions']) => void; busy: boolean }) {
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   useEffect(() => {
-    setNodes(model.graph.nodes.map((node, index) => ({ id: node.id, type: 'plant',
-      position: { x: (index % 5) * 340, y: Math.floor(index / 5) * 330 }, data: { model: node } })));
+    const initial = arrangedPositions(model, model.layout.grouping);
+    const material: PlantNode[] = model.graph.nodes.map(node => ({ id: node.id, type: 'plant',
+      position: model.layout.positions[node.id] ?? initial[node.id], data: { model: node } }));
+    const backgrounds: Node[] = [];
+    if (model.layout.grouping !== 'none') {
+      let index = 0;
+      for (const group of locationGroups(model, model.layout.grouping).values()) {
+        const positions = group.nodes.map(node => model.layout.positions[node.id] ?? initial[node.id]);
+        const left = Math.min(...positions.map(p => p.x)) - 30;
+        const top = Math.min(...positions.map(p => p.y)) - 60;
+        backgrounds.push({ id: `display-group:${index++}`, type: 'group', position: { x: left, y: top },
+          data: { label: group.label }, draggable: false, selectable: false, zIndex: -1,
+          style: { width: Math.max(...positions.map(p => p.x)) - left + 290,
+            height: Math.max(...positions.map(p => p.y)) - top + 280, background: '#e8eef680',
+            border: '1px solid #a6b8cc', borderRadius: 12, pointerEvents: 'none' } });
+      }
+    }
+    setNodes([...backgrounds, ...material]);
   }, [model, setNodes]);
   const lanes = new Map<string, number>();
   const edges: MaterialEdge[] = model.graph.routes.map((route) => {
@@ -55,7 +98,8 @@ export function Graph({ model, onSelect }: { model: Model; onSelect: (value: Flo
       markerEnd: { type: MarkerType.ArrowClosed }, data: { route, lane, select: () => onSelect(route) } };
   });
   return <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
-    onNodesChange={onNodesChange} onNodeClick={(_, node) => onSelect(node.data.model)}
+    onNodesChange={onNodesChange} onNodeClick={(_, node) => { if (node.type === 'plant') onSelect(node.data.model as FlowNode); }}
+    nodesDraggable={!busy} onNodeDragStop={(_, _node, moved) => onMove(Object.fromEntries(moved.map(node => [node.id, node.position])))}
     onEdgeClick={(_, edge) => edge.data && onSelect(edge.data.route)} nodesConnectable={false}
     deleteKeyCode={null} fitView minZoom={0.08} maxZoom={2}>
     <Background gap={24}/><Controls showInteractive={false}/>

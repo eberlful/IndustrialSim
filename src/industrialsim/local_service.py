@@ -38,6 +38,12 @@ class EditParameters(BaseModel):
     operation_id: str | None = None
 
 
+class EditLayout(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    positions: dict[str, Any] | None = None
+    grouping: Literal['none', 'area', 'hall'] | None = None
+
+
 class SaveModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
     path: str
@@ -85,6 +91,16 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
     def edit_parameters(body: EditParameters) -> JSONResponse:
         result = session.edit_parameters(body.kind, body.element_id, body.changes,
                                          operation_id=body.operation_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/layout')
+    def edit_layout(body: EditLayout) -> JSONResponse:
+        result = session.edit_layout(positions=body.positions, grouping=body.grouping)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/layout/save')
+    def save_layout() -> JSONResponse:
+        result = session.save_layout()
         return JSONResponse(result, status_code=200 if result['accepted'] else 422)
 
     @app.post('/api/project/undo')
