@@ -13,10 +13,12 @@ import webbrowser
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict
 import uvicorn
 
 from industrialsim.project import ProjectSession
+from industrialsim.episode_worker import EpisodeWorker
 
 
 class OpenModel(BaseModel):
@@ -70,11 +72,16 @@ class SaveModel(BaseModel):
 
 
 def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None = None) -> FastAPI:
+    episodes = EpisodeWorker(session.directory)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if browser_url:
             threading.Timer(0.5, webbrowser.open, args=(browser_url,)).start()
-        yield
+        try:
+            yield
+        finally:
+            await run_in_threadpool(episodes.close)
 
     app = FastAPI(title='IndustrialSim local project', lifespan=lifespan)
 
@@ -91,6 +98,19 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
         ):
             return JSONResponse({'detail': 'Use the local project origin'}, status_code=403)
         return await call_next(request)
+
+    @app.get('/api/episode')
+    def episode() -> dict[str, Any]:
+        return episodes.snapshot()
+
+    @app.post('/api/episode/start')
+    def start_episode() -> JSONResponse:
+        exported = session.export_yaml()
+        if not exported['accepted']:
+            return JSONResponse({**episodes.snapshot(), 'accepted': False,
+                                 'diagnostics': exported['diagnostics']}, status_code=422)
+        result = episodes.start(exported['yaml'])
+        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
 
     @app.get('/api/project')
     def project() -> dict[str, Any]:

@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Graph, arrangedPositions } from './Graph';
 import { GraphTools, PortEditor, RouteConnections } from './GraphEditing';
+import { EpisodeControl } from './EpisodeControl';
 import { EpisodeSetup, ProductionPlan } from './EpisodeInputs';
 import { Properties } from './Properties';
 import { ResourceProperties, resourceDefinitions } from './Resources';
@@ -10,6 +11,7 @@ import type { FlowNode, Model, Project, Route } from './types';
 import './style.css';
 
 function App() {
+  const projectRevision = useRef(0);
   const [project, setProject] = useState<Project>({ project: '', model: null });
   const [path, setPath] = useState('');
   const [yaml, setYaml] = useState('');
@@ -32,13 +34,15 @@ function App() {
   const [draftOverwrite, setDraftOverwrite] = useState(false);
   const [draftSaved, setDraftSaved] = useState('');
   useEffect(() => {
+    const revision = projectRevision.current;
     fetch('/api/project').then(async (response) => {
       if (!response.ok) throw new Error(`Project request failed (${response.status})`);
       return response.json() as Promise<Project>;
-    }).then((result) => { setProject(result); setPath(result.models?.[0] ?? ''); setDraftPath(result.drafts?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); setEditorYaml(result.model?.yaml ?? ''); if (result.model && !result.model.graph_available) setView('yaml'); })
-      .catch((error: Error) => setDiagnostics([error.message]));
+    }).then((result) => { if (revision !== projectRevision.current) return; setProject(result); setPath(result.models?.[0] ?? ''); setDraftPath(result.drafts?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); setEditorYaml(result.model?.yaml ?? ''); if (result.model && !result.model.graph_available) setView('yaml'); })
+      .catch((error: Error) => { if (revision === projectRevision.current) setDiagnostics([error.message]); });
   }, []);
   async function request(endpoint: string, body: object): Promise<boolean> {
+    projectRevision.current += 1;
     setBusy(true);
     try {
       const response = await fetch(`/api/project/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -132,6 +136,7 @@ function App() {
       <button disabled={busy || yamlDirty || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
       <button disabled={busy || inputsDirty || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
     </section>
+    <EpisodeControl canStart={!!model?.valid && !inputsDirty && !yamlDirty && !busy}/>
     {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
     {model && view === 'yaml' && <section className="import-panel yaml-editor" aria-label="Advanced YAML editor">
       <h2>Advanced YAML editor</h2>
@@ -169,7 +174,7 @@ function App() {
           </>}
         </section>
         {model && <section className="panel" aria-label="Graph editing"><h2>Graph editing</h2><GraphTools model={model} busy={busy} command={command => load('structure', command)} select={route => setSelection({ kind: 'route', id: route.id })}/></section>}
-        <section className="panel" aria-label="Episode controls"><h2>Episode</h2><p>○ Not started</p><button disabled>Start Episode</button><p className="hint">Execution controls will be available in a subsequent implementation issue.</p>{model?.episode_inputs && <EpisodeSetup key={JSON.stringify([inputsRevision, model.episode_inputs.seed, model.episode_inputs.episode])} model={model} busy={busy} onDirty={() => setSetupDirty(true)} edit={async changes => { if (await request('episode', { changes })) setSetupDirty(false); }}/>}</section>
+        <section className="panel" aria-label="Episode controls"><h2>Episode setup</h2>{model?.episode_inputs && <EpisodeSetup key={JSON.stringify([inputsRevision, model.episode_inputs.seed, model.episode_inputs.episode])} model={model} busy={busy} onDirty={() => setSetupDirty(true)} edit={async changes => { if (await request('episode', { changes })) setSetupDirty(false); }}/>}</section>
         <section className="panel"><h2>Plant organization</h2><p className="hint">Area and Hall locations are separate from material flow.</p>{model?.plant ? <><h3>{model.plant.name}</h3>{model.plant.areas.map((area) => <details key={area.id}><summary>{area.name}</summary><ul>{area.halls.map((hall) => <li key={hall.id}>{hall.name} <small>({hall.id})</small></li>)}</ul></details>)}</> : <p>No Plant hierarchy declared.</p>}</section>
       </aside>
     </div>}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 from collections import deque
 import concurrent.futures
 from dataclasses import dataclass, field
@@ -1054,6 +1056,7 @@ class EpisodeEngine:
                 self.decision_triggers.setdefault("dispatch", []).append(d_runtime)
         self.decision_diagnostics: list[dict[str, Any]] = []
         self.decision_batches: list[dict[str, Any]] = []
+        self.execution_exhausted = False
         self.is_aborted: bool = False
         self.abort_reason: str | None = None
         self.buffer_history: dict[str, list[dict[str, Any]]] = {}
@@ -4364,11 +4367,16 @@ class EpisodeEngine:
                         )
                         return
 
-    def run(
+    def advance(
         self,
         pause_at_ns: int | None = None,
         pause_at_decision_batch: bool = False,
+        max_events: int | None = None,
     ) -> EpisodeSummary:
+        if max_events is not None and (type(max_events) is not int or max_events < 1):
+            raise ValueError('max_events must be a positive integer')
+        self.execution_exhausted = False
+        starting_events = self.kernel.events_processed
         max_t = pause_at_ns
         if self.cfg.episode.end_condition.max_time_ns is not None:
             if max_t is None:
@@ -4386,11 +4394,16 @@ class EpisodeEngine:
             )
             if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
                 if pause_at_decision_batch:
-                    return self.to_summary()
+                    return self.to_summary(update_metrics=False)
                 self._process_decision_batch()
                 self._check_runtime_hard_constraints()
                 if self.is_aborted or self.is_deadlocked:
                     break
+
+            # Yield only after all events and decisions at this time are settled.
+            if (max_events is not None and not has_more_events_at_same_time
+                    and self.kernel.events_processed - starting_events >= max_events):
+                return self.to_summary(update_metrics=False)
 
             next_time = self.kernel.peek_next_time()
             if next_time is None or (max_t is not None and next_time > max_t):
@@ -4407,7 +4420,7 @@ class EpisodeEngine:
             )
             if not has_more_events_at_same_time and self.decision_coordinator.has_pending():
                 if pause_at_decision_batch:
-                    return self.to_summary()
+                    return self.to_summary(update_metrics=False)
                 self._process_decision_batch()
                 self._check_runtime_hard_constraints()
                 if self.is_aborted or self.is_deadlocked:
@@ -4442,26 +4455,39 @@ class EpisodeEngine:
                 ):
                     self.kernel.advance_to(self.cfg.episode.end_condition.max_time_ns)
 
+        self.execution_exhausted = (pause_at_ns is None and not (
+            pause_at_decision_batch and self.decision_coordinator.has_pending()))
+        return self.to_summary(update_metrics=False)
+
+    def run(
+        self,
+        pause_at_ns: int | None = None,
+        pause_at_decision_batch: bool = False,
+    ) -> EpisodeSummary:
+        """Compatibility execution API, including its existing outcome records."""
+        self.advance(pause_at_ns, pause_at_decision_batch)
         summary = self.to_summary()
         if not pause_at_decision_batch:
-            if self.is_telemetry_enabled:
-                self._sample_telemetry(sample_type="terminal", event_name="episode_end")
-            self.audit_logger.record(
-                event_type="reward",
-                simulated_time_ns=self.kernel.current_time_ns,
-                episode_id=self.episode_id,
-                branch_id=getattr(self.decision_coordinator, "branch_id", None),
-                details={
-                    "reward": summary.reward,
-                    "reward_breakdown": summary.reward_breakdown,
-                    "total_strategic_cost": self.total_strategic_cost,
-                    "events_processed": self.kernel.events_processed,
-                },
-            )
-
+            self._record_outcome(summary)
         return summary
 
-    def to_summary(self) -> EpisodeSummary:
+    def _record_outcome(self, summary: EpisodeSummary) -> None:
+        if self.is_telemetry_enabled:
+            self._sample_telemetry(sample_type="terminal", event_name="episode_end")
+        self.audit_logger.record(
+            event_type="reward",
+            simulated_time_ns=self.kernel.current_time_ns,
+            episode_id=self.episode_id,
+            branch_id=getattr(self.decision_coordinator, "branch_id", None),
+            details={
+                "reward": summary.reward,
+                "reward_breakdown": summary.reward_breakdown,
+                "total_strategic_cost": self.total_strategic_cost,
+                "events_processed": self.kernel.events_processed,
+            },
+        )
+
+    def to_summary(self, *, update_metrics: bool = True) -> EpisodeSummary:
         all_terminal = self._is_terminal_condition_met(self.kernel)
         if self.is_deadlocked:
             status = "deadlocked"
@@ -4472,14 +4498,21 @@ class EpisodeEngine:
         else:
             status = "incomplete"
 
+        # Observation projects metrics on copies; compatibility APIs retain
+        # their existing updates to live resource state.
+        machines = self.machines if update_metrics else deepcopy(self.machines)
+        workers = self.workers if update_metrics else deepcopy(self.workers)
+        vehicles = self.vehicles if update_metrics else deepcopy(self.vehicles)
+        stations = self.stations if update_metrics else deepcopy(self.stations)
+
         # Update resource and station metrics to current time
-        for mach in self.machines.values():
+        for mach in machines.values():
             mach.update_metrics(self.kernel.current_time_ns)
-        for w in self.workers.values():
+        for w in workers.values():
             w.update_metrics(self.kernel.current_time_ns)
-        for v in self.vehicles.values():
+        for v in vehicles.values():
             v.update_metrics(self.kernel.current_time_ns)
-        for s in self.stations.values():
+        for s in stations.values():
             if s.waiting_since_ns is not None:
                 s.total_waiting_time_ns += self.kernel.current_time_ns - s.waiting_since_ns
                 s.waiting_since_ns = self.kernel.current_time_ns
@@ -4511,7 +4544,7 @@ class EpisodeEngine:
                 restarted_count=s.restarted_count,
                 scrapped_count=s.scrapped_count,
             )
-            for s in self.stations.values()
+            for s in stations.values()
         ]
 
         buffer_summaries = [
@@ -4540,7 +4573,7 @@ class EpisodeEngine:
                 operating_mode=m.operating_mode,
                 utilization=m.utilization,
             )
-            for m in self.machines.values()
+            for m in machines.values()
         ]
 
         worker_summaries = [
@@ -4556,7 +4589,7 @@ class EpisodeEngine:
                 total_off_shift_time_ns=w.total_off_shift_time_ns,
                 utilization=w.utilization,
             )
-            for w in self.workers.values()
+            for w in workers.values()
         ]
 
         vehicle_summaries = sorted(
@@ -4570,7 +4603,7 @@ class EpisodeEngine:
                     utilization=v.utilization,
                     pool_id=v.pool_id,
                 )
-                for v in self.vehicles.values()
+                for v in vehicles.values()
             ],
             key=lambda v: v.id,
         )
@@ -4643,6 +4676,93 @@ class EpisodeEngine:
         object.__setattr__(summary_obj, "reward_breakdown", reward_breakdown)
         object.__setattr__(summary_obj, "hard_constraints", hard_constraints)
         return summary_obj
+
+
+class EpisodeSession:
+    """Public, single-owner lifecycle with frozen inputs and explicit finalization.
+
+    Advance and snapshot never write terminal records. Finalize is idempotent
+    and available only after execution finishes. Closing unfinished work leaves
+    its output visibly incomplete. Callers serialize mutations of a session.
+    """
+
+    def __init__(
+        self,
+        source: str | Path | dict[str, Any] | SimulationConfig,
+        decision_provider: DecisionProvider | None = None,
+        output_dir: str | Path | None = None,
+    ) -> None:
+        validation = validate_config(source)
+        if not validation.is_valid or validation.config is None:
+            raise ValueError(f"Invalid configuration: {'; '.join(validation.errors)}")
+        cfg = validation.config.model_copy(deep=True)
+        self._writer: RunArtifactWriter | None = None
+        self._closed = False
+        self._finalized = False
+        if output_dir is not None:
+            # Exclusive reservation protects completed AND incomplete artifacts.
+            Path(output_dir).mkdir(parents=True, exist_ok=False)
+            self._writer = RunArtifactWriter(output_dir, cfg, f"ep-{cfg.seed}")
+        try:
+            self._engine = EpisodeEngine.create(
+                cfg, decision_provider=decision_provider,
+                audit_logger=self._writer.audit_logger if self._writer else None,
+                telemetry_manager=self._writer.telemetry_manager if self._writer else None,
+            )
+            if self._writer:
+                self._writer.plugin_metadata.update(self._engine.plugin_metadata)
+            self._summary = self._engine.to_summary(update_metrics=False)
+        except BaseException:
+            if self._writer:
+                self._writer.audit_logger.close()
+                self._writer.telemetry_manager.close()
+            raise
+
+    @property
+    def finished(self) -> bool:
+        return self._summary.status != 'incomplete' or self._engine.execution_exhausted or (
+            self._engine.kernel.queue_size == 0
+            and not self._engine.decision_coordinator.has_pending()
+        )
+
+    def snapshot(self) -> EpisodeSummary:
+        """Return an isolated observation without advancing or recording outcomes."""
+        return deepcopy(self._summary)
+
+    def advance(
+        self, until_time_ns: int | None = None, pause_at_decision_batch: bool = False,
+        max_events: int | None = None,
+    ) -> EpisodeSummary:
+        if self._closed or self._finalized:
+            raise ValueError('Cannot advance a closed or finalized Episode')
+        if until_time_ns is not None and until_time_ns < self._summary.simulated_time_ns:
+            raise ValueError('Cannot advance backwards in simulation time')
+        self._summary = self._engine.advance(until_time_ns, pause_at_decision_batch, max_events)
+        return self.snapshot()
+
+    def finalize(self) -> EpisodeSummary:
+        if self._finalized:
+            return self.snapshot()
+        if self._closed:
+            raise ValueError('Cannot finalize a closed Episode')
+        if not self.finished:
+            raise ValueError('Episode execution must be finished before finalization')
+        self._summary = self._engine.to_summary()
+        self._engine._record_outcome(self._summary)
+        if self._writer:
+            save_checkpoint(self._engine.create_checkpoint(), self._writer.checkpoints_dir / 'final_checkpoint.json')
+            self._writer.finalize(self._summary.to_dict(), status=self._summary.status)
+        self._finalized = True
+        return self.snapshot()
+
+    def close(self) -> None:
+        """Release output streams without publishing an unfinished outcome."""
+        if not self._closed:
+            try:
+                self._engine.audit_logger.close()
+            finally:
+                self._engine.telemetry_manager.close()
+                self._closed = True
 
 
 def create_checkpoint(
