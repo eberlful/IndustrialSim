@@ -369,3 +369,25 @@ stations:
   expect(exported).toMatch(/count: '?9007199254740993'?(?:,|\n)/);
   expect(exported.match(/capacity: 9007199254740993/g)).toHaveLength(2);
 });
+
+test('blank resource capacities and Worker counts can be corrected to one', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content').fill(reference);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await page.getByLabel('Resource capacity').fill('');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByLabel('Resource capacity')).toHaveValue('');
+  await page.getByLabel('Resource capacity').fill('1');
+  await page.getByRole('button', { name: 'Apply resource', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.locator('.react-flow__node').filter({ hasText: 'st-body-1' }).click();
+  await page.getByLabel('Worker count').fill('');
+  await page.getByRole('button', { name: 'Apply requirements', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('⚠ Draft invalid');
+  await expect(page.getByLabel('Worker count')).toHaveValue('');
+  await page.getByLabel('Worker count').fill('1');
+  await page.getByRole('button', { name: 'Apply requirements', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+});

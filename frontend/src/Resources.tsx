@@ -10,7 +10,7 @@ export function resourceDefinitions(model: Model, kind: 'machine' | 'worker'): R
 
 export function ResourceProperties({ resource, kind, model, busy, edit }: EditorProps & { resource: Resource; kind: 'machine' | 'worker' }) {
   const [name, setName] = useState(resource.name ?? '');
-  const [capacity, setCapacity] = useState(String(resource.capacity ?? 1));
+  const [capacity, setCapacity] = useState(String(resource.capacity === undefined ? 1 : resource.capacity ?? ''));
   const [workerKind, setWorkerKind] = useState(resource.kind ?? 'individual');
   const [qualifications, setQualifications] = useState(resource.qualifications?.join('\n') ?? '');
   const collection = kind === 'machine' ? 'machines' : 'workers';
@@ -23,7 +23,7 @@ export function ResourceProperties({ resource, kind, model, busy, edit }: Editor
       event.preventDefault();
       const changes: Record<string, unknown> = {};
       if (name !== (resource.name ?? '')) changes.name = name || null;
-      if (capacity !== String(resource.capacity ?? 1)) changes.capacity = integerOrText(capacity);
+      if (capacity !== String(resource.capacity === undefined ? 1 : resource.capacity ?? '')) changes.capacity = integerOrText(capacity);
       if (kind === 'worker') {
         if (workerKind !== (resource.kind ?? 'individual')) changes.kind = workerKind;
         if (qualifications !== (resource.qualifications?.join('\n') ?? '')) changes.qualifications = qualifications.split('\n').filter(Boolean);
@@ -46,7 +46,7 @@ export function ResourceProperties({ resource, kind, model, busy, edit }: Editor
 export function OperationResources({ operation, nodeId, model, busy, edit }: EditorProps & { operation: Operation; nodeId: string }) {
   const [machines, setMachines] = useState(operation.required_machines ?? []);
   const [workers, setWorkers] = useState((operation.required_workers ?? []).map(requirement => ({
-    worker_id: requirement.worker_id ?? '', qualification: requirement.qualification ?? '', count: String(requirement.count ?? 1),
+    worker_id: requirement.worker_id ?? '', qualification: requirement.qualification ?? '', count: String(requirement.count === undefined ? 1 : requirement.count ?? ''),
   })));
   const machineDefinitions = resourceDefinitions(model, 'machine');
   const workerDefinitions = resourceDefinitions(model, 'worker');
@@ -59,7 +59,7 @@ export function OperationResources({ operation, nodeId, model, busy, edit }: Edi
     }));
     const changes: Record<string, unknown> = {};
     if (JSON.stringify(machines) !== JSON.stringify(operation.required_machines ?? [])) changes.required_machines = machines;
-    const original = (operation.required_workers ?? []).map(requirement => ({ worker_id: requirement.worker_id ?? null, qualification: requirement.qualification ?? null, count: requirement.count ?? 1 }));
+    const original = (operation.required_workers ?? []).map(requirement => ({ worker_id: requirement.worker_id ?? null, qualification: requirement.qualification ?? null, count: requirement.count === undefined ? 1 : requirement.count }));
     if (JSON.stringify(requirements) !== JSON.stringify(original)) changes.required_workers = requirements;
     void edit({ kind: 'node', element_id: nodeId, operation_id: operation.id, changes });
   }}>

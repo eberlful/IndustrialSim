@@ -18,6 +18,13 @@ from industrialsim.application import validate_config
 from industrialsim.project_graph import check_graph_shape, graph_diagnostics
 
 
+def _editable_integer(value: Any) -> Any:
+    """Carry integers outside JavaScript's exact range as decimal text."""
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
+        return str(value)
+    return value
+
+
 def _atomic_write(path: Path, text: str, *, overwrite: bool) -> None:
     """Publish a complete file, with exclusive creation unless overwrite is explicit."""
     temporary: Path | None = None
@@ -123,26 +130,20 @@ class ProjectSession:
         for node in graph['nodes']:
             node.setdefault('input_ports', [])
             node.setdefault('output_ports', [])
-        # JSON numbers cannot carry every Python integer exactly. Editable
-        # values outside JavaScript's safe range travel as decimal text.
+        # Editable values travel separately from the authoritative YAML draft.
         for element in [*graph['nodes'], *graph['routes'],
                         *config.get('machines', []), *config.get('workers', [])]:
             for field in ('capacity', 'output_capacity', 'transit_time'):
-                value = element.get(field)
-                if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
-                    element[field] = str(value)
+                if field in element:
+                    element[field] = _editable_integer(element[field])
             for operation in element.get('operations', []):
-                value = operation.get('duration')
-                if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
-                    operation['duration'] = str(value)
+                if 'duration' in operation:
+                    operation['duration'] = _editable_integer(operation['duration'])
                 requirements = operation.get('required_workers', [])
                 if isinstance(requirements, list):
                     for requirement in requirements:
-                        if not isinstance(requirement, dict):
-                            continue
-                        count = requirement.get('count')
-                        if isinstance(count, int) and not isinstance(count, bool) and abs(count) > 2**53 - 1:
-                            requirement['count'] = str(count)
+                        if isinstance(requirement, dict) and 'count' in requirement:
+                            requirement['count'] = _editable_integer(requirement['count'])
         if text is None:
             buffer = StringIO()
             YAML(typ='safe', pure=True).dump(draft, buffer)
