@@ -30,6 +30,12 @@ class ImportModel(BaseModel):
     name: str = 'Imported YAML'
 
 
+class EditYaml(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    yaml: str
+    expected_yaml: str | None = None
+
+
 class EditParameters(BaseModel):
     model_config = ConfigDict(extra='forbid')
     kind: Literal['node', 'route', 'machine', 'worker']
@@ -93,6 +99,11 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
     @app.post('/api/project/import')
     def import_model(body: ImportModel) -> JSONResponse:
         result = session.import_yaml(body.yaml, body.name)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/yaml')
+    def edit_yaml(body: EditYaml) -> JSONResponse:
+        result = session.edit_yaml(body.yaml, expected_yaml=body.expected_yaml)
         return JSONResponse(result, status_code=200 if result['accepted'] else 422)
 
     @app.post('/api/project/edit')

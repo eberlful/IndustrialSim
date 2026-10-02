@@ -391,3 +391,65 @@ test('blank resource capacities and Worker counts can be corrected to one', asyn
   await page.getByRole('button', { name: 'Apply requirements', exact: true }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
 });
+
+test('advanced YAML shares the form draft, preserves invalid text and reloads exports', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content').fill(reference);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.locator('.react-flow__node').filter({ hasText: 'buf-body-out' }).click();
+  await page.getByLabel('Buffer capacity').fill('8');
+  await page.getByRole('button', { name: 'Apply parameters', exact: true }).click();
+  await page.getByRole('button', { name: 'YAML editor', exact: true }).click();
+  const editor = page.getByLabel('Advanced YAML content');
+  const current = await editor.inputValue();
+  expect(current).toContain('capacity: 8');
+  for (const section of ['telemetry:', 'process_plans:', 'decision_triggers:', 'maintenance:']) expect(current).toContain(section);
+  const advanced = current.replace('initial_health: 1.0', 'initial_health: 0.8');
+  await editor.fill(advanced);
+  // Switching to forms submits pending text first.
+  await page.getByRole('button', { name: 'Visual editor', exact: true }).click();
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await page.getByText('All resource properties', { exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Properties' })).toContainText('0.8');
+  await page.getByRole('button', { name: 'YAML editor', exact: true }).click();
+  await expect(editor).toHaveValue(advanced);
+  await editor.fill('episode: [');
+  await page.getByLabel('Draft filename').fill('invalid-yaml.json');
+  // Saving a draft also submits pending invalid text.
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByText('Draft saved: invalid-yaml.json', { exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toContainText('YAML parsing error');
+  await expect(page.getByRole('button', { name: 'Download YAML' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Visual editor', exact: true }).click();
+  await expect(page.getByText('Visual editing unavailable', { exact: true })).toBeVisible();
+  await expect(page.locator('.react-flow__node')).toHaveCount(0);
+  await page.reload();
+  await expect(editor).toHaveValue('episode: [');
+  await page.getByLabel('Saved draft').selectOption('invalid-yaml.json');
+  await page.getByRole('button', { name: 'Open draft', exact: true }).click();
+  await expect(editor).toHaveValue('episode: [');
+  await editor.fill(advanced.replace('initial_health: 0.8', 'initial_health: 2.0'));
+  await page.getByRole('button', { name: 'Apply YAML', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('initial_health');
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(editor).toHaveValue('episode: [');
+  await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  await expect(editor).toHaveValue(/initial_health: 2.0/);
+  await editor.fill(advanced);
+  await page.getByLabel('Save as project path').fill('advanced-yaml.yaml');
+  // Executable save validates and uses the pending corrected text.
+  await page.getByRole('button', { name: 'Save YAML', exact: true }).click();
+  await expect(page.getByText('Saved: advanced-yaml.yaml', { exact: true })).toBeVisible();
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download YAML' }).click();
+  const exported = readFileSync((await (await downloading).path())!, 'utf8');
+  expect(exported).toBe(advanced);
+  await page.getByLabel('YAML content', { exact: true }).fill(exported);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await page.getByRole('button', { name: 'Visual editor', exact: true }).click();
+  await page.locator('.react-flow__node').filter({ hasText: 'buf-body-out' }).click();
+  await expect(page.getByLabel('Buffer capacity')).toHaveValue('8');
+  await page.getByRole('button', { name: 'YAML editor', exact: true }).click();
+  await expect(editor).toHaveValue(exported);
+});

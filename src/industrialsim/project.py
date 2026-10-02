@@ -60,8 +60,8 @@ class ProjectSession:
         self._lock = RLock()
         self._draft: dict[str, Any] | None = None
         self._layout_identity = ''
-        self._undo: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        self._redo: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        self._undo: list[tuple[dict[str, Any] | None, dict[str, Any]]] = []
+        self._redo: list[tuple[dict[str, Any] | None, dict[str, Any]]] = []
 
     def models(self) -> list[str]:
         paths = set(self.directory.rglob('*.yaml')) | set(self.directory.rglob('*.yml'))
@@ -152,7 +152,37 @@ class ProjectSession:
         layout = deepcopy(self._model['layout']) if self._model else {'positions': {}, 'grouping': 'none'}
         self._model = {'layout': layout, 'name': name, 'yaml': text, 'configuration': config,
                        'graph': graph, 'plant': config.get('plant'),
-                       'valid': result.is_valid and not errors, 'diagnostics': errors}
+                       'valid': result.is_valid and not errors, 'diagnostics': errors, 'graph_available': True}
+
+    def edit_yaml(self, text: str, *, expected_yaml: str | None = None) -> dict[str, Any]:
+        """Replace the complete draft; retain invalid text for correction."""
+        with self._lock:
+            if self._model is None:
+                return self._rejected(['Open a model before editing YAML'])
+            if expected_yaml is not None and expected_yaml != self._model['yaml']:
+                return self._rejected(['The draft changed since this YAML was loaded. Reload the current draft before applying edits.'])
+            if text == self._model['yaml']:
+                return {**self.snapshot(), 'accepted': True}
+            self._undo.append((deepcopy(self._draft), deepcopy(self._model)))
+            self._redo.clear()
+            self._set_text(text, self._model['name'])
+            return {**self.snapshot(), 'accepted': True}
+
+    def _set_text(self, text: str, name: str) -> None:
+        result = validate_config(text + '\n')
+        if result.is_valid:
+            draft = YAML(typ='safe', pure=True).load(text)
+            self._set_draft(draft, name, text)
+            assert self._model is not None
+            node_ids = {node['id'] for node in self._model['graph']['nodes']}
+            self._model['layout']['positions'] = {node_id: position for node_id, position
+                in self._model['layout']['positions'].items() if node_id in node_ids}
+        else:
+            layout = deepcopy(self._model['layout']) if self._model else {'positions': {}, 'grouping': 'none'}
+            self._draft = None
+            self._model = {'layout': layout, 'name': name, 'yaml': text, 'configuration': {},
+                           'graph': {'nodes': [], 'routes': []}, 'plant': None,
+                           'valid': False, 'diagnostics': result.errors, 'graph_available': False}
 
     def edit_parameters(
         self, kind: str, element_id: str, changes: dict[str, Any],
@@ -308,7 +338,8 @@ class ProjectSession:
                 path.parent.mkdir(exist_ok=True)
                 document = {'version': 1, 'kind': 'industrialsim-project-draft',
                             'name': self._model['name'], 'yaml': self._model['yaml'],
-                            'layout': self._model['layout'], 'layout_identity': self._layout_identity}
+                            'layout': self._model['layout'], 'layout_identity': self._layout_identity,
+                            'graph_available': self._model['graph_available']}
                 _atomic_write(path, json.dumps(document, allow_nan=False), overwrite=overwrite)
                 return {**self.snapshot(), 'accepted': True, 'saved_draft': name, 'drafts': self.drafts()}
             except (OSError, ValueError) as exc:
@@ -327,11 +358,14 @@ class ProjectSession:
                 identity = document['layout_identity']
                 if not isinstance(identity, str) or len(identity) != 64 or any(c not in '0123456789abcdef' for c in identity):
                     raise ValueError('Invalid draft layout identity')
-                draft = YAML(typ='safe', pure=True).load(document['yaml'])
-                if not isinstance(draft, dict):
-                    raise ValueError('Draft configuration must be a mapping')
-                check_graph_shape(draft)
-                self._set_draft(draft, document['name'], document['yaml'])
+                if document.get('graph_available', True):
+                    draft = YAML(typ='safe', pure=True).load(document['yaml'])
+                    if not isinstance(draft, dict):
+                        raise ValueError('Draft configuration must be a mapping')
+                    check_graph_shape(draft)
+                    self._set_draft(draft, document['name'], document['yaml'])
+                else:
+                    self._set_text(document['yaml'], document['name'])
                 self._validate_layout(document['layout'])
                 assert self._model is not None
                 self._model['layout'] = document['layout']
@@ -352,10 +386,10 @@ class ProjectSession:
             return self._restore(self._redo, self._undo)
 
     def _restore(
-        self, source: list[tuple[dict[str, Any], dict[str, Any]]],
-        destination: list[tuple[dict[str, Any], dict[str, Any]]],
+        self, source: list[tuple[dict[str, Any] | None, dict[str, Any]]],
+        destination: list[tuple[dict[str, Any] | None, dict[str, Any]]],
     ) -> dict[str, Any]:
-        if not source or self._draft is None or self._model is None:
+        if not source or self._model is None:
             return self._rejected(['No change to restore'])
         destination.append((deepcopy(self._draft), deepcopy(self._model)))
         self._draft, self._model = source.pop()
@@ -363,8 +397,10 @@ class ProjectSession:
 
     def export_yaml(self) -> dict[str, Any]:
         with self._lock:
-            if self._model is None or self._draft is None:
+            if self._model is None:
                 return self._rejected(['Open a model before exporting'])
+            if self._draft is None:
+                return self._rejected(self._model['diagnostics'])
             result = validate_config(self._draft)
             errors = list(dict.fromkeys([*result.errors, *graph_diagnostics(self._draft)]))
             if not result.is_valid or errors:
@@ -416,7 +452,7 @@ class ProjectSession:
         assert self._model is not None
         ids = {node['id'] for node in self._model['graph']['nodes']}
         for node_id, position in layout['positions'].items():
-            if node_id not in ids:
+            if self._model['graph_available'] and node_id not in ids:
                 raise ValueError(f'Unknown layout node {node_id}')
             if not isinstance(position, dict) or set(position) != {'x', 'y'} or any(
                 isinstance(value, bool) or not isinstance(value, (int, float))

@@ -13,6 +13,8 @@ function App() {
   const [path, setPath] = useState('');
   const [yaml, setYaml] = useState('');
   const [name, setName] = useState('Imported YAML');
+  const [view, setView] = useState<'visual' | 'yaml'>('visual');
+  const [editorYaml, setEditorYaml] = useState('');
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [selection, setSelection] = useState<{ kind: 'node' | 'route' | 'machine' | 'worker'; id: string } | null>(null);
@@ -27,36 +29,65 @@ function App() {
     fetch('/api/project').then(async (response) => {
       if (!response.ok) throw new Error(`Project request failed (${response.status})`);
       return response.json() as Promise<Project>;
-    }).then((result) => { setProject(result); setPath(result.models?.[0] ?? ''); setDraftPath(result.drafts?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); })
+    }).then((result) => { setProject(result); setPath(result.models?.[0] ?? ''); setDraftPath(result.drafts?.[0] ?? ''); setDiagnostics(result.diagnostics ?? []); setEditorYaml(result.model?.yaml ?? ''); if (result.model && !result.model.graph_available) setView('yaml'); })
       .catch((error: Error) => setDiagnostics([error.message]));
   }, []);
-  async function load(endpoint: string, body: object) {
+  async function request(endpoint: string, body: object): Promise<boolean> {
     setBusy(true);
     try {
       const response = await fetch(`/api/project/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const result: Project = await response.json();
       if (result.accepted) {
         setProject((previous) => ({ ...previous, ...result }));
+        setEditorYaml(result.model?.yaml ?? '');
+        if (endpoint === 'draft/open' && result.model && !result.model.graph_available) setView('yaml');
         if (endpoint === 'open' || endpoint === 'import' || endpoint === 'draft/open') setSelection(null);
         if (endpoint !== 'save') setSaved('');
         setDiagnostics(result.diagnostics ?? []);
         if (result.saved_draft) { setDraftSaved(`Draft saved: ${result.saved_draft}`); setDraftPath(result.saved_draft); setDraftOverwrite(false); }
         else setDraftSaved('');
         if (result.saved_path) { setSaved(`Saved: ${result.saved_path}`); setPath(result.saved_path); setOverwrite(false); }
+        return true;
       } else {
         setDiagnostics(result.diagnostics ?? [`Request failed (${response.status}). Check the YAML and retry.`]);
+        return false;
       }
     } catch (error) {
       setDiagnostics([error instanceof Error ? error.message : 'Could not reach the local service.']);
+      return false;
     } finally { setBusy(false); }
   }
   const model: Model | null = project.model;
+  const yamlDirty = !!model && editorYaml !== model.yaml;
+  async function submitYaml(): Promise<boolean> {
+    if (!yamlDirty || !model) return true;
+    return request('yaml', { yaml: editorYaml, expected_yaml: model.yaml });
+  }
+  async function load(endpoint: string, body: object): Promise<void> {
+    if (['save', 'draft/save', 'undo'].includes(endpoint) && !await submitYaml()) return;
+    await request(endpoint, body);
+  }
+  async function switchView(next: 'visual' | 'yaml') {
+    if (next === 'visual' && !await submitYaml()) return;
+    setView(next);
+  }
+  async function reloadYaml() {
+    setBusy(true);
+    try {
+      const response = await fetch('/api/project');
+      if (!response.ok) throw new Error('Could not reload the current draft.');
+      const result: Project = await response.json();
+      setProject(result); setEditorYaml(result.model?.yaml ?? ''); setDiagnostics(result.diagnostics ?? []);
+    } catch (error) { setDiagnostics([error instanceof Error ? error.message : 'Could not reload the current draft.']); }
+    finally { setBusy(false); }
+  }
   const selectedElement = selection?.kind === 'node'
     ? model?.graph.nodes.find(node => node.id === selection.id)
     : selection?.kind === 'route' ? model?.graph.routes.find(route => route.id === selection.id) : undefined;
   const selectedResource = model && (selection?.kind === 'machine' || selection?.kind === 'worker')
     ? resourceDefinitions(model, selection.kind).find(resource => resource.id === selection.id) : undefined;
   async function download() {
+    if (!await submitYaml()) return;
     setBusy(true);
     try {
       const response = await fetch('/api/project/export');
@@ -74,24 +105,34 @@ function App() {
   }
   return <main>
     <header><div><p className="eyebrow">INDUSTRIALSIM / LOCAL PROJECT</p><h1>Plant workspace</h1><p className="project-path">{project.project || 'Connecting to local service…'}</p></div>
-      <div className="status" role="status">{busy ? '◷ Validating…' : model ? model.valid ? '✓ Model valid' : '⚠ Draft invalid' : '○ No model loaded'}</div></header>
+      <div className="status" role="status">{busy ? '◷ Validating…' : yamlDirty ? '○ YAML needs validation' : model ? model.valid ? '✓ Model valid' : '⚠ Draft invalid' : '○ No model loaded'}</div></header>
     <section className="toolbar" aria-label="Project controls">
       <label>Project model <select value={path} onChange={(event) => setPath(event.target.value)} disabled={busy}>
         {!project.models?.length && <option value="">No project YAML files</option>}
         {project.models?.map((file) => <option key={file}>{file}</option>)}
       </select></label>
-      <button disabled={busy || !path} onClick={() => void load('open', { path })}>Open model</button>
-      {model && <><label>Display grouping<select aria-label="Display grouping" value={model.layout.grouping} disabled={busy}
+      <button disabled={busy || yamlDirty || !path} onClick={() => void load('open', { path })}>Open model</button>
+      {model?.graph_available && <><label>Display grouping<select aria-label="Display grouping" value={model.layout.grouping} disabled={busy || view === 'yaml'}
         onChange={event => { const grouping = event.target.value as 'none' | 'area' | 'hall'; void load('layout', { grouping, positions: arrangedPositions(model, grouping) }); }}>
         <option value="none">None</option><option value="area">Area</option><option value="hall">Hall</option>
-      </select></label><button disabled={busy} onClick={() => void load('layout/save', {})}>Save layout</button></>}
+      </select></label><button disabled={busy || view === 'yaml'} onClick={() => void load('layout/save', {})}>Save layout</button></>}
+      {model && <><button disabled={busy} aria-pressed={view === 'visual'} onClick={() => void switchView('visual')}>Visual editor</button><button disabled={busy} aria-pressed={view === 'yaml'} onClick={() => void switchView('yaml')}>YAML editor</button></>}
       <span>{model ? `Loaded: ${model.name}` : 'Open a project model or import YAML below'}</span>
-      <button disabled={busy || !project.can_undo} onClick={() => void load('undo', {})}>Undo</button>
-      <button disabled={busy || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
-      <button disabled={busy || !model?.valid} onClick={() => void download()}>Download YAML</button>
+      <button disabled={busy || (!project.can_undo && !yamlDirty)} onClick={() => void load('undo', {})}>Undo</button>
+      <button disabled={busy || yamlDirty || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
+      <button disabled={busy || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
     </section>
     {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
-    <div className="workspace">
+    {model && view === 'yaml' && <section className="import-panel yaml-editor" aria-label="Advanced YAML editor">
+      <h2>Advanced YAML editor</h2>
+      <p>Edit the complete simulation configuration. Switching to visual editing or saving submits and validates this text. Invalid text can be saved as an incomplete draft.</p>
+      <label>Advanced YAML content<textarea spellCheck={false} value={editorYaml} disabled={busy} onChange={event => { setEditorYaml(event.target.value); setSaved(''); setDraftSaved(''); }}/></label>
+      <button disabled={busy || !yamlDirty} onClick={() => void submitYaml()}>Apply YAML</button>
+      <button disabled={busy} onClick={() => void reloadYaml()}>Reload current YAML</button>
+      {yamlDirty && <p role="note">YAML changes await validation.</p>}
+    </section>}
+    {model && view === 'visual' && !model.graph_available && <section className="import-panel" aria-label="Unavailable visual editor"><h2>Visual editing unavailable</h2><p>The current YAML draft has validation errors. Its text is retained. Use the YAML editor to correct it or undo the edit.</p></section>}
+    {view === 'visual' && (!model || model.graph_available) && <div className="workspace">
       <section className="graph-panel" aria-label="Material Flow Graph">
         <div className="panel-title"><h2>Material Flow Graph</h2><span>{model ? `${model.graph.nodes.length} nodes · ${model.graph.routes.length} routes` : 'No topology yet'}</span></div>
         <div className="graph-canvas">{model ? <Graph key={model.name} model={model} busy={busy} onMove={positions => void load('layout', { positions })} onSelect={element => setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id })}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
@@ -115,12 +156,12 @@ function App() {
         <section className="panel" aria-label="Episode controls"><h2>Episode</h2><p>○ Not started</p><button disabled>Start Episode</button><p className="hint">Execution controls will be available in a subsequent implementation issue.</p>{model && <details><summary>Loaded Episode inputs</summary><pre>{JSON.stringify({ seed: model.configuration.seed, episode: model.configuration.episode }, null, 2)}</pre></details>}</section>
         <section className="panel"><h2>Plant organization</h2><p className="hint">Area and Hall locations are separate from material flow.</p>{model?.plant ? <><h3>{model.plant.name}</h3>{model.plant.areas.map((area) => <details key={area.id}><summary>{area.name}</summary><ul>{area.halls.map((hall) => <li key={hall.id}>{hall.name} <small>({hall.id})</small></li>)}</ul></details>)}</> : <p>No Plant hierarchy declared.</p>}</section>
       </aside>
-    </div>
+    </div>}
     {model && <section className="import-panel save-panel" aria-label="Save model">
       <h2>Save validated YAML</h2><p>Save explicitly to a project-local file. Existing files require overwrite to be enabled.</p>
       <label>Save as project path<input value={savePath} disabled={busy} onChange={event => { setSavePath(event.target.value); setOverwrite(false); setSaved(''); }}/></label>
       <label><input type="checkbox" checked={overwrite} disabled={busy} onChange={event => setOverwrite(event.target.checked)}/>Overwrite existing file at this path</label>
-      <button disabled={busy || !model.valid || !savePath.trim()} onClick={() => void load('save', { path: savePath, overwrite })}>Save YAML</button>
+      <button disabled={busy || (!model.valid && !yamlDirty) || !savePath.trim()} onClick={() => void load('save', { path: savePath, overwrite })}>Save YAML</button>
       {saved && <p>{saved}</p>}
     </section>}
     <section className="import-panel save-panel" aria-label="Project drafts">
@@ -131,17 +172,17 @@ function App() {
       <label>Saved draft<select value={draftPath} disabled={busy} onChange={event => setDraftPath(event.target.value)}>
         <option value="">Choose a draft…</option>{project.drafts?.map(file => <option key={file}>{file}</option>)}
       </select></label>
-      <button disabled={busy || !draftPath} onClick={() => void load('draft/open', { path: draftPath })}>Open draft</button>
+      <button disabled={busy || yamlDirty || !draftPath} onClick={() => void load('draft/open', { path: draftPath })}>Open draft</button>
       {draftSaved && <p>{draftSaved}</p>}
     </section>
     <details className="import-panel" open><summary>Import simulation YAML</summary>
       <p>Imports are validated in memory. Original files are preserved.</p>
-      <label>YAML file <input type="file" accept=".yaml,.yml,text/yaml" disabled={busy} onChange={async (event) => {
+      <label>YAML file <input type="file" accept=".yaml,.yml,text/yaml" disabled={busy || yamlDirty} onChange={async (event) => {
         const file = event.target.files?.[0];
         if (file) { try { setYaml(await file.text()); setName(file.name); } catch { setDiagnostics(['Could not read the selected YAML file.']); } }
       }}/></label>
-      <label>YAML content <textarea spellCheck={false} value={yaml} disabled={busy} onChange={(event) => { setYaml(event.target.value); setName('Imported YAML'); }}/></label>
-      <button disabled={busy || !yaml.trim()} onClick={() => void load('import', { yaml, name })}>Validate and import</button>
+      <label>YAML content <textarea spellCheck={false} value={yaml} disabled={busy || yamlDirty} onChange={(event) => { setYaml(event.target.value); setName('Imported YAML'); }}/></label>
+      <button disabled={busy || yamlDirty || !yaml.trim()} onClick={() => void load('import', { yaml, name })}>Validate and import</button>
     </details>
     {model && <details className="import-panel"><summary>Complete project draft</summary><p>Includes sections outside the graph. Edits and export use this project draft.</p><pre>{JSON.stringify(model.configuration, null, 2)}</pre></details>}
   </main>;
