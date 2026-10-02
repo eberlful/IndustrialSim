@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import threading
-from typing import Any, AsyncIterator, Awaitable, Callable, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Sequence
 import webbrowser
 
 from fastapi import FastAPI, Request
@@ -28,6 +28,20 @@ class ImportModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
     yaml: str
     name: str = 'Imported YAML'
+
+
+class EditParameters(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    kind: Literal['node', 'route']
+    element_id: str
+    changes: dict[str, Any]
+    operation_id: str | None = None
+
+
+class SaveModel(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    path: str
+    overwrite: bool = False
 
 
 def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None = None) -> FastAPI:
@@ -66,6 +80,36 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
     def import_model(body: ImportModel) -> JSONResponse:
         result = session.import_yaml(body.yaml, body.name)
         return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/edit')
+    def edit_parameters(body: EditParameters) -> JSONResponse:
+        result = session.edit_parameters(body.kind, body.element_id, body.changes,
+                                         operation_id=body.operation_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/undo')
+    def undo() -> JSONResponse:
+        result = session.undo()
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/redo')
+    def redo() -> JSONResponse:
+        result = session.redo()
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.get('/api/project/export')
+    def export_yaml() -> Response:
+        result = session.export_yaml()
+        if not result['accepted']:
+            return JSONResponse(result, status_code=422)
+        return Response(result['yaml'], media_type='application/yaml',
+                        headers={'Content-Disposition': 'attachment; filename="plant.yaml"'})
+
+    @app.post('/api/project/save')
+    def save_model(body: SaveModel) -> JSONResponse:
+        result = session.save_model(body.path, overwrite=body.overwrite)
+        return JSONResponse({**result, 'models': session.models()},
+                            status_code=200 if result['accepted'] else 422)
 
     app.mount('/', StaticFiles(directory=assets, html=True), name='frontend')
     return app

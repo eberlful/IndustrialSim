@@ -48,3 +48,10 @@ textarea { display: block; width: 100%; height: 160px; margin-top: 8px; border: 
 :focus-visible { outline: 3px solid #6c91da; outline-offset: 2px; }
 @media (max-width: 950px) { .workspace { grid-template-columns: minmax(0, 1fr); } aside { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; } .graph-canvas { height: 500px; } }
 .route-label { position: absolute; pointer-events: all; z-index: 10; padding: 3px 6px; background: white; color: #22334a; border: 1px solid #d8e0e9; font-size: 11px; }
+.property-form { display: grid; gap: 10px; margin: 16px 0; }
+.property-form label { display: grid; gap: 5px; }
+.property-form input, .property-form select, .save-panel input:not([type=checkbox]) { min-width: 0; width: 100%; padding: 8px; border: 1px solid #ced8e4; border-radius: 5px; }
+.field-errors { color: #87541a; font-size: 12px; padding-left: 18px; overflow-wrap: anywhere; }
+.save-panel label { max-width: 600px; }
+.property-form textarea { height: 80px; }
+.property-form small { color: #64748b; font-size: 11px; }

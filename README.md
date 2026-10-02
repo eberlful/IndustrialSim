@@ -199,16 +199,32 @@ Choose a YAML file or paste YAML in **Import simulation YAML**, then select
 a failed import leaves the accepted model visible. Imports retain the original
 YAML and full validated configuration in the service's memory without writing to
 any source file. Reopening the browser reconnects to that accepted model; restarting
-the service requires opening/importing it again. Saving, persistent layouts, editing
-and Episode execution are covered by subsequent frontend issues. The Episode panel
-currently shows the loaded inputs and an explicit **Not started** status.
+the service requires opening/importing it again. Select a node to edit its Hall assignment, Buffer capacity, Station output capacity
+or individual Operation durations. Select a route to edit its transit time,
+capacity, required capabilities and vehicle pool. Enter one capability per line;
+commas remain part of a capability name. Durations accept units such as
+`125s` or `2m`; bare integers mean nanoseconds. Apply the corresponding form to
+update the authoritative project draft. Invalid edits stay visible with property
+and reference diagnostics. **Undo** and **Redo** restore both values and validation
+state, including after a browser reload; a successful open/import starts a new
+history. History and drafts are held in service memory.
+
+**Download YAML** exports the fully validated draft. **Save YAML** writes it to the
+specified project-relative `.yaml`/`.yml` path; its parent directory must exist.
+Replacing an existing file requires checking **Overwrite existing file at this
+path** and explicitly saving. Invalid drafts cannot be saved as executable YAML
+or downloaded. Saves preserve all semantic configuration, including advanced
+sections that forms do not display; YAML formatting and comments may change.
+Reopen the saved file to load its edited values. Persistent layouts, advanced YAML
+editing and Episode execution are covered by subsequent frontend issues. The
+Episode panel currently shows loaded inputs and an explicit **Not started** status.
 
 Frontend developer checks:
 
 ```bash
 npm --prefix frontend ci
 npm --prefix frontend run typecheck
-uv run --no-default-groups --extra frontend pytest tests/test_project_session.py
+uv run --no-default-groups --extra frontend pytest tests/test_project_session.py tests/test_project_editing.py
 # After installing Playwright's Chromium once:
 cd frontend
 npx playwright install chromium
