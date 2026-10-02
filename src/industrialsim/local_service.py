@@ -44,6 +44,11 @@ class EditParameters(BaseModel):
     operation_id: str | None = None
 
 
+class EditEpisode(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    changes: dict[str, Any]
+
+
 class EditStructure(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['add', 'update', 'delete']
@@ -110,6 +115,11 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
     def edit_parameters(body: EditParameters) -> JSONResponse:
         result = session.edit_parameters(body.kind, body.element_id, body.changes,
                                          operation_id=body.operation_id)
+        return JSONResponse(result, status_code=200 if result['accepted'] else 422)
+
+    @app.post('/api/project/episode')
+    def edit_episode(body: EditEpisode) -> JSONResponse:
+        result = session.edit_episode(body.changes)
         return JSONResponse(result, status_code=200 if result['accepted'] else 422)
 
     @app.post('/api/project/structure')

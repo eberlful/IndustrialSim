@@ -25,6 +25,14 @@ def _editable_integer(value: Any) -> Any:
     return value
 
 
+def _editable_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _editable_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_editable_values(item) for item in value]
+    return _editable_integer(value)
+
+
 def _atomic_write(path: Path, text: str, *, overwrite: bool) -> None:
     """Publish a complete file, with exclusive creation unless overwrite is explicit."""
     temporary: Path | None = None
@@ -152,6 +160,11 @@ class ProjectSession:
         layout = deepcopy(self._model['layout']) if self._model else {'positions': {}, 'grouping': 'none'}
         self._model = {'layout': layout, 'name': name, 'yaml': text, 'configuration': config,
                        'graph': graph, 'plant': config.get('plant'),
+                       'episode_inputs': _editable_values({
+                           'seed': draft.get('seed', 42),
+                           'episode': draft['episode'],
+                           'production_plan': draft.get('production_plan', []),
+                       }),
                        'valid': result.is_valid and not errors, 'diagnostics': errors, 'graph_available': True}
 
     def edit_yaml(self, text: str, *, expected_yaml: str | None = None) -> dict[str, Any]:
@@ -243,6 +256,40 @@ class ProjectSession:
             if not changes:
                 return {**self.snapshot(), 'accepted': True}
             element.update(deepcopy(changes))
+            self._remember_draft()
+            self._set_draft(draft, self._model['name'])
+            return {**self.snapshot(), 'accepted': True}
+
+    def edit_episode(self, changes: dict[str, Any]) -> dict[str, Any]:
+        """Prepare inputs without changing the end-condition type or other sections.
+
+        Invalid values stay in the draft and use the same validation/export gate
+        as Plant edits. Explicit Production Units are retained, including any
+        conflicts the domain validator reports with a changed Production Plan.
+        """
+        with self._lock:
+            if self._draft is None or self._model is None:
+                return self._rejected(['Open a model before editing Episode inputs'])
+            if set(changes) - {'seed', 'max_time', 'production_plan'}:
+                return self._rejected(['Unsupported Episode input properties'])
+            if 'production_plan' in changes and (
+                not isinstance(changes['production_plan'], list)
+                or any(not isinstance(row, dict) for row in changes['production_plan'])
+            ):
+                return self._rejected(['Production Plan must be a table of mappings'])
+            if not changes:
+                return {**self.snapshot(), 'accepted': True}
+            draft = deepcopy(self._draft)
+            if 'seed' in changes:
+                draft['seed'] = deepcopy(changes['seed'])
+            if 'max_time' in changes:
+                episode = dict(draft['episode'])
+                end = dict(episode['end_condition'])
+                end['max_time'] = deepcopy(changes['max_time'])
+                episode['end_condition'] = end
+                draft['episode'] = episode
+            if 'production_plan' in changes:
+                draft['production_plan'] = deepcopy(changes['production_plan'])
             self._remember_draft()
             self._set_draft(draft, self._model['name'])
             return {**self.snapshot(), 'accepted': True}
