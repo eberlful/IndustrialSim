@@ -42,6 +42,9 @@ export function EpisodeInspection({ episode, selection, onSelect, available = fa
   const observation = episode.observation;
   if (!observation) return <p>Waiting for the first authoritative snapshot…</p>;
   const entity = selection ? observation[selection.kind][selection.id] : null;
+  const contracts = available && selection ? observation.requests?.filter(request => request.target_id === selection.id
+    || request.observation.unit_id === selection.id
+    || (Array.isArray(request.observation.occupants) && request.observation.occupants.some(unit => unit.unit_id === selection.id))) ?? [] : [];
   const node = selection?.kind === 'stations' ? observation.stations[selection.id] : selection?.kind === 'buffers' ? observation.buffers[selection.id] : null;
   const resources = node ? resourcesAtNode(observation, node.id) : [];
   return <section aria-label="Live entity details" className="panel">
@@ -51,11 +54,19 @@ export function EpisodeInspection({ episode, selection, onSelect, available = fa
       <option value="">Choose a Machine or Worker…</option>
       {(['machines', 'workers'] as const).map(kind => <optgroup key={kind} label={kind}>{Object.keys(observation[kind]).map(id => <option key={id} value={`${kind}:${id}`}>{id}</option>)}</optgroup>)}
     </select></label>
+    <label>Live Production Unit<select aria-label="Live Production Unit" value={selection?.kind === 'production_units' ? selection.id : ''}
+      onChange={event => { if (event.target.value) onSelect({ kind: 'production_units', id: event.target.value }); }}>
+      <option value="">Choose a Production Unit…</option>
+      {Object.keys(observation.production_units).map(id => <option key={id} value={id}>{id}</option>)}
+    </select></label>
+    {selection?.kind === 'production_units' && !entity && <p>Selected Production Unit observations: Unavailable</p>}
     {entity ? <div aria-label={selection?.kind === 'production_units' ? 'Production Unit details' : 'Resource state'}>
       <h3>{entity.id}</h3><pre>{JSON.stringify(entity, (_key, value) => available && value === null ? 'Unavailable' : value, 2)}</pre>
+      {contracts.map(request => <details key={request.request_id}><summary>{request.request_id} · Exact observation contract</summary><pre>{JSON.stringify(request.observation, null, 2)}</pre></details>)}
     </div> : <p>Select a Station or Buffer in the Episode graph, or choose a resource.</p>}
     {node && <><h3>Production Units</h3>{node.unit_ids == null ? <p>Production Units: Unavailable</p> : node.unit_ids.length === 0 ? <p>No Production Units at this node.</p> : node.unit_ids.map(id =>
       <button key={id} onClick={() => onSelect({ kind: 'production_units', id })}>{id}</button>)}
+      {node.observed_unit_ids?.map(id => <button key={`observed:${id}`} onClick={() => onSelect({ kind: 'production_units', id })}>Observed: {id}</button>)}
       <h3>Resources</h3>{resources.map(({ kind, resource }) => <button key={`${kind}:${resource.id}`} onClick={() => onSelect({ kind, id: resource.id })}>{resource.id} · {resource.available_capacity ?? 'Unavailable'}/{resource.capacity ?? 'Unavailable'} available</button>)}
     </>}
   </section>;

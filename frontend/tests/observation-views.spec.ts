@@ -45,3 +45,36 @@ test('switching views preserves provider input and exposes only contracted entit
   await page.getByRole('button', { name: 'Continue Episode', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Outcome:', exact: false })).toBeVisible();
 });
+
+
+test('Routing request keeps observed Production Unit details visible across views', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content', { exact: true }).fill(`
+episode: {end_condition: {type: all_units_terminal}}
+production_units: [{id: unit, variant: sedan, source_id: source}]
+material_flow:
+  nodes:
+    - {id: source, kind: source, output_ports: [{id: out, direction: output, port_type: body}]}
+    - {id: sink, kind: sink, input_ports: [{id: in, direction: input, port_type: body}]}
+  routes:
+    - {id: route, source_node_id: source, source_port_id: out, target_node_id: sink, target_port_id: in, transit_time: 1s}
+decision_triggers:
+  - {id: route-choice, trigger_type: routing_decision, node_id: source}
+`);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByLabel('Decision mode', { exact: true }).selectOption('manual');
+  await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
+  await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Awaiting decisions');
+  await page.getByLabel('Live Production Unit', { exact: true }).selectOption('unit');
+  await expect(page.getByLabel('Production Unit details')).toContainText('"variant": "sedan"');
+  await page.getByRole('button', { name: 'Available observations', exact: true }).click();
+  await expect(page.getByLabel('Production Unit details')).toContainText('"variant": "sedan"');
+  await expect(page.getByLabel('Production Unit details')).toContainText('"location": "source"');
+  await expect(page.getByLabel('Production Unit details')).toContainText('"quality_state": "Unavailable"');
+  await page.getByRole('button', { name: 'Submit complete Decision Batch', exact: true }).click();
+  await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Paused');
+  await expect(page.getByText('Selected Production Unit observations: Unavailable', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Continue Episode', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Outcome:', exact: false })).toBeVisible();
+});

@@ -13,6 +13,7 @@ function MaterialNode({ data }: NodeProps<PlantNode>) {
     <strong>{node.id}</strong>
     {data.live && <span className="occupancy">Occupancy: {data.live.occupancy ?? 'Unavailable'}{data.live.capacity != null ? ` / ${data.live.capacity}` : ''}
       {data.live.busy ? ' · busy' : ''}{data.live.blocked ? ' · blocked' : ''}</span>}
+    {data.live?.observed_unit_ids?.length ? <span>Observed Production Units: {data.live.observed_unit_ids.join(', ')}</span> : null}
     {data.resources && <span>{data.resources}</span>}
     {node.hall_id && <span className="hall">Hall: {node.hall_id}</span>}
     <div className="ports">

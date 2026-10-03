@@ -108,3 +108,20 @@ def test_buffer_contract_exposes_occupants_without_hidden_quality() -> None:
     assert unit['findings'] is None
     assert views['available']['requests'] == session.decision_batch()['batch']['requests']
     session.close()
+
+
+def test_routing_contract_unit_details_do_not_require_hidden_inventory() -> None:
+    from test_transport_orders_simulation import VEHICLE_CONTENTION_YAML
+    session = EpisodeSession(VEHICLE_CONTENTION_YAML + '''
+decision_triggers:
+  - {id: route-choice, trigger_type: routing_decision, node_id: src}
+''')
+    session.advance_to_next_decision_batch()
+    views = session.observation_views()
+    unit = views['available']['production_units']['u1']
+    assert unit['variant'] == 'sedan'
+    assert unit['location'] == 'src'
+    assert unit['quality_state'] is None
+    assert unit['process_step_index'] is None
+    assert views['available']['requests'] == session.decision_batch()['batch']['requests']
+    session.close()

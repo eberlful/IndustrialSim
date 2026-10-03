@@ -41,6 +41,21 @@ def available_observations(truth: dict[str, Any], requests: list[dict[str, Any]]
                         'id': unit['unit_id'], 'variant': unit['variant'],
                         'location': buffer_id, 'quality_state': None, 'state': None,
                         'process_step_index': None, 'findings': None,
-                        'contract_observation': deepcopy(unit),
                     }
+        unit_id = observation.get('unit_id')
+        if unit_id:
+            unit = available['production_units'].setdefault(unit_id, {
+                'id': unit_id, 'variant': None, 'location': None, 'state': None,
+                'quality_state': None, 'process_step_index': None, 'findings': None,
+            })
+            if 'variant' in observation:
+                unit['variant'] = observation['variant']
+            if 'current_node_id' in observation:
+                location = observation['current_node_id']
+                unit['location'] = location
+                node = available['stations'].get(location) or available['buffers'].get(location)
+                if node is not None:
+                    observed = node.setdefault('observed_unit_ids', [])
+                    if unit_id not in observed:
+                        observed.append(unit_id)
     return available
