@@ -1711,7 +1711,8 @@ class EpisodeEngine:
         due_date_ns = unit.due_date_ns if unit else None
         findings_count = len(unit.findings) if unit else 0
 
-        c_routes = [self._build_route_summary(r) for r in self.routes_from.get(node_id, [])]
+        routes = self._get_candidate_routes_for_unit(node_id, unit) if unit else self.routes_from.get(node_id, [])
+        c_routes = [self._build_route_summary(r) for r in routes]
 
         return RoutingObservation(
             schema_version="1.0",
@@ -1741,7 +1742,8 @@ class EpisodeEngine:
         due_date_ns = unit.due_date_ns if unit else None
         findings_count = len(unit.findings) if unit else 0
 
-        c_routes = [self._build_route_summary(r) for r in self.routes_from.get(source_node_id, [])]
+        routes = self._get_candidate_routes_for_unit(source_node_id, unit) if unit else self.routes_from.get(source_node_id, [])
+        c_routes = [self._build_route_summary(r) for r in routes]
 
         avail_vehs: list[VehicleSummaryObservation] = []
         for v in self.vehicles.values():
@@ -1751,6 +1753,7 @@ class EpisodeEngine:
                     VehicleSummaryObservation(
                         vehicle_id=v.id,
                         location=v.location,
+                        capabilities=list(v.capabilities),
                         distance_to_pickup_ns=dist,
                         speed_multiplier=v.speed_multiplier,
                     )
@@ -2042,7 +2045,7 @@ class EpisodeEngine:
             is_safe = False
         obs = self._build_strategic_observation(target_id, k.current_time_ns)
         req = DecisionRequest(
-            request_id=f"req-strat-{target_id}-{k.current_time_ns}",
+            request_id=f"req-strat-{target_id}-{trigger_id}-{k.current_time_ns}",
             request_type="strategic",
             time_ns=k.current_time_ns,
             target_id=target_id,
@@ -4891,8 +4894,27 @@ class EpisodeSession:
             return {'accepted': False, 'diagnostics': [diagnostic.model_dump(mode='json') for diagnostic in diagnostics]}
         engine = self._engine
         state_errors = []
+        reserved_occupancy = dict(engine.reserved_route_occupancy)
         for action in response.actions:
-            if isinstance(action, MachineModeAction):
+            if isinstance(action, DispatchAction):
+                order = engine.transport_orders.get(action.target_id)
+                route = engine.routes_by_id.get(action.route_id)
+                vehicle = engine.vehicles.get(action.vehicle_id) if action.vehicle_id else None
+                if order is None or route is None:
+                    state_errors.append('Dispatch must address an existing Transport Order and Route')
+                    continue
+                choice = engine.dispatch_policy.select_dispatch(DispatchContext(
+                    order=order, candidate_routes=[route], available_vehicles=[vehicle] if vehicle else [],
+                    active_route_occupancy=engine.active_route_occupancy,
+                    reserved_route_occupancy=reserved_occupancy,
+                    node_distance_fn=engine._compute_node_distance, can_accept_fn=engine._can_accept,
+                    unconstrained=not engine.vehicles,
+                ))
+                if choice is None:
+                    state_errors.append(f"Vehicle '{action.vehicle_id}' cannot dispatch Route '{action.route_id}': check capabilities, pool, pickup reachability and shared Route capacity")
+                else:
+                    reserved_occupancy[route.id] = reserved_occupancy.get(route.id, 0) + 1
+            elif isinstance(action, MachineModeAction):
                 machine = engine.machines.get(action.target_id)
                 if machine is None or (action.mode != machine.operating_mode and (machine.active_allocations or machine.is_in_maintenance)):
                     state_errors.append(f"Machine '{action.target_id}' must be idle to change mode")

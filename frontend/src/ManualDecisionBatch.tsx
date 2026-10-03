@@ -18,8 +18,15 @@ function proposalFor(pending: PendingDecisionBatch, targetId: string, actionType
 
 export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; onSubmit: (actions: Record<string, unknown>[]) => Promise<EpisodeResponse | undefined> }) {
   const pending = episode.decision_batch!;
-  const [proposals, setProposals] = useState<Proposal[]>(() => pending.batch.requests.map(request =>
-    proposalFor(pending, request.target_id, pending.action_types[request.request_id][0])));
+  const requests = pending.batch.requests.filter((request, index, all) =>
+    all.findIndex(other => other.target_id === request.target_id) === index);
+  function applicableTypes(targetId: string): string[] {
+    const related = pending.batch.requests.filter(request => request.target_id === targetId);
+    return pending.action_types[related[0].request_id].filter(type =>
+      related.every(request => pending.action_types[request.request_id].includes(type)));
+  }
+  const [proposals, setProposals] = useState<Proposal[]>(() => requests.map(request =>
+    proposalFor(pending, request.target_id, applicableTypes(request.target_id)[0])));
   const [errors, setErrors] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   function edit(index: number, name: string, value: string | boolean) {
@@ -29,7 +36,7 @@ export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; o
     setErrors([]);
     let actions: Record<string, unknown>[];
     try {
-      actions = pending.batch.requests.map((request, index) => {
+      actions = requests.map((request, index) => {
         const proposal = proposals[index];
         const schema = pending.action_schemas[proposal.actionType];
         if (!schema) throw new Error(`No supported action contract for ${request.request_id}.`);
@@ -61,15 +68,16 @@ export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; o
     <h2>Decision Batch {pending.batch.batch_id}</h2>
     <p>All {pending.batch.requests.length} requests share simulated time {String(pending.batch.time_ns)} ns. Time stays frozen until this batch is answered.</p>
     <p>Submit every request together. Rejected proposals remain editable and do not invoke fallback.</p>
-    {pending.batch.requests.map((request, index) => {
+    {requests.map((request, index) => {
       const proposal = proposals[index];
       const schema = pending.action_schemas[proposal.actionType];
       return <fieldset key={request.request_id} disabled={submitting}>
         <legend>{request.request_id} · {request.target_id}</legend>
-        <details><summary>Decision Request and shared-boundary observation</summary><pre>{JSON.stringify(request, null, 2)}</pre></details>
+        {pending.batch.requests.filter(related => related.target_id === request.target_id).map(related =>
+          <details key={related.request_id}><summary>{related.request_id} · Decision Request and shared-boundary observation</summary><pre>{JSON.stringify(related, null, 2)}</pre></details>)}
         <label>Action type<select value={proposal.actionType ?? ''} onChange={event => setProposals(current => current.map((old, position) =>
           position === index ? proposalFor(pending, request.target_id, event.target.value) : old))}>
-          {pending.action_types[request.request_id].map(actionType => <option key={actionType} value={actionType}>{actionType.replaceAll('_', ' ')}</option>)}
+          {applicableTypes(request.target_id).map(actionType => <option key={actionType} value={actionType}>{actionType.replaceAll('_', ' ')}</option>)}
         </select></label>
         {!schema && <p role="alert">No supported action contract is available for this request.</p>}
         {Object.entries(schema?.properties ?? {}).filter(([name]) => !['action_type', 'target_id', 'schema_version'].includes(name)).map(([name, field]) => {

@@ -7,6 +7,7 @@ stations: [{id: station, operations: [{id: op, duration: 1s}]}]
 workers: [{id: worker, qualifications: [operator]}]
 decision_triggers:
   - {id: station-safe, trigger_type: safe_point, target_id: station, times_ns: [0], on_failure: abort}
+  - {id: station-safe-again, trigger_type: safe_point, target_id: station, times_ns: [0], on_failure: abort}
   - {id: worker-safe, trigger_type: safe_point, target_id: worker, times_ns: [0], on_failure: abort}
 `;
 
@@ -21,6 +22,9 @@ test('manual batch preserves rejected fields and applies one complete corrected 
   const episode = (await (await context.request.get('/api/episode')).json()).episode;
   const batch = episode.decision_batch.batch;
   expect(typeof batch.time_ns).toBe('string');
+  expect(batch.requests).toHaveLength(3);
+  expect(new Set(batch.requests.map((request: { request_id: string }) => request.request_id)).size).toBe(3);
+  await expect(page.getByLabel('Manual Decision Batch').locator('details')).toHaveCount(3);
   await expect(page.getByRole('group', { name: /station/ })).toBeVisible();
   await expect(page.getByRole('group', { name: /worker/ })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Continue Episode', exact: true })).toBeDisabled();

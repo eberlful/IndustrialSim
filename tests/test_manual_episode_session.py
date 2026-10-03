@@ -351,3 +351,78 @@ machines:
         assert observation['machines']['machine']['in_maintenance']
         assert observation['workers']['worker']['allocations']
         session.close()
+
+
+def test_route_forms_reject_branches_outside_the_units_process_plan() -> None:
+    from industrialsim.application import validate_config
+    from test_transport_orders_simulation import VEHICLE_CONTENTION_YAML
+    validation = validate_config(VEHICLE_CONTENTION_YAML)
+    assert validation.config is not None
+    model = validation.config.model_dump(mode='json')
+    model['production_units'] = model['production_units'][:1]
+    shortcut = dict(model['material_flow']['routes'][0])
+    shortcut.update(id='shortcut', target_node_id='snk')
+    model['material_flow']['routes'].append(shortcut)
+    model['process_plans'] = [{'variant': 'sedan', 'steps': [{'operation_id': 'op1', 'compatible_stations': ['st1']}]}]
+    for trigger_type, target in [('routing_decision', 'src'), ('dispatch_decision', 'dispatch')]:
+        model['decision_triggers'] = [{'id': 'choice', 'trigger_type': trigger_type,
+                                       **({'node_id': target} if trigger_type == 'routing_decision' else {})}]
+        session = EpisodeSession(model)
+        session.advance_to_next_decision_batch()
+        pending = session.decision_batch()
+        assert pending is not None
+        request = pending['batch']['requests'][0]
+        assert {route['route_id'] for route in request['observation']['candidate_routes']} == {'r_src_st1'}
+        action = {'action_type': 'routing' if trigger_type == 'routing_decision' else 'dispatch',
+                  'target_id': request['target_id'], 'route_id': 'shortcut'}
+        if trigger_type == 'dispatch_decision':
+            action['vehicle_id'] = 'v1'
+        before = session.observe()
+        assert not session.submit_decision_batch(pending['batch']['batch_id'], [action])['accepted']
+        assert session.observe() == before
+        action['route_id'] = 'r_src_st1'
+        assert session.submit_decision_batch(pending['batch']['batch_id'], [action])['accepted']
+        session.advance()
+        assert session.finalize().status == 'completed'
+        session.close()
+
+
+def test_dispatch_rejects_unsuitable_vehicle_without_consuming_the_batch() -> None:
+    from industrialsim.application import validate_config
+    from test_transport_orders_simulation import VEHICLE_CONTENTION_YAML
+    validation = validate_config(VEHICLE_CONTENTION_YAML)
+    assert validation.config is not None
+    for constraint in ('capability', 'pool', 'reachability'):
+        model = validation.config.model_dump(mode='json')
+        model['production_units'] = model['production_units'][:1]
+        model['vehicle_pools'] = [{'id': 'heavy-pool'}]
+        model['vehicles'].append({**model['vehicles'][0], 'id': 'v2', 'capabilities': ['heavy'], 'pool_id': 'heavy-pool'})
+        if constraint == 'capability':
+            model['material_flow']['routes'][0]['required_capabilities'] = ['heavy']
+        elif constraint == 'pool':
+            model['material_flow']['routes'][0]['pool_id'] = 'heavy-pool'
+        else:
+            model['material_flow']['nodes'].append({'id': 'island', 'kind': 'sink',
+                                                   'input_ports': [{'id': 'in', 'port_type': 'body', 'direction': 'input'}]})
+            model['material_flow']['nodes'].append({'id': 'island-source', 'kind': 'source',
+                                                   'output_ports': [{'id': 'out', 'port_type': 'body', 'direction': 'output'}]})
+            model['material_flow']['routes'].append({'id': 'island-route', 'source_node_id': 'island-source',
+                                                    'source_port_id': 'out', 'target_node_id': 'island',
+                                                    'target_port_id': 'in', 'transit_time': 1})
+            model['vehicles'][0]['initial_location'] = 'island'
+        model['decision_triggers'] = [{'id': 'dispatch', 'trigger_type': 'dispatch_decision'}]
+        session = EpisodeSession(model)
+        session.advance_to_next_decision_batch()
+        pending = session.decision_batch()
+        assert pending is not None
+        request = pending['batch']['requests'][0]
+        assert next(vehicle for vehicle in request['observation']['available_vehicles'] if vehicle['vehicle_id'] == 'v2')['capabilities'] == ['heavy']
+        action = {'action_type': 'dispatch', 'target_id': request['target_id'], 'route_id': 'r_src_st1', 'vehicle_id': 'v1'}
+        before = session.observe()
+        result = session.submit_decision_batch(pending['batch']['batch_id'], [action])
+        assert not result['accepted'], (constraint, result)
+        assert session.observe() == before
+        assert session.decision_batch() == pending
+        action['vehicle_id'] = 'v2'
+        assert session.submit_decision_batch(pending['batch']['batch_id'], [action])['accepted']
+        session.close()
