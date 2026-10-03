@@ -19,6 +19,7 @@ import uvicorn
 
 from industrialsim.project import ProjectSession
 from industrialsim.episode_worker import EpisodeWorker
+from industrialsim.saved_results import SavedResults
 
 
 class OpenModel(BaseModel):
@@ -138,6 +139,19 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
         ):
             return JSONResponse({'detail': 'Use the local project origin'}, status_code=403)
         return await call_next(request)
+
+    results = SavedResults(session.directory)
+
+    @app.get('/api/results')
+    def saved_results() -> dict[str, Any]:
+        return {'results': results.list()}
+
+    @app.get('/api/results/open')
+    def open_result(path: str) -> dict[str, Any]:
+        try:
+            return results.open(path)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get('/api/episode')
     def episode() -> dict[str, Any]:

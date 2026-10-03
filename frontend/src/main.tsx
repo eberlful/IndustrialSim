@@ -1,3 +1,4 @@
+import { SavedResults } from './SavedResults';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Graph, arrangedPositions } from './Graph';
@@ -152,6 +153,7 @@ function App() {
       <button disabled={busy || yamlDirty || !project.can_redo} onClick={() => void load('redo', {})}>Redo</button>
       <button disabled={busy || inputsDirty || (!model?.valid && !yamlDirty)} onClick={() => void download()}>Download YAML</button>
     </section>
+    <SavedResults/>
     <EpisodeControl episode={episode} onChange={setEpisode} canStart={!!model?.valid && !inputsDirty && !yamlDirty && !busy}/>
     {diagnostics.length > 0 && <section role="alert" className="diagnostics"><strong>{model && !model.valid ? '⚠ Draft needs correction' : '⚠ Action was not accepted'}</strong><ul>{diagnostics.map((message, index) => <li key={index}>{message}</li>)}</ul><p>{model && !model.valid ? 'Correct the indicated properties or undo the change. Save incomplete work as a draft. Executable YAML requires all errors to be corrected.' : model ? `Still displaying ${model.name}. Correct the input and retry.` : 'Correct the YAML and retry.'}</p></section>}
     {model && view === 'yaml' && <section className="import-panel yaml-editor" aria-label="Advanced YAML editor">
