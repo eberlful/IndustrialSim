@@ -164,7 +164,7 @@ class EpisodeWorker:
                     self._publish(session, state='running')
                     continue
                 session.advance(pause_at_decision_batch=seek_batch, max_events=1000)
-                if session.decision_batch() is not None:
+                if session.awaiting_decision_batch:
                     self._publish(session, state='awaiting_decisions')
                     published_at = monotonic()
                 elif monotonic() - published_at >= .1:

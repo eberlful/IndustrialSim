@@ -308,3 +308,16 @@ def test_dispatch_selected_vehicle_is_used_instead_of_baseline_preference() -> N
                   and record['details'].get('transition') == 'in_transport']
     assert dispatched[-1]['details']['vehicle_id'] == 'v2'
     session.close()
+
+
+def test_reassigned_worker_snapshot_preserves_assignment_and_qualifications() -> None:
+    from industrialsim.checkpoint import WorkerSnapshot
+    from industrialsim.domain import Worker
+
+    worker = Worker(id='worker', qualifications=['operator'])
+    worker.assigned_station_id = 'station'
+    snapshot = WorkerSnapshot.from_dict(worker.to_snapshot()).to_dict()
+    restored = Worker(id='worker', qualifications=['original'])
+    restored.restore_state(snapshot)
+    assert restored.assigned_station_id == 'station'
+    assert restored.qualifications == ['operator']

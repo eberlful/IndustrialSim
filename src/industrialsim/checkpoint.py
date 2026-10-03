@@ -370,6 +370,8 @@ class WorkerSnapshot:
     operations_completed: int = 0
     last_state_change_ns: int = 0
     pending_off_shift: bool = False
+    assigned_station_id: str | None = None
+    qualifications: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -384,6 +386,8 @@ class WorkerSnapshot:
             "operations_completed": self.operations_completed,
             "last_state_change_ns": self.last_state_change_ns,
             "pending_off_shift": self.pending_off_shift,
+            "assigned_station_id": self.assigned_station_id,
+            **({"qualifications": list(self.qualifications)} if self.qualifications is not None else {}),
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -406,6 +410,8 @@ class WorkerSnapshot:
             operations_completed=int(data.get("operations_completed", 0)),
             last_state_change_ns=int(data.get("last_state_change_ns", 0)),
             pending_off_shift=bool(data.get("pending_off_shift", False)),
+            assigned_station_id=data.get("assigned_station_id"),
+            qualifications=list(data["qualifications"]) if "qualifications" in data else None,
         )
 
 

@@ -4840,6 +4840,10 @@ class EpisodeSession:
         """Advance to a shared Decision Batch boundary without answering it."""
         return self.advance(pause_at_decision_batch=True, max_events=max_events)
 
+    @property
+    def awaiting_decision_batch(self) -> bool:
+        return self._pending_batch is not None
+
     def decision_batch(self) -> dict[str, Any] | None:
         """Read isolated requests and schemas while simulation time is frozen."""
         if self._pending_batch is None:
