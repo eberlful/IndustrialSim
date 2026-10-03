@@ -56,6 +56,7 @@ from industrialsim.domain import (
     Worker,
 )
 from industrialsim.decisions import (
+    BaselineDecisionProvider,
     BaselineFallbackPolicy,
     BufferObservation,
     BufferOccupantSummary,
@@ -89,6 +90,9 @@ from industrialsim.decisions import (
     VehicleSummaryObservation,
     WorkerReassignmentAction,
     validate_decision_batch_response,
+    manual_action_types,
+    decision_action_schemas,
+    validate_manual_decision_response,
 )
 from industrialsim.kernel import EventKernel, EventPriority, ScheduledEvent
 from industrialsim.random import SemanticRandomStream
@@ -1669,7 +1673,8 @@ class EpisodeEngine:
             schema_version="1.0",
             target_id=target_id,
             is_safe_point=is_safe,
-            allowed_actions=["reconfiguration", "worker_reassignment", "quality_control"],
+            allowed_actions=(["worker_reassignment"] if target_id in self.workers else
+                             ["reconfiguration", "quality_control"] if target_id in self.stations else []),
             current_configuration={},
             quality_control_bounds=bounds,
             available_workers=avail_workers,
@@ -1781,9 +1786,11 @@ class EpisodeEngine:
         elif req_type == "strategic":
             return self._build_strategic_observation(target_id, time_ns)
         elif req_type == "routing":
-            return self._build_routing_observation(target_id, time_ns)
+            return self._build_routing_observation(
+                getattr(req_or_target.observation, 'current_node_id', target_id), time_ns,
+                getattr(req_or_target.observation, 'unit_id', None))
         elif req_type == "dispatch":
-            return self._build_dispatch_observation(time_ns)
+            return self._build_dispatch_observation(time_ns, getattr(req_or_target.observation, 'order_id', None))
         else:
             if target_id in self.buffers:
                 return self._build_buffer_observation(target_id, time_ns)
@@ -1943,6 +1950,12 @@ class EpisodeEngine:
             elif isinstance(action, WorkerReassignmentAction):
                 if action.cost > 0:
                     self.total_strategic_cost += action.cost
+                worker = self.workers.get(action.target_id)
+                if worker is not None and not worker.active_allocations:
+                    worker.assigned_station_id = action.assigned_station_id
+                    if action.qualifications is not None:
+                        worker.qualifications = list(action.qualifications)
+                    self._rebuild_worker_qualification_index()
             elif isinstance(action, QualityControlAction):
                 if action.cost > 0:
                     self.total_strategic_cost += action.cost
@@ -2064,6 +2077,9 @@ class EpisodeEngine:
                     if trig.config.id == req.trigger_id:
                         matched_trig = trig
                         break
+            if matched_trig is None and req.trigger_id:
+                matched_trig = next((trigger for triggers in self.decision_triggers.values()
+                                     for trigger in triggers if trigger.config.id == req.trigger_id), None)
             if matched_trig is None:
                 trigs = self.decision_triggers.get(req.target_id, [])
                 if trigs:
@@ -2353,10 +2369,40 @@ class EpisodeEngine:
             if not candidates:
                 continue
 
+            pending = self.decision_coordinator.pending_requests
+            if any(request.target_id in {order.unit_id, order.id} for request in pending):
+                continue
+            routing_observation = self._build_routing_observation(order.source_node_id, k.current_time_ns, order.unit_id)
+            if not any(route.is_admissible for route in routing_observation.candidate_routes):
+                continue
+            requested = False
+            if order.assigned_route_id is None:
+                for trigger in self.decision_triggers.get(order.source_node_id, []):
+                    if isinstance(trigger, RoutingTriggerRuntime) and trigger.check_routing(order.source_node_id, order.unit_id, k.current_time_ns):
+                        self.decision_coordinator.add_request(DecisionRequest(
+                            request_id=f"req-route-{order.id}-{trigger.config.id}-{k.current_time_ns}",
+                            request_type='routing', time_ns=k.current_time_ns, target_id=order.unit_id,
+                            trigger_id=trigger.config.id, observation=routing_observation, action_schema='routing'))
+                        requested = True
+            if order.assigned_vehicle_id is None:
+                pending_dispatch_count = sum(request.request_type == 'dispatch' for request in pending)
+                if unconstrained or pending_dispatch_count < len(available_vehicles):
+                    for trigger in self.decision_triggers.get('dispatch', []):
+                        if isinstance(trigger, DispatchTriggerRuntime) and trigger.check_dispatch(order.id, k.current_time_ns):
+                            self.decision_coordinator.add_request(DecisionRequest(
+                                request_id=f"req-dispatch-{order.id}-{trigger.config.id}-{k.current_time_ns}",
+                                request_type='dispatch', time_ns=k.current_time_ns, target_id=order.id,
+                                trigger_id=trigger.config.id, observation=self._build_dispatch_observation(k.current_time_ns, order.id),
+                                action_schema='dispatch'))
+                            requested = True
+            if requested:
+                continue
+
             ctx = DispatchContext(
                 order=order,
                 candidate_routes=candidates,
-                available_vehicles=available_vehicles,
+                available_vehicles=([v for v in available_vehicles if v.id == order.assigned_vehicle_id]
+                                    if order.assigned_vehicle_id is not None else available_vehicles),
                 active_route_occupancy=self.active_route_occupancy,
                 node_distance_fn=self._compute_node_distance,
                 can_accept_fn=self._can_accept,
@@ -2602,7 +2648,7 @@ class EpisodeEngine:
         self._try_dispatch_pending_orders(k)
 
     def _can_acquire_worker_requirements(
-        self, reqs: list[dict[str, Any]], time_ns: int
+        self, reqs: list[dict[str, Any]], time_ns: int, station_id: str | None = None
     ) -> tuple[bool, list[dict[str, Any]]]:
         allocated_workers: list[dict[str, Any]] = []
         temp_worker_allocations: dict[str, int] = {}
@@ -2614,7 +2660,8 @@ class EpisodeEngine:
 
             if target_worker_id is not None:
                 w = self.workers.get(target_worker_id)
-                if not w or not w.is_available(time_ns):
+                if not w or not w.is_available(time_ns) or (station_id is not None and
+                        w.assigned_station_id not in (None, station_id)):
                     return False, []
                 curr_allocated = temp_worker_allocations.get(w.id, 0)
                 if w.available_capacity(time_ns) - curr_allocated < needed_count:
@@ -2625,7 +2672,8 @@ class EpisodeEngine:
                 pool = self._workers_by_qualification.get(target_qual, [])
                 candidates = [
                     w for w in pool
-                    if w.is_available(time_ns)
+                    if w.is_available(time_ns) and (station_id is None or
+                                                   w.assigned_station_id in (None, station_id))
                 ]
                 candidates.sort(key=lambda w: (0 if w.kind == "pool" else 1, w.id))
 
@@ -2655,7 +2703,7 @@ class EpisodeEngine:
                 return False, [], []
             allocated_machines.append(m_id)
 
-        can_workers, allocated_workers = self._can_acquire_worker_requirements(op.required_workers, time_ns)
+        can_workers, allocated_workers = self._can_acquire_worker_requirements(op.required_workers, time_ns, station_id)
         if not can_workers:
             return False, [], []
 
@@ -4699,6 +4747,7 @@ class EpisodeSession:
         self._writer: RunArtifactWriter | None = None
         self._closed = False
         self._finalized = False
+        self._pending_batch: DecisionBatch | None = None
         if output_dir is not None:
             # Exclusive reservation protects completed AND incomplete artifacts.
             Path(output_dir).mkdir(parents=True, exist_ok=False)
@@ -4720,10 +4769,10 @@ class EpisodeSession:
 
     @property
     def finished(self) -> bool:
-        return self._summary.status != 'incomplete' or self._engine.execution_exhausted or (
+        return self._pending_batch is None and (self._summary.status != 'incomplete' or self._engine.execution_exhausted or (
             self._engine.kernel.queue_size == 0
             and not self._engine.decision_coordinator.has_pending()
-        )
+        ))
 
     def snapshot(self) -> EpisodeSummary:
         """Return an isolated observation without advancing or recording outcomes."""
@@ -4760,7 +4809,8 @@ class EpisodeSession:
                     'allocations': deepcopy(resource.active_allocations),
                     **({'failed': resource.is_failed, 'in_maintenance': resource.is_in_maintenance,
                         'health': resource.health, 'operating_mode': resource.operating_mode}
-                       if isinstance(resource, Machine) else {}),
+                       if isinstance(resource, Machine) else {'assigned_station_id': resource.assigned_station_id,
+                                                            'qualifications': list(resource.qualifications)}),
                 } for resource in collection.values()
             }
         return {
@@ -4786,15 +4836,106 @@ class EpisodeSession:
         """Read ordered audit records; reads do not advance or finalize."""
         return self._engine.audit_logger.page(cursor, limit)
 
+    def advance_to_next_decision_batch(self, max_events: int | None = None) -> EpisodeSummary:
+        """Advance to a shared Decision Batch boundary without answering it."""
+        return self.advance(pause_at_decision_batch=True, max_events=max_events)
+
+    def decision_batch(self) -> dict[str, Any] | None:
+        """Read isolated requests and schemas while simulation time is frozen."""
+        if self._pending_batch is None:
+            return None
+        batch = self._pending_batch
+        suggestions = BaselineDecisionProvider().decide(batch)
+        return {'batch': batch.model_dump(mode='json'), 'action_schemas': decision_action_schemas(),
+                'action_types': {request.request_id: manual_action_types(request) for request in batch.requests},
+                'suggested_actions': [action.model_dump(mode='json') for action in suggestions.actions]}
+
+    def submit_decision_batch(self, batch_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        """Validate the entire proposal before committing any effects or audit records.
+
+        Form rejection is distinct from an actual provider failure and never
+        invokes fallback. The engine retains its normal provider/audit path.
+        """
+        batch = self._pending_batch
+        if self._closed or self._finalized or batch is None or batch.batch_id != batch_id:
+            return {'accepted': False, 'diagnostics': [{'code': 'STALE_BATCH', 'message': 'This Decision Batch is no longer awaiting actions'}]}
+        try:
+            response = DecisionBatchResponse.model_validate({
+                'batch_id': batch_id, 'actions': actions,
+                'provenance': {'episode_id': batch.episode_id, 'branch_id': batch.branch_id,
+                               'batch_id': batch_id, 'provider_id': 'manual'},
+            })
+        except ValidationError as exc:
+            return {'accepted': False, 'diagnostics': [{'code': 'INVALID_ACTION',
+                    'message': f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"}
+                    for error in exc.errors()]}
+        valid, diagnostics = validate_manual_decision_response(batch, response)
+        if not valid:
+            return {'accepted': False, 'diagnostics': [diagnostic.model_dump(mode='json') for diagnostic in diagnostics]}
+        engine = self._engine
+        state_errors = []
+        for action in response.actions:
+            if isinstance(action, MachineModeAction):
+                machine = engine.machines.get(action.target_id)
+                if machine is None or (action.mode != machine.operating_mode and (machine.active_allocations or machine.is_in_maintenance)):
+                    state_errors.append(f"Machine '{action.target_id}' must be idle to change mode")
+            elif isinstance(action, MaintenanceAction) and action.trigger_maintenance:
+                machine = engine.machines.get(action.target_id)
+                if machine is None or machine.active_allocations or machine.is_in_maintenance or machine.is_failed or not machine.maintenance_policy:
+                    state_errors.append(f"Machine '{action.target_id}' cannot start maintenance in this state or has no maintenance policy")
+            elif isinstance(action, WorkerReassignmentAction):
+                worker = engine.workers.get(action.target_id)
+                if worker is None or worker.active_allocations:
+                    state_errors.append(f"Worker '{action.target_id}' must be idle to reassign")
+                if action.assigned_station_id is not None and action.assigned_station_id not in engine.stations:
+                    state_errors.append(f"Unknown Station '{action.assigned_station_id}'")
+            elif isinstance(action, (ReconfigurationAction, QualityControlAction)):
+                station = engine.stations.get(action.target_id)
+                if station is None or station.is_busy or station.is_reconfiguring:
+                    state_errors.append(f"Station '{action.target_id}' must be at a safe idle boundary")
+        if state_errors:
+            return {'accepted': False, 'diagnostics': [{'code': 'INVALID_RESOURCE_STATE', 'message': error} for error in state_errors]}
+
+        class SubmittedDecisionProvider(DecisionProvider):
+            def decide(self, intended_batch: DecisionBatch) -> DecisionBatchResponse:
+                if intended_batch != batch:
+                    raise ValueError('Decision Batch changed before application')
+                return response
+
+        provider = engine.decision_provider
+        try:
+            engine.decision_provider = SubmittedDecisionProvider()
+            self.resolve_decision_batch()
+        finally:
+            engine.decision_provider = provider
+        return {'accepted': True, 'diagnostics': []}
+
+    def resolve_decision_batch(self) -> EpisodeSummary:
+        """Answer the held batch with the configured provider and failure policy."""
+        if self._closed or self._finalized or self._pending_batch is None:
+            raise ValueError('No Decision Batch is awaiting a provider')
+        self._engine._process_decision_batch()
+        self._pending_batch = None
+        self._summary = self._engine.to_summary(update_metrics=False)
+        return self.snapshot()
+
     def advance(
         self, until_time_ns: int | None = None, pause_at_decision_batch: bool = False,
         max_events: int | None = None,
     ) -> EpisodeSummary:
         if self._closed or self._finalized:
             raise ValueError('Cannot advance a closed or finalized Episode')
+        if self._pending_batch is not None:
+            raise ValueError('Answer the pending Decision Batch before advancing')
         if until_time_ns is not None and until_time_ns < self._summary.simulated_time_ns:
             raise ValueError('Cannot advance backwards in simulation time')
         self._summary = self._engine.advance(until_time_ns, pause_at_decision_batch, max_events)
+        if pause_at_decision_batch and self._engine.decision_coordinator.has_pending():
+            coordinator = deepcopy(self._engine.decision_coordinator)
+            self._pending_batch = coordinator.form_batch(
+                time_ns=self._engine.kernel.current_time_ns,
+                observation_builder=lambda request: self._engine._build_observation_for_request(request, self._engine.kernel.current_time_ns),
+            )
         return self.snapshot()
 
     def finalize(self) -> EpisodeSummary:

@@ -18,7 +18,7 @@ function App() {
   const [liveSelection, setLiveSelection] = useState<LiveSelection | null>(null);
   useEffect(() => {
     setLiveSelection(null);
-    if (episode && ['running', 'pausing', 'paused'].includes(episode.state)) setObserveEpisode(true);
+    if (episode && ['running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'].includes(episode.state)) setObserveEpisode(true);
   }, [episode?.id]);
   const [project, setProject] = useState<Project>({ project: '', model: null });
   const [path, setPath] = useState('');

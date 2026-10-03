@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Annotated, Any, Callable, Literal, Sequence, Union
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from industrialsim.config import (
     BufferThresholdTriggerConfig,
@@ -206,8 +207,8 @@ class ReconfigurationAction(BaseModel):
     schema_version: str = "1.0"
     target_id: str
     configuration: dict[str, Any]
-    duration_ns: int = 0
-    cost: float = 0.0
+    duration_ns: int = Field(default=0, ge=0)
+    cost: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 class WorkerReassignmentAction(BaseModel):
@@ -218,8 +219,8 @@ class WorkerReassignmentAction(BaseModel):
     target_id: str
     assigned_station_id: str | None = None
     qualifications: list[str] | None = None
-    duration_ns: int = 0
-    cost: float = 0.0
+    duration_ns: int = Field(default=0, ge=0)
+    cost: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 class QualityControlAction(BaseModel):
@@ -231,8 +232,8 @@ class QualityControlAction(BaseModel):
     inspection_intensity: float | None = None
     sampling_rate: float | None = None
     release_threshold: float | None = None
-    duration_ns: int = 0
-    cost: float = 0.0
+    duration_ns: int = Field(default=0, ge=0)
+    cost: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
 
 DecisionAction = Annotated[
@@ -497,6 +498,71 @@ def validate_decision_batch_response(
 
     is_valid = len(diagnostics) == 0
     return is_valid, diagnostics
+
+
+def manual_action_types(request: DecisionRequest) -> list[str]:
+    observation = request.observation
+    if isinstance(observation, StrategicObservation):
+        return list(observation.allowed_actions)
+    if isinstance(observation, MachineObservation):
+        return ['machine_mode', 'maintenance']
+    return [request.action_schema]
+
+
+def decision_action_schemas() -> dict[str, Any]:
+    """Expose the existing Pydantic action contracts for schema-driven forms."""
+    schema = TypeAdapter(DecisionAction).json_schema()
+    return {action_type: schema['$defs'][ref.rsplit('/', 1)[-1]]
+            for action_type, ref in schema['discriminator']['mapping'].items()}
+
+
+def validate_manual_decision_response(batch: DecisionBatch, response: DecisionBatchResponse
+                                      ) -> tuple[bool, list[DecisionDiagnosticRecord]]:
+    """Reuse batch validation and validate typed observation-specific choices."""
+    _, diagnostics = validate_decision_batch_response(batch, response)
+    actions = {action.target_id: action for action in response.actions}
+    for request in batch.requests:
+        action = actions.get(request.target_id)
+        if action is None:
+            continue
+        messages = []
+        if action.action_type not in manual_action_types(request):
+            messages.append(f"Action '{action.action_type}' is not applicable; choose from {manual_action_types(request)}")
+        observation = request.observation
+        if isinstance(action, (RoutingAction, DispatchAction)) and isinstance(observation, (RoutingObservation, DispatchObservation)):
+            if action.route_id not in {route.route_id for route in observation.candidate_routes if route.is_admissible}:
+                messages.append(f"Route '{action.route_id}' is not an admissible candidate")
+            if isinstance(action, RoutingAction) and action.unit_id is not None and action.unit_id != observation.unit_id:
+                messages.append(f"Routing action must address Production Unit '{observation.unit_id}'")
+            if isinstance(action, DispatchAction) and isinstance(observation, DispatchObservation):
+                vehicle_ids = {vehicle.vehicle_id for vehicle in observation.available_vehicles}
+                if (action.vehicle_id is not None and action.vehicle_id not in vehicle_ids) or (vehicle_ids and action.vehicle_id is None):
+                    messages.append('Choose an available Vehicle for this dispatch')
+        if isinstance(action, QualityControlAction):
+            for name in ('inspection_intensity', 'sampling_rate', 'release_threshold'):
+                value = getattr(action, name)
+                if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
+                    messages.append(f"{name} must be a finite value between 0 and 1")
+        if isinstance(action, MachineModeAction) and isinstance(observation, MachineObservation):
+            if action.mode not in observation.available_modes:
+                messages.append(f"Mode '{action.mode}' is not available")
+        for message in messages:
+            diagnostics.append(DecisionDiagnosticRecord(code='INVALID_ACTION_CHOICE', message=message,
+                batch_id=batch.batch_id, request_id=request.request_id, target_id=request.target_id))
+    routing_choices = {}
+    for request in batch.requests:
+        routing_action = actions.get(request.target_id)
+        if isinstance(request.observation, RoutingObservation) and isinstance(routing_action, RoutingAction):
+            routing_choices[request.observation.unit_id] = routing_action.route_id
+    for request in batch.requests:
+        action = actions.get(request.target_id)
+        if isinstance(request.observation, DispatchObservation) and isinstance(action, DispatchAction):
+            route = routing_choices.get(request.observation.unit_id)
+            if route is not None and route != action.route_id:
+                diagnostics.append(DecisionDiagnosticRecord(code='CONFLICTING_ROUTE_CHOICES',
+                    message=f"Routing and dispatch for Production Unit '{request.observation.unit_id}' must choose the same Route",
+                    batch_id=batch.batch_id, request_id=request.request_id, target_id=request.target_id))
+    return not diagnostics, diagnostics
 
 
 class DecisionProvider:

@@ -46,6 +46,18 @@ class EditParameters(BaseModel):
     operation_id: str | None = None
 
 
+class StartEpisode(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    mode: Literal['baseline', 'manual'] = 'baseline'
+
+
+class SubmitDecisionBatch(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    episode_id: str
+    batch_id: str
+    actions: list[dict[str, Any]]
+
+
 class EpisodeCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
     episode_id: str
@@ -74,6 +86,22 @@ class SaveModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
     path: str
     overwrite: bool = False
+
+
+def browser_episode_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Preserve exact Decision Batch nanoseconds across JSON/JavaScript."""
+    def exact_times(value: Any, key: str = '') -> Any:
+        if type(value) is int and key.endswith('_ns'):
+            return str(value)
+        if isinstance(value, dict):
+            return {field: exact_times(item, field) for field, item in value.items()}
+        if isinstance(value, list):
+            return [exact_times(item, key) for item in value]
+        return value
+    episode = result.get('episode')
+    if episode and episode.get('decision_batch'):
+        episode['decision_batch'] = exact_times(episode['decision_batch'])
+    return result
 
 
 def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None = None) -> FastAPI:
@@ -106,26 +134,36 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
 
     @app.get('/api/episode')
     def episode() -> dict[str, Any]:
-        return episodes.snapshot(include_history=False)
+        return browser_episode_response(episodes.snapshot(include_history=False))
 
     @app.post('/api/episode/start')
-    def start_episode() -> JSONResponse:
+    def start_episode(body: StartEpisode | None = None) -> JSONResponse:
         exported = session.export_yaml()
         if not exported['accepted']:
             return JSONResponse({**episodes.snapshot(include_history=False), 'accepted': False,
                                  'diagnostics': exported['diagnostics']}, status_code=422)
-        result = episodes.start(exported['yaml'])
-        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+        result = episodes.start(exported['yaml'], mode=body.mode if body else 'baseline')
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
 
     @app.post('/api/episode/pause')
     def pause_episode(body: EpisodeCommand) -> JSONResponse:
         result = episodes.pause(body.episode_id)
-        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
 
     @app.post('/api/episode/continue')
     def continue_episode(body: EpisodeCommand) -> JSONResponse:
         result = episodes.continue_episode(body.episode_id)
-        return JSONResponse(result, status_code=200 if result['accepted'] else 409)
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
+
+    @app.post('/api/episode/next-batch')
+    def next_decision_batch(body: EpisodeCommand) -> JSONResponse:
+        result = episodes.next_decision_batch(body.episode_id)
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
+
+    @app.post('/api/episode/submit-batch')
+    def submit_decision_batch(body: SubmitDecisionBatch) -> JSONResponse:
+        result = episodes.submit_decision_batch(body.episode_id, body.batch_id, body.actions)
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
 
     @app.get('/api/episode/events')
     def episode_events(episode_id: str, cursor: int = Query(0, ge=0),

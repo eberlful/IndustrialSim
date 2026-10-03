@@ -1,7 +1,7 @@
 """One local Episode owned by a serialized worker, independent of HTTP clients."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from threading import Condition, Event, RLock
@@ -25,6 +25,7 @@ class EpisodeWorker:
         self._episode: dict[str, Any] | None = None
         self._events: list[dict[str, Any]] = []
         self._started_at = 0.0
+        self._submission: tuple[str, list[dict[str, Any]], Future[dict[str, Any]]] | None = None
 
     def snapshot(self, *, include_history: bool = True) -> dict[str, Any]:
         """Read the last published state; never access the advancing engine."""
@@ -35,15 +36,17 @@ class EpisodeWorker:
                     'status', 'result_hash', 'raw_metrics', 'reward', 'seed',
                 )}}
             episode = deepcopy(published)
-            if episode and episode['state'] in {'running', 'pausing', 'paused'}:
+            if episode and episode['state'] in {'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'}:
                 episode['wall_clock_seconds'] = monotonic() - self._started_at
             return {'episode': episode}
 
-    def start(self, source: str | Path | dict[str, Any] | SimulationConfig) -> dict[str, Any]:
+    def start(self, source: str | Path | dict[str, Any] | SimulationConfig, mode: str = 'baseline') -> dict[str, Any]:
         with self._lock:
+            if mode not in {'baseline', 'manual'}:
+                return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Choose Baseline or manual decisions']}
             if self._stop.is_set():
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Episode worker is closed']}
-            if self._episode and self._episode['state'] in {'running', 'pausing', 'paused'}:
+            if self._episode and self._episode['state'] in {'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'}:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['An Episode is already active']}
             validation = validate_config(source)
             if not validation.is_valid or validation.config is None:
@@ -55,11 +58,11 @@ class EpisodeWorker:
             self._started_at = monotonic()
             self._events = []
             self._episode = {
-                'id': episode_id, 'state': 'running', 'provider': 'Baseline',
+                'id': episode_id, 'state': 'running', 'provider': 'Manual' if mode == 'manual' else 'Baseline', 'mode': mode,
                 'seed': str(config.seed), 'result_path': f'runs/{episode_id}',
                 'simulated_time_ns': str(config.episode.start_time_ns),
                 'events_processed': 0, 'summary': None, 'diagnostics': [],
-                'wall_clock_seconds': 0.0, 'observation': None,
+                'wall_clock_seconds': 0.0, 'observation': None, 'decision_batch': None,
             }
             result = {**self.snapshot(include_history=False), 'accepted': True, 'diagnostics': []}
             self._executor.submit(self._execute, config, self.directory / self._episode['result_path'])
@@ -77,10 +80,29 @@ class EpisodeWorker:
 
     def pause(self, episode_id: str) -> dict[str, Any]:
         """Request a pause; the worker acknowledges it at a settled boundary."""
-        return self._control(episode_id, {'running', 'pausing', 'paused'}, 'pausing')
+        return self._control(episode_id, {'running', 'seeking_batch', 'pausing', 'paused'}, 'pausing')
 
     def continue_episode(self, episode_id: str) -> dict[str, Any]:
-        return self._control(episode_id, {'paused'}, 'running')
+        with self._lock:
+            if self._episode and self._episode['state'] == 'awaiting_decisions' and self._episode['mode'] == 'baseline' and self._submission is None:
+                return self._control(episode_id, {'awaiting_decisions'}, 'resolving')
+            return self._control(episode_id, {'paused'}, 'running')
+
+    def next_decision_batch(self, episode_id: str) -> dict[str, Any]:
+        return self._control(episode_id, {'running', 'paused'}, 'seeking_batch')
+
+    def submit_decision_batch(self, episode_id: str, batch_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        """Queue a proposal for validation/application by the session owner."""
+        with self._condition:
+            if (self._stop.is_set() or not self._episode or self._episode['id'] != episode_id
+                    or self._episode['state'] != 'awaiting_decisions' or self._submission is not None
+                    or self._episode['decision_batch']['batch']['batch_id'] != batch_id):
+                return {**self.snapshot(include_history=False), 'accepted': False,
+                        'diagnostics': ['This Episode/Decision Batch is no longer awaiting this submission']}
+            future: Future[dict[str, Any]] = Future()
+            self._submission = (batch_id, deepcopy(actions), future)
+            self._condition.notify_all()
+        return future.result()
 
     def events(self, episode_id: str, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
         """Page only published events. Cursors are scoped to one Episode."""
@@ -105,7 +127,7 @@ class EpisodeWorker:
         with self._lock:
             assert self._episode is not None
             self._events.extend(records)
-            self._episode.update(observation=observation, simulated_time_ns=str(summary.simulated_time_ns),
+            self._episode.update(observation=observation, decision_batch=session.decision_batch(), simulated_time_ns=str(summary.simulated_time_ns),
                                  events_processed=summary.events_processed,
                                  wall_clock_seconds=monotonic() - self._started_at, **changes)
 
@@ -116,15 +138,36 @@ class EpisodeWorker:
             self._publish(session)
             published_at = monotonic()
             while not session.finished and not self._stop.is_set():
+                submission = None
                 with self._condition:
                     assert self._episode is not None
                     if self._episode['state'] == 'pausing':
                         self._publish(session, state='paused')
-                    self._condition.wait_for(lambda: self._stop.is_set() or bool(self._episode and self._episode['state'] != 'paused'))
+                    self._condition.wait_for(lambda: self._stop.is_set() or self._submission is not None
+                        or bool(self._episode and self._episode['state'] not in {'paused', 'awaiting_decisions'}))
                     if self._stop.is_set():
                         break
-                session.advance(max_events=1000)
-                if monotonic() - published_at >= .1:
+                    state = self._episode['state']
+                    if self._submission is not None:
+                        submission = self._submission
+                    seek_batch = self._episode['mode'] == 'manual' or state == 'seeking_batch'
+                if submission is not None:
+                    batch_id, actions, future = submission
+                    result = session.submit_decision_batch(batch_id, actions)
+                    self._publish(session, state='paused' if result['accepted'] else 'awaiting_decisions')
+                    with self._condition:
+                        self._submission = None
+                        future.set_result({**self.snapshot(include_history=False), **result})
+                    continue
+                if state == 'resolving':
+                    session.resolve_decision_batch()
+                    self._publish(session, state='running')
+                    continue
+                session.advance(pause_at_decision_batch=seek_batch, max_events=1000)
+                if session.decision_batch() is not None:
+                    self._publish(session, state='awaiting_decisions')
+                    published_at = monotonic()
+                elif monotonic() - published_at >= .1:
                     self._publish(session)
                     published_at = monotonic()
             if self._stop.is_set():
@@ -138,6 +181,12 @@ class EpisodeWorker:
                 self._episode.update(state='failed', diagnostics=[str(exc)],
                                      wall_clock_seconds=monotonic() - self._started_at)
         finally:
+            with self._condition:
+                if self._submission is not None:
+                    _, _, future = self._submission
+                    self._submission = None
+                    future.set_result({**self.snapshot(include_history=False), 'accepted': False,
+                                       'diagnostics': ['Episode worker stopped before submission completed']})
             if session is not None:
                 session.close()
 

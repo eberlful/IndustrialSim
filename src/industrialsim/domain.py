@@ -429,6 +429,7 @@ class Worker:
     operations_completed: int = 0
     last_state_change_ns: int = 0
     pending_off_shift: bool = False
+    assigned_station_id: str | None = None
 
     def is_on_shift(self, time_ns: int) -> bool:
         if not self.shifts:
@@ -501,6 +502,8 @@ class Worker:
             "operations_completed": self.operations_completed,
             "last_state_change_ns": self.last_state_change_ns,
             "pending_off_shift": self.pending_off_shift,
+            "assigned_station_id": self.assigned_station_id,
+            "qualifications": list(self.qualifications),
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
@@ -512,6 +515,8 @@ class Worker:
         self.operations_completed = state.get("operations_completed", 0)
         self.last_state_change_ns = state.get("last_state_change_ns", 0)
         self.pending_off_shift = bool(state.get("pending_off_shift", False))
+        self.assigned_station_id = state.get("assigned_station_id")
+        self.qualifications = list(state.get("qualifications", self.qualifications))
 
 
 @dataclass
