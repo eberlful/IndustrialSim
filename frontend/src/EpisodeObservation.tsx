@@ -38,7 +38,7 @@ export function EpisodeEvents({ episodeId }: { episodeId: string }) {
   </section>;
 }
 
-export function EpisodeInspection({ episode, selection, onSelect }: { episode: Episode; selection: LiveSelection | null; onSelect: (selection: LiveSelection) => void }) {
+export function EpisodeInspection({ episode, selection, onSelect, available = false }: { available?: boolean; episode: Episode; selection: LiveSelection | null; onSelect: (selection: LiveSelection) => void }) {
   const observation = episode.observation;
   if (!observation) return <p>Waiting for the first authoritative snapshot…</p>;
   const entity = selection ? observation[selection.kind][selection.id] : null;
@@ -46,23 +46,24 @@ export function EpisodeInspection({ episode, selection, onSelect }: { episode: E
   const resources = node ? resourcesAtNode(observation, node.id) : [];
   return <section aria-label="Live entity details" className="panel">
     <h2>Episode entity details</h2>
-    <label>Live resource<select value={selection && ['machines', 'workers'].includes(selection.kind) ? `${selection.kind}:${selection.id}` : ''}
+    <label>Live resource<select aria-label="Live resource" value={selection && ['machines', 'workers'].includes(selection.kind) ? `${selection.kind}:${selection.id}` : ''}
       onChange={event => { const colon = event.target.value.indexOf(':'); if (colon > 0) onSelect({ kind: event.target.value.slice(0, colon) as 'machines' | 'workers', id: event.target.value.slice(colon + 1) }); }}>
       <option value="">Choose a Machine or Worker…</option>
       {(['machines', 'workers'] as const).map(kind => <optgroup key={kind} label={kind}>{Object.keys(observation[kind]).map(id => <option key={id} value={`${kind}:${id}`}>{id}</option>)}</optgroup>)}
     </select></label>
     {entity ? <div aria-label={selection?.kind === 'production_units' ? 'Production Unit details' : 'Resource state'}>
-      <h3>{entity.id}</h3><pre>{JSON.stringify(entity, null, 2)}</pre>
+      <h3>{entity.id}</h3><pre>{JSON.stringify(entity, (_key, value) => available && value === null ? 'Unavailable' : value, 2)}</pre>
     </div> : <p>Select a Station or Buffer in the Episode graph, or choose a resource.</p>}
-    {node && <><h3>Production Units</h3>{node.unit_ids.length === 0 ? <p>No Production Units at this node.</p> : node.unit_ids.map(id =>
+    {node && <><h3>Production Units</h3>{node.unit_ids == null ? <p>Production Units: Unavailable</p> : node.unit_ids.length === 0 ? <p>No Production Units at this node.</p> : node.unit_ids.map(id =>
       <button key={id} onClick={() => onSelect({ kind: 'production_units', id })}>{id}</button>)}
-      <h3>Resources</h3>{resources.map(({ kind, resource }) => <button key={`${kind}:${resource.id}`} onClick={() => onSelect({ kind, id: resource.id })}>{resource.id} · {resource.available_capacity}/{resource.capacity} available</button>)}
+      <h3>Resources</h3>{resources.map(({ kind, resource }) => <button key={`${kind}:${resource.id}`} onClick={() => onSelect({ kind, id: resource.id })}>{resource.id} · {resource.available_capacity ?? 'Unavailable'}/{resource.capacity ?? 'Unavailable'} available</button>)}
     </>}
   </section>;
 }
 
 export function EpisodeMetrics({ episode }: { episode: Episode }) {
   return <section className="panel" aria-label="Live raw metrics"><h2>Current raw metrics</h2>
+    {!Object.keys(episode.observation?.raw_metrics ?? {}).length && <p>Raw metrics: Unavailable in the current observation contract.</p>}
     <dl className="outcome-metrics">{Object.entries(episode.observation?.raw_metrics ?? {}).map(([metric, value]) => <div key={metric}><dt>{metric.replaceAll('_', ' ')}</dt><dd>{String(value)}</dd></div>)}</dl>
   </section>;
 }

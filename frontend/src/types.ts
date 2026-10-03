@@ -17,16 +17,16 @@ export type Resource = { id: string; name?: string | null; capacity?: number | s
 export type WorkerRequirement = { worker_id?: string | null; qualification?: string | null; count?: number | string | null };
 export type Operation = { id: string; duration: number | string; required_machines?: string[]; required_workers?: WorkerRequirement[] };
 
-export type LiveNode = { id: string; occupancy: number; unit_ids: string[]; busy?: boolean; blocked?: boolean; capacity?: number; machine_ids?: string[] };
-export type LiveResource = { id: string; capacity: number; available_capacity: number; on_shift: boolean; on_break: boolean;
-  allocations: { station_id: string; unit_id: string; op_id: string }[]; failed?: boolean; in_maintenance?: boolean; health?: number; operating_mode?: string; assigned_station_id?: string | null; qualifications?: string[] };
-export type LiveUnit = { id: string; variant: string; state: string; location: string; quality_state: string; process_step_index: number; findings: unknown[] };
+export type LiveNode = { id: string; occupancy: number | null; unit_ids: string[] | null; busy?: boolean | null; blocked?: boolean | null; capacity?: number | null; machine_ids?: string[] | null };
+export type LiveResource = { id: string; capacity: number | null; available_capacity: number | null; on_shift: boolean | null; on_break: boolean | null;
+  allocations: { station_id: string; unit_id: string; op_id: string }[] | null; failed?: boolean | null; in_maintenance?: boolean | null; health?: number | null; operating_mode?: string | null; assigned_station_id?: string | null; qualifications?: string[] | null };
+export type LiveUnit = { id: string; variant: string | null; state: string | null; location: string | null; quality_state: string | null; process_step_index: number | null; findings: unknown[] | null };
 export type Observation = { simulated_time_ns: string; graph: Model['graph']; plant: Plant | null; stations: Record<string, LiveNode>; buffers: Record<string, LiveNode>;
   machines: Record<string, LiveResource>; workers: Record<string, LiveResource>; production_units: Record<string, LiveUnit>; raw_metrics: Record<string, number> };
 export type Episode = {
   id: string; state: 'running' | 'pausing' | 'paused' | 'finished' | 'failed' | 'interrupted' | 'seeking_batch' | 'awaiting_decisions' | 'resolving'; provider: string; mode: 'baseline' | 'manual'; decision_batch: PendingDecisionBatch | null;
   seed: string; result_path: string; simulated_time_ns: string; events_processed: number; wall_clock_seconds: number;
-  observation: Observation | null; diagnostics: string[];
+  observation: Observation | null; observation_views: { truth: Observation; available: Observation & { requests: PendingDecisionBatch['batch']['requests'] } } | null; diagnostics: string[];
   summary: { status: string; result_hash: string; raw_metrics: Record<string, number>; reward: number | null } | null;
 };
 export type LiveSelection = { kind: 'stations' | 'buffers' | 'machines' | 'workers' | 'production_units'; id: string };

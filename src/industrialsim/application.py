@@ -4848,6 +4848,15 @@ class EpisodeSession:
             'raw_metrics': deepcopy(self._summary.raw_metrics),
         }
 
+    def observation_views(self) -> dict[str, Any]:
+        """Read separate truth and current provider-contract representations."""
+        from industrialsim.observation_views import available_observations
+
+        truth = self.observe()
+        requests = (self._pending_batch.model_dump(mode='json')['requests']
+                    if self._pending_batch is not None else [])
+        return {'truth': truth, 'available': available_observations(truth, requests)}
+
     def events(self, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
         """Read ordered audit records; reads do not advance or finalize."""
         return self._engine.audit_logger.page(cursor, limit)

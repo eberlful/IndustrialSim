@@ -15,6 +15,7 @@ function App() {
   const projectRevision = useRef(0);
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [observeEpisode, setObserveEpisode] = useState(false);
+  const [observationView, setObservationView] = useState<'truth' | 'available'>('truth');
   const [liveSelection, setLiveSelection] = useState<LiveSelection | null>(null);
   useEffect(() => {
     setLiveSelection(null);
@@ -78,7 +79,8 @@ function App() {
     } finally { setBusy(false); }
   }
   const model: Model | null = project.model;
-  const live = observeEpisode ? episode?.observation : null;
+  const live = observeEpisode ? episode?.observation_views?.[observationView] ?? (observationView === 'truth' ? episode?.observation : null) : null;
+  const presentedEpisode = episode && live ? { ...episode, observation: live } : episode;
   const graphModel = useMemo(() => model && live ? { ...model, graph: live.graph, plant: live.plant } : model, [model, live?.graph, live?.plant]);
   const yamlDirty = !!model && editorYaml !== model.yaml;
   async function submitYaml(): Promise<boolean> {
@@ -166,12 +168,21 @@ function App() {
     }}>
       <section className="graph-panel" aria-label="Material Flow Graph">
         {episode && <div><button aria-pressed={observeEpisode} onClick={() => setObserveEpisode(true)}>Episode graph</button><button aria-pressed={!observeEpisode} onClick={() => setObserveEpisode(false)}>Draft graph</button></div>}
+        {episode && observeEpisode && <section aria-label="Episode observation view">
+          <button aria-pressed={observationView === 'truth'} onClick={() => setObservationView('truth')}>Simulator truth</button>
+          <button aria-pressed={observationView === 'available'} onClick={() => setObservationView('available')}>Available observations</button>
+          <p aria-label="Active observation view">Active view: {observationView === 'truth' ? 'Simulator truth' : 'Available observations'} · Decision Provider: {episode.provider}</p>
+          {observationView === 'available' && <><p>Topology and resource identifiers are workspace context. Dynamic values come only from the current Decision Requests. Unavailable values are absent from those contracts.</p>
+            <section aria-label="Available Decision Request observations"><h3>Decision Provider input</h3>
+              {episode.observation_views?.available.requests.length ? episode.observation_views.available.requests.map(request => <details key={request.request_id}><summary>{request.request_id} · {request.target_id}</summary><pre>{JSON.stringify(request, null, 2)}</pre></details>) : <p>No current observation contract. Dynamic observations are unavailable.</p>}
+            </section></>}
+        </section>}
         <div className="panel-title"><h2>Material Flow Graph</h2><span>{graphModel ? `${graphModel.graph.nodes.length} nodes · ${graphModel.graph.routes.length} routes` : 'No topology yet'}</span></div>
         <div className="graph-canvas">{graphModel ? <Graph key={live ? episode?.id : model?.name} model={graphModel} observation={live} busy={busy || !!live} onMove={positions => void load('layout', { positions })} onSelect={element => { if (live && 'kind' in element && (element.kind === 'station' || element.kind === 'buffer')) setLiveSelection({ kind: element.kind === 'station' ? 'stations' : 'buffers', id: element.id }); else if (!live) setSelection({ kind: 'kind' in element ? 'node' : 'route', id: element.id }); }}/> : <div className="empty"><strong>Inspect your Plant</strong><p>Load YAML to see sources, Stations, Buffers, sinks and their typed Ports.</p></div>}</div>
         <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
-        {episode && live && <><EpisodeInspection episode={episode} selection={liveSelection} onSelect={setLiveSelection}/><EpisodeMetrics episode={episode}/><EpisodeEvents key={episode.id} episodeId={episode.id}/></>}
+        {episode && live && <><EpisodeInspection available={observationView === 'available'} episode={presentedEpisode!} selection={liveSelection} onSelect={setLiveSelection}/><EpisodeMetrics episode={presentedEpisode!}/>{observationView === 'truth' ? <EpisodeEvents key={episode.id} episodeId={episode.id}/> : <p>Simulator audit events: Unavailable as Decision Provider input.</p>}</>}
 
         <section className="panel" aria-label="Properties"><h2>Properties</h2>{model && <label className="resource-selector">Resource definition<select disabled={busy} value={selectedResource && selection ? `${selection.kind}:${selection.id}` : ''} onChange={event => {
           const value = event.target.value;

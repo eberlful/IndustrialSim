@@ -99,6 +99,8 @@ def browser_episode_response(result: dict[str, Any]) -> dict[str, Any]:
             return [exact_times(item, key) for item in value]
         return value
     episode = result.get('episode')
+    if episode and episode.get('observation_views'):
+        episode['observation_views']['available'] = exact_times(episode['observation_views']['available'])
     if episode and episode.get('decision_batch'):
         episode['decision_batch'] = exact_times(episode['decision_batch'])
     return result

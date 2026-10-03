@@ -11,7 +11,7 @@ function MaterialNode({ data }: NodeProps<PlantNode>) {
   return <article className={`material-node ${node.kind}`}>
     <small>{node.kind === 'station' ? 'Station' : node.kind === 'buffer' ? 'Buffer' : node.kind}</small>
     <strong>{node.id}</strong>
-    {data.live && <span className="occupancy">Occupancy: {data.live.occupancy}{data.live.capacity != null ? ` / ${data.live.capacity}` : ''}
+    {data.live && <span className="occupancy">Occupancy: {data.live.occupancy ?? 'Unavailable'}{data.live.capacity != null ? ` / ${data.live.capacity}` : ''}
       {data.live.busy ? ' · busy' : ''}{data.live.blocked ? ' · blocked' : ''}</span>}
     {data.resources && <span>{data.resources}</span>}
     {node.hall_id && <span className="hall">Hall: {node.hall_id}</span>}
@@ -97,7 +97,7 @@ export function Graph({ model, onSelect, onMove, busy, observation }: { observat
       if (node.type !== 'plant') return node;
       const live = observation?.stations[node.id] ?? observation?.buffers[node.id];
       const resources = resourcesAtNode(observation, node.id).map(({ resource }) =>
-        `${resource.id}: ${resource.failed ? 'failed' : resource.in_maintenance ? 'maintenance' : `${resource.available_capacity}/${resource.capacity} available`}`).join(' · ');
+        `${resource.id}: ${resource.failed ? 'failed' : resource.in_maintenance ? 'maintenance' : `${resource.available_capacity ?? 'Unavailable'}/${resource.capacity ?? 'Unavailable'} available`}`).join(' · ');
       return { ...node, data: { ...node.data, live, resources } };
     }));
   }, [observation, model, setNodes]);

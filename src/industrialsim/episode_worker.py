@@ -62,7 +62,7 @@ class EpisodeWorker:
                 'seed': str(config.seed), 'result_path': f'runs/{episode_id}',
                 'simulated_time_ns': str(config.episode.start_time_ns),
                 'events_processed': 0, 'summary': None, 'diagnostics': [],
-                'wall_clock_seconds': 0.0, 'observation': None, 'decision_batch': None,
+                'wall_clock_seconds': 0.0, 'observation': None, 'observation_views': None, 'decision_batch': None,
             }
             result = {**self.snapshot(include_history=False), 'accepted': True, 'diagnostics': []}
             self._executor.submit(self._execute, config, self.directory / self._episode['result_path'])
@@ -114,7 +114,8 @@ class EpisodeWorker:
                     'next_cursor': end, 'has_more': end < len(self._events)}
 
     def _publish(self, session: EpisodeSession, **changes: Any) -> None:
-        observation = session.observe()
+        views = session.observation_views()
+        observation = views['truth']
         summary = session.snapshot()
         records: list[dict[str, Any]] = []
         cursor = len(self._events)
@@ -127,7 +128,7 @@ class EpisodeWorker:
         with self._lock:
             assert self._episode is not None
             self._events.extend(records)
-            self._episode.update(observation=observation, decision_batch=session.decision_batch(), simulated_time_ns=str(summary.simulated_time_ns),
+            self._episode.update(observation=observation, observation_views=views, decision_batch=session.decision_batch(), simulated_time_ns=str(summary.simulated_time_ns),
                                  events_processed=summary.events_processed,
                                  wall_clock_seconds=monotonic() - self._started_at, **changes)
 

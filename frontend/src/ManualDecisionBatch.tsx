@@ -67,6 +67,7 @@ export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; o
   return <section className="import-panel manual-decisions" aria-label="Manual Decision Batch">
     <h2>Decision Batch {pending.batch.batch_id}</h2>
     <p>All {pending.batch.requests.length} requests share simulated time {String(pending.batch.time_ns)} ns. Time stays frozen until this batch is answered.</p>
+    <p>Decision Provider contract · These requests and action forms are the same in both observation views.</p>
     <p>Submit every request together. Rejected proposals remain editable and do not invoke fallback.</p>
     {requests.map((request, index) => {
       const proposal = proposals[index];
