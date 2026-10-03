@@ -4062,14 +4062,6 @@ class EpisodeEngine:
 
         # Restore kernel
         kernel = EventKernel(initial_time_ns=checkpoint.simulated_time_ns)
-        kernel.restore(
-            {
-                "current_time_ns": checkpoint.simulated_time_ns,
-                "sequence_counter": checkpoint.next_sequence - 1,
-                "events_processed": checkpoint.events_processed,
-                "queue": checkpoint.event_queue,
-            }
-        )
 
         # Restore production units via domain encapsulation
         domain_state = checkpoint.domain_state
@@ -4222,6 +4214,15 @@ class EpisodeEngine:
             audit_logger=audit_logger,
             telemetry_manager=telemetry_manager,
         )
+        # The saved queue is authoritative; constructor scheduling must not replay triggers.
+        kernel.restore(
+            {
+                "current_time_ns": checkpoint.simulated_time_ns,
+                "sequence_counter": checkpoint.next_sequence - 1,
+                "events_processed": checkpoint.events_processed,
+                "queue": checkpoint.event_queue,
+            }
+        )
         if checkpoint.domain_state.get("decision_coordinator"):
             engine.decision_coordinator.restore_state(checkpoint.domain_state.get("decision_coordinator"))
         if checkpoint.domain_state.get("decision_triggers"):
@@ -4233,6 +4234,10 @@ class EpisodeEngine:
                             t.restore_state(t_state)
         engine.decision_diagnostics = list(checkpoint.domain_state.get("decision_diagnostics", []))
         engine.decision_batches = list(checkpoint.domain_state.get("decision_batches", []))
+        engine.total_strategic_cost = float(checkpoint.domain_state.get("total_strategic_cost", 0.0))
+        engine.buffer_history = deepcopy(checkpoint.domain_state.buffer_history)
+        if checkpoint.domain_state.last_domain_progress_time_ns is not None:
+            engine.last_domain_progress_time_ns = checkpoint.domain_state.last_domain_progress_time_ns
         return engine
 
     def create_checkpoint(self) -> Checkpoint:
@@ -4283,6 +4288,9 @@ class EpisodeEngine:
             decision_coordinator=self.decision_coordinator.to_snapshot(),
             decision_diagnostics=list(self.decision_diagnostics),
             decision_batches=list(self.decision_batches),
+            total_strategic_cost=self.total_strategic_cost,
+            buffer_history=deepcopy(self.buffer_history),
+            last_domain_progress_time_ns=self.last_domain_progress_time_ns,
         )
 
         return Checkpoint(
@@ -4755,6 +4763,7 @@ class EpisodeSession:
         source: str | Path | dict[str, Any] | SimulationConfig,
         decision_provider: DecisionProvider | None = None,
         output_dir: str | Path | None = None,
+        *, episode_id: str | None = None,
     ) -> None:
         validation = validate_config(source)
         if not validation.is_valid or validation.config is None:
@@ -4767,7 +4776,7 @@ class EpisodeSession:
         if output_dir is not None:
             # Exclusive reservation protects completed AND incomplete artifacts.
             Path(output_dir).mkdir(parents=True, exist_ok=False)
-            self._writer = RunArtifactWriter(output_dir, cfg, f"ep-{cfg.seed}")
+            self._writer = RunArtifactWriter(output_dir, cfg, episode_id or f"ep-{cfg.seed}")
         try:
             self._engine = EpisodeEngine.create(
                 cfg, decision_provider=decision_provider,
@@ -4782,6 +4791,60 @@ class EpisodeSession:
                 self._writer.audit_logger.close()
                 self._writer.telemetry_manager.close()
             raise
+
+    @classmethod
+    def from_checkpoint(
+        cls, checkpoint: str | Path | dict[str, Any] | Checkpoint,
+        decision_provider: DecisionProvider | None = None,
+        output_dir: str | Path | None = None,
+        *, episode_id: str | None = None, parent_run_id: str | None = None,
+    ) -> EpisodeSession:
+        """Validate before reserving new artifacts; preserve any unanswered batch."""
+        cp = (load_checkpoint(checkpoint) if isinstance(checkpoint, (str, Path)) else
+              deserialize_checkpoint(checkpoint) if isinstance(checkpoint, dict) else checkpoint)
+        engine = restore_checkpoint(cp, decision_provider=decision_provider)
+        session = cls.__new__(cls)
+        session._engine = engine
+        session._writer = None
+        session._closed = False
+        session._finalized = False
+        session._pending_batch = None
+        session._summary = engine.to_summary(update_metrics=False)
+        if engine.decision_coordinator.has_pending():
+            coordinator = deepcopy(engine.decision_coordinator)
+            session._pending_batch = coordinator.form_batch(
+                time_ns=engine.kernel.current_time_ns,
+                observation_builder=lambda request: engine._build_observation_for_request(request, engine.kernel.current_time_ns),
+            )
+        if session.finished:
+            session.close()
+            raise ValueError('Choose a Checkpoint from an unfinished Episode')
+        if output_dir is not None:
+            try:
+                Path(output_dir).mkdir(parents=True, exist_ok=False)
+                checkpoint_hash = json.loads(serialize_checkpoint(cp))['checksum']
+                writer = RunArtifactWriter(output_dir, engine.cfg, episode_id or f"ep-{engine.cfg.seed}",
+                                           parent_run_id=parent_run_id, checkpoint_hash=checkpoint_hash,
+                                           plugin_metadata=engine.plugin_metadata)
+                session._writer = writer
+                engine.audit_logger.close()
+                engine.telemetry_manager.close()
+                engine.audit_logger = writer.audit_logger
+                engine.telemetry_manager = writer.telemetry_manager
+            except BaseException:
+                session.close()
+                raise
+        return session
+
+    def create_checkpoint(self) -> Checkpoint:
+        """Capture a consistent continuation without advancing or answering requests."""
+        if self._closed or self._finalized:
+            raise ValueError('Cannot checkpoint a closed or finalized Episode')
+        return deepcopy(self._engine.create_checkpoint())
+
+    def configuration(self) -> dict[str, Any]:
+        """Read the Episode's frozen configuration, independently of project drafts."""
+        return self._engine.cfg.model_dump(mode='json')
 
     @property
     def finished(self) -> bool:

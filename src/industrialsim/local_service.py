@@ -58,6 +58,11 @@ class SubmitDecisionBatch(BaseModel):
     actions: list[dict[str, Any]]
 
 
+class RestoreCheckpoint(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    path: str
+
+
 class EpisodeCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
     episode_id: str
@@ -145,6 +150,20 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
             return JSONResponse({**episodes.snapshot(include_history=False), 'accepted': False,
                                  'diagnostics': exported['diagnostics']}, status_code=422)
         result = episodes.start(exported['yaml'], mode=body.mode if body else 'baseline')
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
+
+    @app.get('/api/episode/checkpoints')
+    def saved_checkpoints() -> dict[str, Any]:
+        return {'checkpoints': episodes.checkpoints()}
+
+    @app.post('/api/episode/checkpoint')
+    def checkpoint_episode(body: EpisodeCommand) -> JSONResponse:
+        result = episodes.create_checkpoint(body.episode_id)
+        return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
+
+    @app.post('/api/episode/restore')
+    def restore_episode(body: RestoreCheckpoint) -> JSONResponse:
+        result = episodes.restore_checkpoint(body.path)
         return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
 
     @app.post('/api/episode/pause')

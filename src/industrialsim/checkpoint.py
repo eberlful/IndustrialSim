@@ -198,6 +198,9 @@ class StationSnapshot:
     plugin_version: str | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
     custom_state: dict[str, Any] = field(default_factory=dict)
+    configuration: dict[str, Any] = field(default_factory=dict)
+    is_reconfiguring: bool = False
+    inspection_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -219,6 +222,9 @@ class StationSnapshot:
             "blocked_start_ns": self.blocked_start_ns,
             "waiting_since_ns": self.waiting_since_ns,
             "type_id": self.type_id,
+            "configuration": dict(self.configuration),
+            "is_reconfiguring": self.is_reconfiguring,
+            "inspection_overrides": dict(self.inspection_overrides),
         }
         if self.plugin_id is not None:
             result["plugin_id"] = self.plugin_id
@@ -275,6 +281,9 @@ class StationSnapshot:
             plugin_version=data.get("plugin_version"),
             parameters=dict(data.get("parameters", {})),
             custom_state=custom_state,
+            configuration=dict(data.get("configuration", {})),
+            is_reconfiguring=bool(data.get("is_reconfiguring", False)),
+            inspection_overrides=dict(data.get("inspection_overrides", {})),
         )
 
 
@@ -579,6 +588,9 @@ class DomainStateSnapshot:
     decision_coordinator: dict[str, Any] = field(default_factory=dict)
     decision_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     decision_batches: list[dict[str, Any]] = field(default_factory=list)
+    total_strategic_cost: float = 0.0
+    buffer_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    last_domain_progress_time_ns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -602,6 +614,9 @@ class DomainStateSnapshot:
             "decision_coordinator": dict(self.decision_coordinator),
             "decision_diagnostics": list(self.decision_diagnostics),
             "decision_batches": list(self.decision_batches),
+            "total_strategic_cost": self.total_strategic_cost,
+            "buffer_history": self.buffer_history,
+            "last_domain_progress_time_ns": self.last_domain_progress_time_ns,
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -645,6 +660,12 @@ class DomainStateSnapshot:
             return self.decision_diagnostics
         if key == "decision_batches":
             return self.decision_batches
+        if key == "total_strategic_cost":
+            return self.total_strategic_cost
+        if key == "buffer_history":
+            return self.buffer_history
+        if key == "last_domain_progress_time_ns":
+            return self.last_domain_progress_time_ns
         raise KeyError(key)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -699,6 +720,9 @@ class DomainStateSnapshot:
             decision_coordinator=dict(data.get("decision_coordinator", {})),
             decision_diagnostics=list(data.get("decision_diagnostics", [])),
             decision_batches=list(data.get("decision_batches", [])),
+            total_strategic_cost=float(data.get("total_strategic_cost", 0.0)),
+            buffer_history=dict(data.get("buffer_history", {})),
+            last_domain_progress_time_ns=data.get("last_domain_progress_time_ns"),
         )
 
 

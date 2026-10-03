@@ -946,6 +946,9 @@ class Station:
             "busy_start_ns": self.busy_start_ns,
             "blocked_start_ns": self.blocked_start_ns,
             "waiting_since_ns": self.waiting_since_ns,
+            "configuration": dict(self.configuration),
+            "is_reconfiguring": self.is_reconfiguring,
+            "inspection_overrides": {oid: dict(op.inspection) for oid, op in self.operations.items() if op.inspection},
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
@@ -965,6 +968,11 @@ class Station:
         self.busy_start_ns = state.get("busy_start_ns")
         self.blocked_start_ns = state.get("blocked_start_ns")
         self.waiting_since_ns = state.get("waiting_since_ns")
+        self.configuration = dict(state.get("configuration", {}))
+        self.is_reconfiguring = bool(state.get("is_reconfiguring", False))
+        for oid, inspection in state.get("inspection_overrides", {}).items():
+            if oid in self.operations:
+                self.operations[oid].inspection = dict(inspection)
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {

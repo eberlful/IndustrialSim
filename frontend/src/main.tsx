@@ -81,7 +81,11 @@ function App() {
   const model: Model | null = project.model;
   const live = observeEpisode ? episode?.observation_views?.[observationView] ?? (observationView === 'truth' ? episode?.observation : null) : null;
   const presentedEpisode = episode && live ? { ...episode, observation: live } : episode;
-  const graphModel = useMemo(() => model && live ? { ...model, graph: live.graph, plant: live.plant } : model, [model, live?.graph, live?.plant]);
+  const graphModel = useMemo<Model | null>(() => live && episode ? {
+    name: `Episode ${episode.id}`, yaml: '', configuration: episode.configuration,
+    layout: { positions: {}, grouping: 'none' }, graph: live.graph, plant: live.plant,
+    valid: true, graph_available: true, diagnostics: [],
+  } : model, [model, live?.graph, live?.plant, episode?.id, episode?.configuration]);
   const yamlDirty = !!model && editorYaml !== model.yaml;
   async function submitYaml(): Promise<boolean> {
     if (!yamlDirty || !model) return true;
@@ -182,7 +186,7 @@ function App() {
         <p className="hint">Select a node or route to inspect properties. Drag nodes to improve readability; save layout to restore positions and display grouping. Grouping uses existing assignments.</p>
       </section>
       <aside>
-        {episode && live && <><EpisodeInspection available={observationView === 'available'} episode={presentedEpisode!} selection={liveSelection} onSelect={setLiveSelection}/><EpisodeMetrics episode={presentedEpisode!}/>{observationView === 'truth' ? <EpisodeEvents key={episode.id} episodeId={episode.id}/> : <p>Simulator audit events: Unavailable as Decision Provider input.</p>}</>}
+        {episode && live && <><section className="panel" aria-label="Frozen Episode configuration"><h2>Episode configuration</h2><p>Frozen configuration for Episode {episode.id}. Project draft edits apply to a future Episode.</p><details><summary>Inspect Episode configuration</summary><pre>{JSON.stringify(episode.configuration, null, 2)}</pre></details></section><EpisodeInspection available={observationView === 'available'} episode={presentedEpisode!} selection={liveSelection} onSelect={setLiveSelection}/><EpisodeMetrics episode={presentedEpisode!}/>{observationView === 'truth' ? <EpisodeEvents key={episode.id} episodeId={episode.id}/> : <p>Simulator audit events: Unavailable as Decision Provider input.</p>}</>}
 
         <section className="panel" aria-label="Properties"><h2>Properties</h2>{model && <label className="resource-selector">Resource definition<select disabled={busy} value={selectedResource && selection ? `${selection.kind}:${selection.id}` : ''} onChange={event => {
           const value = event.target.value;
