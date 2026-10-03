@@ -78,6 +78,7 @@ def test_worker_restart_requires_explicit_restore_and_rejects_old_episode_identi
         outcome = wait_for_state(worker, 'finished')
         import json
         manifest = json.loads((tmp_path / outcome['result_path'] / 'manifest.json').read_text())
+        assert manifest['run_id'] == restored['id']
         assert manifest['parent_run_id'] == original['id']
         assert manifest['checkpoint_hash'] == saved['checkpoint']['checkpoint_hash']
     assert {path.relative_to(tmp_path): path.read_bytes() for path in (tmp_path / original['result_path']).rglob('*') if path.is_file()} == before

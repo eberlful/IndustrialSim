@@ -155,10 +155,12 @@ class RunArtifactWriter:
         parent_run_id: str | None = None,
         checkpoint_hash: str | None = None,
         plugin_metadata: dict[str, str] | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.config = config
         self.episode_id = episode_id
+        self.run_id = run_id or episode_id
         self.branch_id = branch_id
         self.parent_run_id = parent_run_id
         self.checkpoint_hash = checkpoint_hash
@@ -205,7 +207,7 @@ class RunArtifactWriter:
         manifest_data: dict[str, Any] = {
             "schema_version": self.config.schema_version,
             "kernel_version": "1.0",
-            "run_id": self.episode_id,
+            "run_id": self.run_id,
             "branch_id": self.branch_id,
             "parent_run_id": self.parent_run_id,
             "checkpoint_hash": self.checkpoint_hash,

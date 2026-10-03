@@ -4776,7 +4776,7 @@ class EpisodeSession:
         if output_dir is not None:
             # Exclusive reservation protects completed AND incomplete artifacts.
             Path(output_dir).mkdir(parents=True, exist_ok=False)
-            self._writer = RunArtifactWriter(output_dir, cfg, episode_id or f"ep-{cfg.seed}")
+            self._writer = RunArtifactWriter(output_dir, cfg, f"ep-{cfg.seed}", run_id=episode_id)
         try:
             self._engine = EpisodeEngine.create(
                 cfg, decision_provider=decision_provider,
@@ -4823,9 +4823,9 @@ class EpisodeSession:
             try:
                 Path(output_dir).mkdir(parents=True, exist_ok=False)
                 checkpoint_hash = json.loads(serialize_checkpoint(cp))['checksum']
-                writer = RunArtifactWriter(output_dir, engine.cfg, episode_id or f"ep-{engine.cfg.seed}",
+                writer = RunArtifactWriter(output_dir, engine.cfg, engine.episode_id,
                                            parent_run_id=parent_run_id, checkpoint_hash=checkpoint_hash,
-                                           plugin_metadata=engine.plugin_metadata)
+                                           plugin_metadata=engine.plugin_metadata, run_id=episode_id)
                 session._writer = writer
                 engine.audit_logger.close()
                 engine.telemetry_manager.close()
