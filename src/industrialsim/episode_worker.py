@@ -16,6 +16,8 @@ from industrialsim.decisions import BaselineDecisionProvider
 from industrialsim.saved_checkpoints import SavedCheckpoints
 
 
+ACTIVE_EPISODE_STATES = frozenset({'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'})
+
 class EpisodeWorker:
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory).resolve(strict=True)
@@ -40,7 +42,7 @@ class EpisodeWorker:
                     'status', 'result_hash', 'raw_metrics', 'reward', 'seed',
                 )}}
             episode = deepcopy(published)
-            if episode and episode['state'] in {'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'}:
+            if episode and episode['state'] in ACTIVE_EPISODE_STATES:
                 episode['wall_clock_seconds'] = monotonic() - self._started_at
             return {'episode': episode}
 
@@ -50,7 +52,7 @@ class EpisodeWorker:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Choose Baseline or manual decisions']}
             if self._stop.is_set() or self._restoring:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Episode worker is closed']}
-            if self._episode and self._episode['state'] in {'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'}:
+            if self._episode and self._episode['state'] in ACTIVE_EPISODE_STATES:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['An Episode is already active']}
             validation = validate_config(source)
             if not validation.is_valid or validation.config is None:
@@ -92,8 +94,7 @@ class EpisodeWorker:
     def restore_checkpoint(self, path: str) -> dict[str, Any]:
         """Restore only on explicit selection, into a fresh paused local Episode."""
         with self._lock:
-            if (self._stop.is_set() or self._restoring or (self._episode and self._episode['state'] in
-                    {'running', 'pausing', 'paused', 'seeking_batch', 'awaiting_decisions', 'resolving'})):
+            if (self._stop.is_set() or self._restoring or (self._episode and self._episode['state'] in ACTIVE_EPISODE_STATES)):
                 return {**self.snapshot(include_history=False), 'accepted': False,
                         'diagnostics': ['An Episode is already active or the worker is closed']}
             self._restoring = True
