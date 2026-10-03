@@ -321,3 +321,33 @@ def test_reassigned_worker_snapshot_preserves_assignment_and_qualifications() ->
     restored.restore_state(snapshot)
     assert restored.assigned_station_id == 'station'
     assert restored.qualifications == ['operator']
+
+
+def test_joint_maintenance_and_worker_actions_apply_before_resource_allocation() -> None:
+    model = MODEL.replace('target_id: station', 'target_id: machine').replace('interval_ns: 1000000000', 'times_ns: [0]') + '''
+workers: [{id: worker, qualifications: [maintenance]}]
+machines:
+  - id: machine
+    maintenance:
+      duration: 100ns
+      required_workers: [{qualification: maintenance, count: 1}]
+'''
+    model = model.replace('decision_triggers:', 'decision_triggers:\n  - {id: worker-safe, trigger_type: safe_point, target_id: worker, times_ns: [0]}')
+    for maintenance_first in (True, False):
+        session = EpisodeSession(model)
+        session.advance_to_next_decision_batch()
+        pending = session.decision_batch()
+        assert pending is not None
+        actions = [
+            {'action_type': 'maintenance', 'target_id': 'machine', 'trigger_maintenance': True},
+            {'action_type': 'worker_reassignment', 'target_id': 'worker', 'assigned_station_id': 'station'},
+        ]
+        if not maintenance_first:
+            actions.reverse()
+        result = session.submit_decision_batch(pending['batch']['batch_id'], actions)
+        assert result['accepted'], result
+        observation = session.observe()
+        assert observation['workers']['worker']['assigned_station_id'] == 'station'
+        assert observation['machines']['machine']['in_maintenance']
+        assert observation['workers']['worker']['allocations']
+        session.close()

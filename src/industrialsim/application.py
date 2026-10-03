@@ -1913,6 +1913,9 @@ class EpisodeEngine:
     def _apply_actions_list(
         self, batch: DecisionBatch, actions: Sequence[DecisionAction]
     ) -> None:
+        # Commit direct state changes before any action allocates resources or
+        # dispatches production. Proposal ordering must not skip valid effects.
+        maintenance_targets = []
         for action in actions:
             if isinstance(action, BufferReorderAction):
                 buf = self.buffers.get(action.target_id)
@@ -1923,18 +1926,15 @@ class EpisodeEngine:
                         if uid not in reordered:
                             reordered.append(uid)
                     buf.occupants = reordered
-                self._try_pull_upstream(self.kernel, action.target_id)
-                for r in self.routes_from.get(action.target_id, []):
-                    self._try_pull_upstream(self.kernel, r.target_node_id)
             elif isinstance(action, MachineModeAction):
                 mach = self.machines.get(action.target_id)
-                if mach is not None:
+                if mach is not None and not mach.active_allocations and not mach.is_in_maintenance:
                     mach.operating_mode = action.mode
             elif isinstance(action, MaintenanceAction):
                 if action.trigger_maintenance:
                     mach = self.machines.get(action.target_id)
                     if mach is not None:
-                        self._trigger_maintenance(self.kernel, mach)
+                        maintenance_targets.append(mach)
             elif isinstance(action, ReconfigurationAction):
                 if action.cost > 0:
                     self.total_strategic_cost += action.cost
@@ -1947,6 +1947,8 @@ class EpisodeEngine:
                         event_type="COMPLETE_RECONFIGURATION",
                         payload={"station_id": action.target_id},
                     )
+                elif st is not None:
+                    st.configuration.update(action.configuration)
             elif isinstance(action, WorkerReassignmentAction):
                 if action.cost > 0:
                     self.total_strategic_cost += action.cost
@@ -1970,10 +1972,19 @@ class EpisodeEngine:
                             if action.release_threshold is not None:
                                 op.inspection["release_threshold"] = action.release_threshold
             elif isinstance(action, RoutingAction):
-                pass
+                uid = action.unit_id or action.target_id
+                oid = self._active_transport_orders_by_unit.get(uid)
+                if oid and action.route_id in self.routes_by_id:
+                    self.transport_orders[oid].assigned_route_id = action.route_id
             elif isinstance(action, DispatchAction):
-                pass
+                req = next((r for r in batch.requests if r.target_id == action.target_id), None)
+                oid = getattr(req.observation, "order_id", action.target_id) if req else action.target_id
+                if oid in self.transport_orders:
+                    self.transport_orders[oid].assigned_route_id = action.route_id
+                    self.transport_orders[oid].assigned_vehicle_id = action.vehicle_id
 
+        for machine in maintenance_targets:
+            self._trigger_maintenance(self.kernel, machine)
         for req in batch.requests:
             if req.target_id in self.buffers:
                 self._try_pull_upstream(self.kernel, req.target_id)
@@ -2366,6 +2377,8 @@ class EpisodeEngine:
                 continue
 
             candidates = self._get_candidate_routes_for_unit(order.source_node_id, unit)
+            if order.assigned_route_id is not None:
+                candidates = [r for r in candidates if r.id == order.assigned_route_id]
             if not candidates:
                 continue
 
