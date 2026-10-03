@@ -40,7 +40,7 @@ export function SavedResults() {
     graph: { nodes, routes: flow?.routes ?? [] }, plant: (config.plant ?? null) as Model['plant'],
     layout: { positions: {}, grouping: 'none' }, valid: true, graph_available: true, diagnostics: [] } : null;
   const diagnosis = result?.summary?.deadlock_diagnosis;
-  const entity = selected && config ? [...nodes, ...((config.machines ?? []) as { id: string }[]), ...((config.workers ?? []) as { id: string }[]), ...((config.production_units ?? []) as { id: string }[])].find(item => item.id === selected) : null;
+  const entity = selected && config ? [...nodes, ...(flow?.routes ?? []), ...((config.vehicles ?? []) as { id: string }[]), ...((config.machines ?? []) as { id: string }[]), ...((config.workers ?? []) as { id: string }[]), ...((config.production_units ?? []) as { id: string }[])].find(item => item.id === selected) : null;
   return <section className="import-panel" aria-label="Saved Episode results">
     <h2>Saved Episode results</h2>
     <label>Saved Episode output<select aria-label="Saved Episode output" value={path} disabled={busy} onChange={event => setPath(event.target.value)}>

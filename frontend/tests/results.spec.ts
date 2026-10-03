@@ -59,6 +59,8 @@ session.close()
     await saved.getByRole('button', { name: 'Open saved results', exact: true }).click();
     await expect(saved.getByLabel('Saved result status')).toContainText('⚠ deadlocked');
     const diagnosis = saved.getByLabel('Deadlock diagnosis', { exact: true });
+    await saved.getByRole('button', { name: 'r-stB-sink', exact: true }).click();
+    await expect(saved.getByLabel('Saved entity details')).toContainText('source_node_id');
     await diagnosis.getByRole('button').first().click();
     await expect(saved.getByLabel('Saved entity details')).toBeVisible();
     await diagnosis.getByText('Wait relationships, capacities and ownership', { exact: true }).click();
