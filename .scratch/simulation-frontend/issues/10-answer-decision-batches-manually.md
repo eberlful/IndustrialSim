@@ -20,4 +20,8 @@
 
 Implemented Baseline/manual selection, stable batch boundaries, schema-derived forms, editable validation failures and atomic submissions with Episode/batch identity. Public session tests exercise every action contract, shared-state conflicts, correction, provenance and selected resource effects. Worker tests cover both manual control and configured provider failure semantics. Browser tests verify rejected proposals stay editable and complete valid batches apply once.
 
-Validation: Python suite 328 passed, 1 skipped before the final selected-Vehicle regression; browser suite 17 passed; Python and TypeScript type checks and frontend build passed. Final review and verification follow.
+Final validation: 333 Python tests passed, 1 skipped; all 17 browser workflows passed. Python typechecks for five changed modules and TypeScript typecheck/frontend build passed. The manual browser workflow also covers multiple requests for one target, keeping all requests visible while submitting one shared action.
+
+Code review against starting commit `06360b31f0ac29596bee2d14c37a6cc540de6909`: Standards: 0 remaining findings; Spec: 0 remaining findings. Review fixes preserve Worker assignments/qualifications in checkpoints, apply direct batch effects before resource allocation, group same-target forms with unique request IDs, restrict routes to the Production Unit's process plan, and reuse existing dispatch policy rules for Vehicle suitability and shared Route capacity. Public regressions verify rejected proposals leave state and pending batches intact, correction succeeds, and proposal ordering does not skip effects.
+
+The 18 manual public session/worker tests also passed against exported committed sources, with only the existing workspace's Python 3.12 runtime/YAML compatibility adaptations applied to that temporary verification copy. Existing unrelated workspace changes remain outside the implementation commits.
