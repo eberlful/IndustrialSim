@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="IndustrialSim: Produktionsabläufe modellieren, Steuerungsstrategien unter vergleichbaren Bedingungen testen und Ergebnisse nachvollziehen.">
+  <meta name="theme-color" content="#101f2c">
+  <title>IndustrialSim — Produktion verstehen.</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#inhalt">Zum Inhalt</a>
+  <header class="header wrap">
+    <a class="brand" href="#" aria-label="IndustrialSim Startseite"><span class="brand-mark" aria-hidden="true">i<span></span></span>Industrial<span class="brand-light">Sim</span></a>
+    <nav aria-label="Hauptnavigation"><a href="#funktionen">Funktionen</a><a href="#ablauf">So funktioniert’s</a><a href="#praxis">In der Praxis</a></nav>
+    <a class="header-link" href="#einstieg">Software kennenlernen <span aria-hidden="true">↗</span></a>
+  </header>
+  <main id="inhalt">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot"></span> PRODUKTIONSSIMULATION FÜR BESSERE ENTSCHEIDUNGEN</p>
+        <h1 id="hero-title">Produktion verstehen.<br>Entscheidungen <em>sicher vergleichen.</em></h1>
+        <p class="lead">Was passiert, wenn sich Ihre Produktion verändert? IndustrialSim bildet Abläufe in der Automobilproduktion ab — und macht die Auswirkungen Ihrer Entscheidungen nachvollziehbar.</p>
+        <div class="actions"><a class="button primary" href="#funktionen">Möglichkeiten entdecken <span aria-hidden="true">↗</span></a><a class="text-link" href="#ablauf">So funktioniert’s <span aria-hidden="true">↓</span></a></div>
+        <div class="hero-footnote"><span>Reproduzierbare Simulation</span><span>Vergleichbare Strategien</span><span>Nachvollziehbare Ergebnisse</span></div>
+      </div>
+      <div class="plant-card">
+        <div class="card-top"><span><span class="status-dot"></span> EIN BLICK IN DAS MODELL</span><span class="small-tag">ILLUSTRATION</span></div>
+        <svg class="plant-visual" viewBox="0 0 560 380" role="img" aria-labelledby="plant-title plant-desc">
+          <title id="plant-title">Schematischer Materialfluss eines Automobilwerks</title><desc id="plant-desc">Rohbau, Lackiererei, Puffer und Endmontage sind durch Transportrouten verbunden. Eine alternative Route führt zur Qualitätsprüfung und Nacharbeit.</desc>
+          <defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#35505c"/></pattern><marker id="arrow" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><path d="M0 0 6 3.5 0 7" fill="none" stroke="#59d8bf" stroke-width="1.2"/></marker></defs>
+          <rect width="560" height="380" fill="url(#grid)"/>
+          <g fill="none" stroke="#59d8bf" stroke-width="2" marker-end="url(#arrow)"><path d="M164 110 H217"/><path d="M340 110 H382"/><path d="M439 146 V208 H333 V248"/><path d="M217 284 H164"/><path d="M105 248 V146" stroke-dasharray="5 6"/></g>
+          <g class="svg-node"><rect x="44" y="74" width="120" height="72" rx="9"/><path d="M64 105 v-13 h18 v13 m-23 10 h29 m-23 0 v-10 h18 v10"/><text x="104" y="132">Rohbau</text></g>
+          <g class="svg-node"><rect x="217" y="74" width="123" height="72" rx="9"/><path d="M242 90 h22 l-4 13 h-14 z m7 13 v12 m-11 0 h22"/><text x="278" y="132">Lackiererei</text></g>
+          <g class="svg-node buffer"><rect x="382" y="74" width="114" height="72" rx="9"/><path d="M404 92 h12 v17 h-12 z m19 0 h12 v17 h-12 z m19 0 h12 v17 h-12 z"/><text x="439" y="132">Puffer</text></g>
+          <g class="svg-node"><rect x="217" y="248" width="171" height="72" rx="9"/><path d="M243 283 h43 l-5-12 h-30 z m-4 0 v8 h51 v-8 m-42 8 v5 m32-5 v5"/><text x="302" y="307">Endmontage</text></g>
+          <g class="svg-node subdued"><rect x="44" y="248" width="120" height="72" rx="9"/><path d="m65 279 8 8 15-19"/><text x="104" y="307">Qualitätsprüfung</text></g>
+          <g class="moving-unit" fill="#b8f8e8"><rect x="180" y="105" width="12" height="10" rx="3"/><rect x="433" y="178" width="12" height="10" rx="3"/></g>
+          <text x="70" y="201" class="route-label">Nacharbeit</text><text x="274" y="188" class="route-label">Materialfluss &amp; Transport</text>
+        </svg>
+        <div class="card-bottom"><span><span class="legend-line"></span> Materialfluss</span><span><span class="legend-line dashed"></span> Nacharbeit</span><span>Ein Werk. Viele Zusammenhänge.</span></div>
+      </div>
+    </section>
+    <div class="principles"><div class="wrap"><p>Vom einzelnen Prozess<br><strong>zum Zusammenspiel im Werk.</strong></p><span>Materialfluss</span><span>Ressourcen</span><span>Qualität</span><span>Steuerung</span></div></div>
+    <section class="section wrap" id="funktionen" aria-labelledby="features-title">
+      <div class="section-heading"><div><p class="eyebrow">01 / MÖGLICHKEITEN</p><h2 id="features-title">Die Produktion ist vernetzt.<br>Ihr Modell sollte es auch sein.</h2></div><p>IndustrialSim verbindet Produktionsprozesse, Logistik und Entscheidungen in einer diskreten Ereignissimulation. Sie bestimmen, welche Zusammenhänge Ihr Modell abbildet.</p></div>
+      <div class="feature-grid">
+        <article class="feature"><span class="feature-number">01 <span aria-hidden="true">↗</span></span><h3>Materialfluss &amp; Ressourcen</h3><p>Stationen, Puffer und Transportrouten verbinden. Maschinen und qualifizierte Mitarbeitende mit ihren Kapazitäten und Verfügbarkeiten modellieren.</p><span class="feature-label">Das Werk als zusammenhängendes System</span></article>
+        <article class="feature"><span class="feature-number">02 <span aria-hidden="true">↗</span></span><h3>Kapazitäten &amp; Ausfälle</h3><p>Begrenzte Puffer, Maschinenzustände und Ausfälle berücksichtigen. Untersuchen, wo Ressourcen den Ablauf einschränken und Blockaden entstehen.</p><span class="feature-label">Engpässe im Modell untersuchen</span></article>
+        <article class="feature"><span class="feature-number">03 <span aria-hidden="true">↗</span></span><h3>Qualität &amp; Nacharbeit</h3><p>Qualitätsprüfungen, Nacharbeit und Ausschuss abbilden. Verborgene Defekte und beobachtete Prüfergebnisse werden getrennt behandelt.</p><span class="feature-label">Qualität entlang der Prozesskette</span></article>
+        <article class="feature"><span class="feature-number">04 <span aria-hidden="true">↗</span></span><h3>Steuerungsstrategien vergleichen</h3><p>Unterschiedliche Regeln für Reihenfolgen, Routen oder Transporte unter kontrollierten Zufallsbedingungen testen. Entscheidungen an konsistenten Pausepunkten treffen.</p><span class="feature-label">Eine gemeinsame Vergleichsgrundlage</span></article>
+        <article class="feature"><span class="feature-number">05 <span aria-hidden="true">↗</span></span><h3>Alternativen durchspielen</h3><p>Den Simulationszustand als Checkpoint sichern, fortsetzen und alternative Entscheidungen vom selben Ausgangszustand aus untersuchen.</p><span class="feature-label">Was wäre, wenn wir anders entscheiden?</span></article>
+        <article class="feature"><span class="feature-number">06 <span aria-hidden="true">↗</span></span><h3>Ergebnisse nachvollziehen</h3><p>Kennzahlen, Zeitreihen und Ereignisprotokolle auswerten. Konfiguration, Seed und Laufdaten dokumentieren die Grundlage jedes Vergleichs.</p><span class="feature-label">Von der Entscheidung zur Auswertung</span></article>
+      </div>
+    </section>
+    <section class="explore-section" aria-labelledby="explore-title"><div class="wrap">
+      <div class="section-heading"><div><p class="eyebrow">DAS ZUSAMMENSPIEL ENTDECKEN</p><h2 id="explore-title">Jeder Bereich beeinflusst den nächsten.</h2></div><p>Wählen Sie einen Bereich und entdecken Sie, welche Einflussgrößen Sie im Modell beschreiben können.</p></div>
+      <div class="flow-controls" role="group" aria-label="Produktionsbereich auswählen">
+        <button type="button" data-area="rohbau" aria-pressed="true" aria-controls="area-details"><span>01</span>Rohbau <span aria-hidden="true">→</span></button>
+        <button type="button" data-area="lack" aria-pressed="false" aria-controls="area-details"><span>02</span>Lackiererei <span aria-hidden="true">→</span></button>
+        <button type="button" data-area="puffer" aria-pressed="false" aria-controls="area-details"><span>03</span>Puffer <span aria-hidden="true">→</span></button>
+        <button type="button" data-area="montage" aria-pressed="false" aria-controls="area-details"><span>04</span>Endmontage <span aria-hidden="true">↗</span></button>
+      </div>
+      <div class="area-details" id="area-details" aria-live="polite" aria-atomic="true"><div><p class="eyebrow" id="area-kicker">01 / ROHBAU</p><h3 id="area-title">Der Anfang der Prozesskette.</h3><p id="area-description">Stationen führen die deklarierten Operationen aus. Benötigte Maschinen und Mitarbeitende können die verfügbare Kapazität begrenzen.</p></div><div><p class="detail-label">MODELLIERBARE EINFLUSSGRÖSSEN</p><ul id="area-factors"><li>Bearbeitungsdauer der Operationen</li><li>Maschinenkapazität und Verfügbarkeit</li><li>Qualifikationen und Schichten</li></ul></div></div>
+      <p class="illustration-note">Illustrative Darstellung einer Prozesskette. Die Auswahl erklärt das Modell und führt keine Simulation aus.</p>
+      <noscript><p>Lackiererei: Prozessdauer, Maschinenzustände und Qualitätsprüfungen. Puffer: Kapazität, Reihenfolge und Transportanbindung. Endmontage: Prozessanforderungen, Ressourcen und Nacharbeit.</p></noscript>
+    </div></section>
+    <section class="section wrap" id="ablauf" aria-labelledby="workflow-title">
+      <div class="section-heading"><div><p class="eyebrow">02 / VOM MODELL ZUR ERKENNTNIS</p><h2 id="workflow-title">Vier Schritte.<br>Eine nachvollziehbare Entscheidung.</h2></div><p>Sie legen das Produktionssystem und die Fragestellung fest. IndustrialSim führt die konfigurierten Abläufe aus und liefert die Daten für Ihre Bewertung.</p></div>
+      <ol class="steps"><li><span class="step-number">01</span><h3>Werk definieren</h3><p>Materialfluss, Ressourcen und Prozesse beschreiben. Im Produktionsplan Varianten, Mengen und Freigabezeiten festlegen.</p></li><li><span class="step-number">02</span><h3>Simulation durchführen</h3><p>Das Modell validieren und eine Episode starten. Produktions- und Transportereignisse verändern den Zustand des Werks.</p></li><li><span class="step-number">03</span><h3>Varianten vergleichen</h3><p>Steuerungsregeln verändern oder alternative Aktionen aus einem Checkpoint testen. Zufallsbedingungen kontrolliert halten.</p></li><li><span class="step-number">04</span><h3>Ergebnisse auswerten</h3><p>Kennzahlen und Ereignisse untersuchen. Prüfen, welche Strategie für Ihre Ziele und Modellannahmen geeignet ist.</p></li></ol>
+      <div class="access"><p>Ihr Zugang zum Modell</p><div><strong>Browseroberfläche</strong><span>Materialfluss ansehen, Modelle bearbeiten und Episoden steuern.</span></div><div><strong>YAML-Konfiguration</strong><span>Modelle deklarativ beschreiben, validieren und versionieren.</span></div><div><strong>Python &amp; CLI</strong><span>Abläufe automatisieren und Experimente in eigene Auswertungen einbinden.</span></div></div>
+    </section>
+    <section class="practice section" id="praxis" aria-labelledby="practice-title"><div class="wrap"><p class="eyebrow">03 / FRAGEN AUS DER PRAXIS</p><h2 id="practice-title">Aus „Was wäre, wenn …“<br>wird ein untersuchbarer Vergleich.</h2><div class="practice-grid"><article><span class="case-label">PUFFER &amp; MATERIALFLUSS</span><h3>Was verändert ein größerer Puffer?</h3><p>Kapazitäten im Modell variieren und beobachten, wie sich Belegung, Wartezustände und der weitere Materialfluss verändern.</p></article><article><span class="case-label">RESSOURCEN &amp; VERFÜGBARKEIT</span><h3>Wo begrenzen Ressourcen die Produktion?</h3><p>Verfügbarkeiten und Ressourcenbedarf untersuchen. Nachvollziehen, welche Stationen warten und wie sich Einschränkungen fortsetzen.</p></article><article><span class="case-label">ENTSCHEIDUNGEN &amp; STRATEGIEN</span><h3>Welche Steuerung passt zum Produktionsziel?</h3><p>Alternative Priorisierungen oder Transportzuweisungen vergleichen und anhand Ihrer gewählten Kennzahlen bewerten.</p></article></div><p class="practice-note">Die Aussagekraft der Ergebnisse hängt von den hinterlegten Modellannahmen und ihrer Kalibrierung ab.</p></div></section>
+    <section class="section wrap deep-dive" aria-labelledby="deep-title"><div><p class="eyebrow">04 / WEITERDENKEN</p><h2 id="deep-title">Auch für die nächste<br>Generation der Steuerung.</h2><p>IndustrialSim bietet definierte Entscheidungsschnittstellen für eigene Heuristiken und externe KI-Agenten. Die Simulation pausiert, während eine Entscheidung berechnet wird — ohne dass Simulationszeit verstreicht.</p><p>Reproduzierbare Episoden, dokumentierte Zufallsbedingungen und gespeicherte Zustände unterstützen wissenschaftliche und operative Vergleiche.</p><a class="text-link" href="../docs/decision-providers.md">Entscheidungsschnittstellen ansehen <span aria-hidden="true">↗</span></a></div><div class="decision-card"><div class="card-top"><span>DER ENTSCHEIDUNGSZYKLUS</span><span class="small-tag">SCHEMATISCH</span></div><ol><li><span>01</span> Zustand beobachten</li><li><span>02</span> Simulation pausieren</li><li><span>03</span> Entscheidung prüfen &amp; anwenden</li><li><span>04</span> Simulation fortsetzen</li></ol><p>Gleicher Ausgangspunkt.<br><strong>Alternative Entscheidungen.</strong></p></div></section>
+    <section class="start-section wrap" id="einstieg" aria-labelledby="start-title"><div><p class="eyebrow">IHR EINSTIEG IN INDUSTRIALSIM</p><h2 id="start-title">Lernen Sie Ihr Modell<br>von morgen kennen.</h2><p>Starten Sie mit dem Referenzwerk oder beschreiben Sie Ihre eigene Produktionsstruktur. Installation, Beispiele und Schnittstellen finden Sie in der Projektdokumentation.</p><a class="button primary" href="../README.md">Installation &amp; Schnellstart <span aria-hidden="true">↗</span></a></div><div class="doc-links"><a href="../docs/configuration.md"><span><small>MODELLIERUNG</small>Konfiguration verstehen</span><span aria-hidden="true">↗</span></a><a href="../docs/cli-reference.md"><span><small>AUSFÜHRUNG</small>CLI-Befehle kennenlernen</span><span aria-hidden="true">↗</span></a><a href="../examples/reference_automotive_plant.yaml"><span><small>BEISPIEL</small>Referenzwerk ansehen</span><span aria-hidden="true">↗</span></a><p>Lokale Projektdateien · Markdown und YAML werden je nach Browser als Text geöffnet oder heruntergeladen.</p></div></section>
+  </main>
+  <footer class="footer wrap"><a class="brand" href="#">Industrial<span class="brand-light">Sim</span></a><p>Produktion modellieren. Entscheidungen nachvollziehen.</p><a href="#inhalt">Zurück nach oben ↑</a></footer>
+</body>
+</html>
