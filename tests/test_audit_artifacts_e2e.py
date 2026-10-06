@@ -96,7 +96,7 @@ def test_manifest_contains_comprehensive_reproducibility_metadata(tmp_path: Path
     # Runtime metadata
     runtime = manifest["runtime"]
     assert runtime["implementation"] == "CPython"
-    assert runtime["version"].startswith("3.14")
+    assert runtime["version"].startswith("3.12")
     assert isinstance(runtime["platform"], str) and len(runtime["platform"]) > 0
 
     # Library metadata

@@ -3,6 +3,35 @@ import { readFileSync } from 'node:fs';
 
 const reference = readFileSync('../examples/reference_automotive_plant.yaml', 'utf8');
 
+test('element changes retain multiple pending forms and discard only the selected form', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content', { exact: true }).fill(reference);
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  const buffer = page.locator('.react-flow__node').filter({ hasText: 'buf-body-out' });
+  await buffer.click();
+  await page.getByLabel('Buffer capacity', { exact: true }).fill('8');
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await page.getByLabel('Resource capacity', { exact: true }).fill('2');
+  await expect(page.getByRole('button', { name: 'Open model', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Validate and import', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Start Episode', exact: true })).toBeDisabled();
+  await buffer.click();
+  await expect(page.getByLabel('Buffer capacity', { exact: true })).toHaveValue('8');
+  await page.getByRole('button', { name: 'Apply parameters', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Save YAML', exact: true })).toBeDisabled();
+  await page.getByLabel('Resource definition').selectOption('machine:m-body-welder-1');
+  await expect(page.getByLabel('Resource capacity', { exact: true })).toHaveValue('2');
+  await page.getByRole('region', { name: 'Properties', exact: true }).getByRole('button', { name: 'Discard form changes', exact: true }).click();
+  await expect(page.getByLabel('Resource capacity', { exact: true })).toHaveValue('1');
+  await expect(page.getByRole('button', { name: 'Save YAML', exact: true })).toBeEnabled();
+  await buffer.click();
+  await expect(page.getByLabel('Buffer capacity', { exact: true })).toHaveValue('8');
+  await page.getByLabel('Buffer capacity', { exact: true }).fill('9');
+  await page.getByRole('button', { name: 'Discard all form changes', exact: true }).click();
+  await expect(page.getByLabel('Buffer capacity', { exact: true })).toHaveValue('8');
+});
+
 test('open and import a Plant, inspect topology, retain it after errors and reconnect', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Open model' }).click();

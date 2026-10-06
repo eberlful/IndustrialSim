@@ -1,0 +1,3 @@
+# Predict action outcomes with TabFM
+
+The TabFM research integration predicts raw production metric changes over a fixed horizon and uses a Decision Provider to select jointly valid actions, starting with Machine operating modes and a five-minute horizon. Keep this outcome predictor separate from the Industrial World Model trajectory contract: direct metric prediction avoids reconstructing graph-state rollouts but cannot support arbitrary state rollouts. Published weights are used only within a noncommercial, nonproduction research experiment; observations and candidate validation retain ADR-0016 and ADR-0018 boundaries.

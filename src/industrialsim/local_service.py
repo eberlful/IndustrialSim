@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import uvicorn
 
 from industrialsim.project import ProjectSession
@@ -50,6 +50,7 @@ class EditParameters(BaseModel):
 class StartEpisode(BaseModel):
     model_config = ConfigDict(extra='forbid')
     mode: Literal['baseline', 'manual'] = 'baseline'
+    step_delay_seconds: float = Field(default=0, ge=0, le=2)
 
 
 class SubmitDecisionBatch(BaseModel):
@@ -163,7 +164,8 @@ def create_app(session: ProjectSession, assets: Path, *, browser_url: str | None
         if not exported['accepted']:
             return JSONResponse({**episodes.snapshot(include_history=False), 'accepted': False,
                                  'diagnostics': exported['diagnostics']}, status_code=422)
-        result = episodes.start(exported['yaml'], mode=body.mode if body else 'baseline')
+        result = episodes.start(exported['yaml'], mode=body.mode if body else 'baseline',
+                                step_delay_seconds=body.step_delay_seconds if body else 0)
         return JSONResponse(browser_episode_response(result), status_code=200 if result['accepted'] else 409)
 
     @app.get('/api/episode/checkpoints')
@@ -299,6 +301,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('project', type=Path)
     parser.add_argument('--model', help='Project-relative YAML file to load initially')
     parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--host', choices=('127.0.0.1', '0.0.0.0'), default='127.0.0.1',
+                        help='Bind address; use 0.0.0.0 inside a container')
+    parser.add_argument('--skip-build', action='store_true',
+                        help='Serve an existing frontend/dist build without Node.js')
     parser.add_argument('--no-browser', action='store_true')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
@@ -314,18 +320,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     frontend = Path(__file__).resolve().parents[2] / 'frontend'
     if not (frontend / 'package.json').is_file():
         parser.error('Run industrialsim-ui from a source checkout containing frontend/')
-    npm = shutil.which('npm')
-    if npm is None:
-        parser.error('Node.js and npm are required to build the browser UI')
-    # One command builds the browser bundle and serves it from the same origin.
-    try:
-        subprocess.run([npm, 'ci', '--no-audit', '--no-fund'], cwd=frontend, check=True)
-        subprocess.run([npm, 'run', 'build'], cwd=frontend, check=True)
-    except subprocess.CalledProcessError as exc:
-        parser.error(f'Frontend build failed (exit {exc.returncode})')
+    if args.skip_build:
+        if not (frontend / 'dist' / 'index.html').is_file():
+            parser.error('--skip-build requires a built frontend/dist/index.html')
+    else:
+        npm = shutil.which('npm')
+        if npm is None:
+            parser.error('Node.js and npm are required to build the browser UI')
+        # One command builds the browser bundle and serves it from the same origin.
+        try:
+            subprocess.run([npm, 'ci', '--no-audit', '--no-fund'], cwd=frontend, check=True)
+            subprocess.run([npm, 'run', 'build'], cwd=frontend, check=True)
+        except subprocess.CalledProcessError as exc:
+            parser.error(f'Frontend build failed (exit {exc.returncode})')
     url = f'http://127.0.0.1:{args.port}'
     app = create_app(session, frontend / 'dist', browser_url=None if args.no_browser else url)
-    uvicorn.run(app, host='127.0.0.1', port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
 

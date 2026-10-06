@@ -41,7 +41,7 @@ production_units:
 
 
 def test_reference_automotive_plant_configuration_structure() -> None:
-    yaml_path = Path("/workspaces/IndustrialSim/examples/reference_automotive_plant.yaml")
+    yaml_path = Path(__file__).resolve().parents[1] / "examples/reference_automotive_plant.yaml"
     assert yaml_path.exists(), f"Reference plant configuration file {yaml_path} does not exist"
 
     result = validate_config(yaml_path)
@@ -306,7 +306,7 @@ reward_policy:
 def test_reference_plant_determinism_repeated_execution_hashes() -> None:
     from industrialsim.application import run_episode
 
-    yaml_path = Path("/workspaces/IndustrialSim/examples/reference_automotive_plant.yaml")
+    yaml_path = Path(__file__).resolve().parents[1] / "examples/reference_automotive_plant.yaml"
     summary1 = run_episode(yaml_path)
     summary2 = run_episode(yaml_path)
 
@@ -358,7 +358,7 @@ def test_reference_plant_baseline_vs_decision_provider_comparison(tmp_path: Path
                 actions=actions,
             )
 
-    yaml_path = Path("/workspaces/IndustrialSim/examples/reference_automotive_plant.yaml")
+    yaml_path = Path(__file__).resolve().parents[1] / "examples/reference_automotive_plant.yaml"
     out_dir = tmp_path / "reference_plant_comparison"
 
     comparison = compare_policies(
@@ -449,7 +449,7 @@ def test_reference_plant_counterfactual_branching_artifacts(tmp_path: Path) -> N
     from industrialsim.application import create_checkpoint, branch_checkpoint, inspect
     from industrialsim.decisions import BufferReorderAction
 
-    yaml_path = Path("/workspaces/IndustrialSim/examples/reference_automotive_plant.yaml")
+    yaml_path = Path(__file__).resolve().parents[1] / "examples/reference_automotive_plant.yaml"
     cp = create_checkpoint(yaml_path, pause_at_decision_batch=True)
 
     # Paused at Decision Batch

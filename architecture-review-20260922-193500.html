@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Architecture Review: IndustrialSim</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 4 4; }
+      .leak { stroke: #dc2626; stroke-width: 2px; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); }
+      .shallow { background: #f8fafc; border: 1px dashed #94a3b8; }
+      pre.mermaid { background: transparent !important; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans antialiased selection:bg-indigo-100 selection:text-indigo-900">
+    <main class="max-w-6xl mx-auto px-6 py-12 space-y-16">
+
+      <!-- Header -->
+      <header class="border-b border-stone-200 pb-8">
+        <div class="flex flex-col md:flex-row md:items-end justify-between gap-4">
+          <div>
+            <div class="text-xs font-semibold tracking-widest text-indigo-600 uppercase">Architecture Deepening Report</div>
+            <h1 class="text-4xl font-bold tracking-tight text-slate-900 mt-1">IndustrialSim</h1>
+            <p class="text-stone-500 text-sm mt-1">Evaluation of module depth, interface seams, and locality</p>
+          </div>
+          <div class="text-xs text-stone-400 font-mono">2026-09-22 · CPython 3.14 · 12,812 LOC</div>
+        </div>
+
+        <!-- Legend -->
+        <div class="mt-8 pt-4 border-t border-stone-100 flex flex-wrap items-center gap-6 text-xs text-stone-600">
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 rounded border border-slate-700 bg-white shadow-xs"></span>
+            <span>Module</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 rounded border border-dashed border-indigo-500 bg-indigo-50/50"></span>
+            <span>Seam</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 rounded deep text-white shadow-xs"></span>
+            <span>Deep module</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-0.5 bg-red-600"></span>
+            <span>Leakage across seam</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-0.5 border-t border-dashed border-stone-400"></span>
+            <span>Internal implementation</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Candidates Section -->
+      <section id="candidates" class="space-y-14">
+
+        <!-- Candidate 1 -->
+        <article id="candidate-1" class="rounded-xl border border-stone-200 bg-white p-6 md:p-8 shadow-xs space-y-6">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-stone-100 pb-4">
+            <div>
+              <span class="text-xs font-mono font-medium text-stone-400">CANDIDATE 01</span>
+              <h2 class="text-2xl font-bold text-slate-900">Deepen the Logistics & Transport Dispatch module</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">Strong</span>
+              <span class="px-2.5 py-1 text-xs font-mono rounded-full bg-stone-100 text-stone-700 border border-stone-200">local-substitutable</span>
+            </div>
+          </div>
+
+          <div class="text-sm font-mono text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200">
+            src/industrialsim/dispatch.py · src/industrialsim/application.py (lines 2254–2542)
+          </div>
+
+          <!-- Side-by-side Visual -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Before -->
+            <div class="rounded-lg border border-red-200 bg-red-50/20 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-red-600 mb-3 flex items-center justify-between">
+                  <span>Before: Shallow Module + State Leaks</span>
+                  <span class="text-xs font-mono text-red-500">8 Parameters</span>
+                </div>
+                <div class="space-y-3">
+                  <div class="p-3 bg-white border border-slate-300 rounded text-center shadow-xs">
+                    <div class="text-xs font-mono uppercase text-slate-500">Caller: EpisodeEngine</div>
+                    <div class="mt-2 text-xs font-mono bg-red-50 text-red-700 border border-red-200 rounded p-1.5 text-left">
+                      <div>active_route_occupancy (dict)</div>
+                      <div>reserved_route_occupancy (dict)</div>
+                      <div>node_distance_fn (lambda)</div>
+                      <div>can_accept_fn (lambda)</div>
+                    </div>
+                  </div>
+                  <div class="flex justify-center">
+                    <svg class="w-6 h-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3"></path>
+                    </svg>
+                  </div>
+                  <div class="p-2 border border-dashed border-slate-400 bg-stone-50 rounded text-center">
+                    <div class="text-xs font-mono uppercase font-semibold text-slate-700">BaselineDispatchPolicy</div>
+                    <div class="text-xs text-stone-500 mt-1 font-mono">Thin sorting filter (~80 LOC)</div>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">Caller manages mutable occupancies, order queues, and graph queries</div>
+            </div>
+
+            <!-- After -->
+            <div class="rounded-lg border border-emerald-200 bg-emerald-50/20 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-emerald-700 mb-3 flex items-center justify-between">
+                  <span>After: Deep Logistics Module</span>
+                  <span class="text-xs font-mono text-emerald-700">Small Interface</span>
+                </div>
+                <div class="space-y-3">
+                  <div class="p-2.5 bg-white border border-slate-300 rounded text-center shadow-xs">
+                    <div class="text-xs font-mono uppercase text-slate-500">Caller: EpisodeEngine</div>
+                    <div class="mt-1 text-xs font-mono text-emerald-800">enqueue_order() · step_dispatch()</div>
+                  </div>
+                  <div class="flex justify-center">
+                    <div class="w-full border-t-2 border-dashed border-indigo-400 my-1 relative">
+                      <span class="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-white px-2 text-[10px] font-mono text-indigo-600">SEAM</span>
+                    </div>
+                  </div>
+                  <div class="p-4 deep rounded-lg text-white shadow-md">
+                    <div class="text-xs font-mono uppercase tracking-wider text-emerald-400 font-semibold">Logistics Subsystem</div>
+                    <div class="mt-2 grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-300">
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Route Occupancy</div>
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Vehicle Fleets</div>
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Repositioning</div>
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Dispatch Policy Adapter</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">All route reservations and vehicle fleet states live behind the seam</div>
+            </div>
+          </div>
+
+          <!-- Problem & Solution -->
+          <div class="space-y-3 pt-2">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Problem:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                <code class="font-mono text-xs">BaselineDispatchPolicy</code> is shallow: its 8-parameter interface leaks route occupancy state, topological distance callbacks, and downstream acceptance predicates back to <code class="font-mono text-xs">EpisodeEngine</code>.
+              </p>
+            </div>
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Solution:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Consolidate Transport Order queues, route occupancy tracking, vehicle fleet state, and dispatch execution behind a deep Logistics module with a compact stepping interface.
+              </p>
+            </div>
+          </div>
+
+          <!-- Wins -->
+          <div class="pt-2 border-t border-stone-100">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Wins:</span>
+            <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-xs font-medium text-slate-700">
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Locality: all transport state together</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Leverage: callers invoke one step</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Interface shrinks: 8 parameters to 1</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Tests bypass dummy lambda fixtures</li>
+            </ul>
+          </div>
+        </article>
+
+        <!-- Candidate 2 -->
+        <article id="candidate-2" class="rounded-xl border border-stone-200 bg-white p-6 md:p-8 shadow-xs space-y-6">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-stone-100 pb-4">
+            <div>
+              <span class="text-xs font-mono font-medium text-stone-400">CANDIDATE 02</span>
+              <h2 class="text-2xl font-bold text-slate-900">Deepen the Decision Subsystem & Observation Compiler</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">Strong</span>
+              <span class="px-2.5 py-1 text-xs font-mono rounded-full bg-stone-100 text-stone-700 border border-stone-200">ports &amp; adapters</span>
+            </div>
+          </div>
+
+          <div class="text-sm font-mono text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200">
+            src/industrialsim/decisions.py · src/industrialsim/application.py (lines 1533–1980)
+          </div>
+
+          <!-- Mermaid Sequence Diagram -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="rounded-lg border border-red-200 bg-white p-4 flex flex-col justify-between h-[360px]">
+              <div class="text-xs uppercase tracking-wider font-semibold text-red-600 mb-1">Before: Leakage Across Decision Seam</div>
+              <pre class="mermaid">
+flowchart TD
+  Engine[EpisodeEngine] -->|evaluates| TR[5 Trigger Runtimes]
+  Engine -->|compiles| OB[5 Observation Payloads]
+  Engine -->|invokes| Coord[DecisionCoordinator]
+  Coord -->|passes batch| Prov[DecisionProvider]
+  Engine -->|validates & executes| Fallback[FallbackPolicy]
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class TR,OB,Fallback leak;
+              </pre>
+              <div class="text-xs text-stone-400 text-center italic">Coordinator is anemic list wrapper; Engine compiles observations</div>
+            </div>
+
+            <div class="rounded-lg border border-emerald-200 bg-white p-4 flex flex-col justify-between h-[360px]">
+              <div class="text-xs uppercase tracking-wider font-semibold text-emerald-700 mb-1">After: Deep Decision Subsystem</div>
+              <pre class="mermaid">
+flowchart TD
+  Engine[EpisodeEngine] -->|on_domain_event| DecSub[Deep Decision Module]
+  subgraph DecSub[Decision Subsystem]
+    direction TB
+    Trig[Trigger Evaluator] --> Obs[Observation Compiler]
+    Obs --> Provider[Decision Provider]
+    Provider -.fallback.-> FB[Fallback Policy]
+  end
+  DecSub -->|return actions| Engine
+  classDef deepBox fill:#0f172a,stroke:#047857,stroke-width:2px,color:#fff;
+  class DecSub deepBox;
+              </pre>
+              <div class="text-xs text-stone-400 text-center italic">One seam: event in, validated actions out. Latent state hidden.</div>
+            </div>
+          </div>
+
+          <!-- Problem & Solution -->
+          <div class="space-y-3 pt-2">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Problem:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                <code class="font-mono text-xs">DecisionBatchCoordinator</code> is a shallow list wrapper while <code class="font-mono text-xs">EpisodeEngine</code> evaluates 5 trigger runtimes, synthesizes 5 observation payloads, and orchestrates fallbacks.
+              </p>
+            </div>
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Solution:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Encapsulate pause-point detection, trigger hysteresis, bounded observation compilation, and fallback resolution behind a deep Decision module.
+              </p>
+            </div>
+          </div>
+
+          <!-- Wins -->
+          <div class="pt-2 border-t border-stone-100">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Wins:</span>
+            <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-xs font-medium text-slate-700">
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Locality: contracts stay in module</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Leverage: engine sheds 600 lines</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Seam strictly enforces ADR-0008</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Triggers tested without episode runs</li>
+            </ul>
+          </div>
+        </article>
+
+        <!-- Candidate 3 -->
+        <article id="candidate-3" class="rounded-xl border border-stone-200 bg-white p-6 md:p-8 shadow-xs space-y-6">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-stone-100 pb-4">
+            <div>
+              <span class="text-xs font-mono font-medium text-stone-400">CANDIDATE 03</span>
+              <h2 class="text-2xl font-bold text-slate-900">Deepen the Production Resource & Shift Allocation module</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">Strong</span>
+              <span class="px-2.5 py-1 text-xs font-mono rounded-full bg-stone-100 text-stone-700 border border-stone-200">in-process</span>
+            </div>
+          </div>
+
+          <div class="text-sm font-mono text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200">
+            src/industrialsim/domain.py (lines 228–516) · src/industrialsim/application.py (lines 2601–3050)
+          </div>
+
+          <!-- Cross Section / Mass Diagram -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Before -->
+            <div class="rounded-lg border border-red-200 bg-red-50/20 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-red-600 mb-3 flex items-center justify-between">
+                  <span>Before: 6 Shallow Layers in Engine</span>
+                  <span class="text-xs font-mono text-red-500">800+ LOC in Engine</span>
+                </div>
+                <div class="space-y-1.5 font-mono text-[11px]">
+                  <div class="h-9 px-3 flex items-center justify-between bg-white border border-slate-300 rounded text-slate-700">
+                    <span>Engine._can_acquire_worker_requirements</span>
+                    <span class="text-red-500 font-bold">leak</span>
+                  </div>
+                  <div class="h-9 px-3 flex items-center justify-between bg-white border border-slate-300 rounded text-slate-700">
+                    <span>Engine._try_allocate_pending_resources</span>
+                    <span class="text-red-500 font-bold">leak</span>
+                  </div>
+                  <div class="h-9 px-3 flex items-center justify-between bg-white border border-slate-300 rounded text-slate-700">
+                    <span>Engine._handle_shift_end (Handover)</span>
+                    <span class="text-red-500 font-bold">leak</span>
+                  </div>
+                  <div class="h-9 px-3 flex items-center justify-between bg-white border border-slate-300 rounded text-slate-700">
+                    <span>Engine._handle_break_start / end</span>
+                    <span class="text-red-500 font-bold">leak</span>
+                  </div>
+                  <div class="h-9 px-3 flex items-center justify-between bg-stone-100 border border-slate-300 rounded text-slate-500">
+                    <span>Machine &amp; Worker (Dumb Dataclasses)</span>
+                    <span class="text-stone-400">passive</span>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">Engine probes internal dicts of Machine and Worker to allocate</div>
+            </div>
+
+            <!-- After -->
+            <div class="rounded-lg border border-emerald-200 bg-emerald-50/20 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-emerald-700 mb-3 flex items-center justify-between">
+                  <span>After: Deep Production Resource Module</span>
+                  <span class="text-xs font-mono text-emerald-700">3 Methods</span>
+                </div>
+                <div class="space-y-3">
+                  <div class="p-2.5 bg-white border border-slate-300 rounded text-center shadow-xs">
+                    <div class="text-xs font-mono uppercase text-slate-500">Caller: EpisodeEngine</div>
+                    <div class="mt-1 text-xs font-mono text-emerald-800">request_allocation() · release_allocation()</div>
+                  </div>
+                  <div class="flex justify-center">
+                    <div class="w-full border-t-2 border-dashed border-indigo-400 my-1 relative">
+                      <span class="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-white px-2 text-[10px] font-mono text-indigo-600">SEAM</span>
+                    </div>
+                  </div>
+                  <div class="p-4 deep rounded-lg text-white shadow-md">
+                    <div class="text-xs font-mono uppercase tracking-wider text-emerald-400 font-semibold">ProductionResourceManager</div>
+                    <div class="mt-2 space-y-1.5 text-[11px] font-mono text-slate-300">
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Atomic Machine &amp; Worker Reservation (ADR-0007)</div>
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Shift Handover &amp; Break Substitution</div>
+                      <div class="bg-slate-800/80 p-1.5 rounded border border-slate-700">Prioritized Resource Waiter Queues</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">Atomic acquisition and shift transitions live entirely inside module</div>
+            </div>
+          </div>
+
+          <!-- Problem & Solution -->
+          <div class="space-y-3 pt-2">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Problem:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                <code class="font-mono text-xs">Machine</code> and <code class="font-mono text-xs">Worker</code> are shallow data holders while <code class="font-mono text-xs">EpisodeEngine</code> directly implements 800+ lines of atomic multi-resource acquisition, shift handovers, and break interruptions.
+              </p>
+            </div>
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Solution:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Encapsulate atomic multi-resource reservation, priority-based waiter queues, and shift handover replacement within a deep Production Resource module.
+              </p>
+            </div>
+          </div>
+
+          <!-- Wins -->
+          <div class="pt-2 border-t border-stone-100">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Wins:</span>
+            <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-xs font-medium text-slate-700">
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Locality: atomic invariants isolated</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Leverage: 20 engine methods become 3</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Stations own composed policies</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Direct contention tests without YAML</li>
+            </ul>
+          </div>
+        </article>
+
+        <!-- Candidate 4 -->
+        <article id="candidate-4" class="rounded-xl border border-stone-200 bg-white p-6 md:p-8 shadow-xs space-y-6">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-stone-100 pb-4">
+            <div>
+              <span class="text-xs font-mono font-medium text-stone-400">CANDIDATE 04</span>
+              <h2 class="text-2xl font-bold text-slate-900">Unify the Material Flow Graph & Dynamic Topology</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">Strong</span>
+              <span class="px-2.5 py-1 text-xs font-mono rounded-full bg-stone-100 text-stone-700 border border-stone-200">in-process</span>
+            </div>
+          </div>
+
+          <div class="text-sm font-mono text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200">
+            src/industrialsim/material_flow.py · src/industrialsim/application.py (lines 782–866)
+          </div>
+
+          <!-- Mermaid Flowchart -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="rounded-lg border border-red-200 bg-white p-4 flex flex-col justify-between h-[360px]">
+              <div class="text-xs uppercase tracking-wider font-semibold text-red-600 mb-1">Before: Split & Discarded Graph</div>
+              <pre class="mermaid">
+flowchart TD
+  Config[MaterialFlowConfig] --> MFG[MaterialFlowGraph in material_flow.py]
+  MFG -->|validate only| Check[Config Check]
+  MFG -.discarded at runtime.-> Discard[X]
+  Config --> MFT[MaterialFlowTopology in application.py]
+  MFT --> Dijkstra[Dijkstra Shortest Path]
+  MFT --> RouteIndex[Route Indexing]
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class MFG,MFT leak;
+              </pre>
+              <div class="text-xs text-stone-400 text-center italic">MaterialFlowGraph discarded after check; Topology re-indexed in Engine</div>
+            </div>
+
+            <div class="rounded-lg border border-emerald-200 bg-white p-4 flex flex-col justify-between h-[360px]">
+              <div class="text-xs uppercase tracking-wider font-semibold text-emerald-700 mb-1">After: Deep Material Flow Graph</div>
+              <pre class="mermaid">
+flowchart TD
+  Config[MaterialFlowConfig] --> MFG[Deep MaterialFlowGraph]
+  subgraph MFG[Deep Material Flow Module]
+    direction TB
+    V[Port & Route Validation]
+    R[Multigraph Indexing]
+    D[Dijkstra Distances & Paths]
+    A[Route Admissibility]
+  end
+  MFG -->|query paths & routes| Consumers[Logistics, Routing & Engine]
+  classDef deepBox fill:#0f172a,stroke:#047857,stroke-width:2px,color:#fff;
+  class MFG deepBox;
+              </pre>
+              <div class="text-xs text-stone-400 text-center italic">One authoritative graph object for validation, indexing, and distances</div>
+            </div>
+          </div>
+
+          <!-- Problem & Solution -->
+          <div class="space-y-3 pt-2">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Problem:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Material flow is fractured between static validation in <code class="font-mono text-xs">material_flow.py</code> and dynamic Dijkstra shortest-path calculations in <code class="font-mono text-xs">application.py</code>.
+              </p>
+            </div>
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Solution:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Merge <code class="font-mono text-xs">MaterialFlowTopology</code> into <code class="font-mono text-xs">MaterialFlowGraph</code> to form a single deep module handling schema validation, route indexing, and distance pathfinding.
+              </p>
+            </div>
+          </div>
+
+          <!-- Wins -->
+          <div class="pt-2 border-t border-stone-100">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Wins:</span>
+            <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-xs font-medium text-slate-700">
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Locality: all graph logic unified</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Leverage: callers query one graph</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Eliminates split topology abstractions</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Topology testable without Engine import</li>
+            </ul>
+          </div>
+        </article>
+
+        <!-- Candidate 5 -->
+        <article id="candidate-5" class="rounded-xl border border-stone-200 bg-white p-6 md:p-8 shadow-xs space-y-6">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-stone-100 pb-4">
+            <div>
+              <span class="text-xs font-mono font-medium text-stone-400">CANDIDATE 05</span>
+              <h2 class="text-2xl font-bold text-slate-900">Extract the Policy Evaluation & Counterfactual Branching module</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="px-2.5 py-1 text-xs font-semibold rounded-full bg-amber-100 text-amber-800 border border-amber-200">Worth exploring</span>
+              <span class="px-2.5 py-1 text-xs font-mono rounded-full bg-stone-100 text-stone-700 border border-stone-200">in-process</span>
+            </div>
+          </div>
+
+          <div class="text-sm font-mono text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200">
+            src/industrialsim/benchmark.py · src/industrialsim/application.py (lines 4770–5524)
+          </div>
+
+          <!-- Mass Diagram -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Before -->
+            <div class="rounded-lg border border-slate-200 bg-slate-50/50 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-slate-600 mb-3 flex items-center justify-between">
+                  <span>Before: Simulation &amp; Evaluation Entangled</span>
+                  <span class="text-xs font-mono text-slate-500">application.py</span>
+                </div>
+                <div class="p-4 bg-white border border-slate-300 rounded space-y-2 text-xs font-mono">
+                  <div class="font-bold text-slate-800">application.py (5,530 lines)</div>
+                  <div class="text-stone-600">├─ EpisodeEngine (Simulation Kernel Integration)</div>
+                  <div class="text-amber-700 font-semibold">├─ _compute_raw_metrics / _compute_reward</div>
+                  <div class="text-amber-700 font-semibold">├─ EpisodeSummary.compare_with</div>
+                  <div class="text-amber-700 font-semibold">├─ branch_checkpoint / _execute_single_branch_worker</div>
+                  <div class="text-amber-700 font-semibold">└─ compare_policies</div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">Simulation execution module also coordinates multiprocessing branches</div>
+            </div>
+
+            <!-- After -->
+            <div class="rounded-lg border border-indigo-200 bg-indigo-50/20 p-5 flex flex-col justify-between h-[360px]">
+              <div>
+                <div class="text-xs uppercase tracking-wider font-semibold text-indigo-700 mb-3 flex items-center justify-between">
+                  <span>After: Clean Separation of Run vs Score</span>
+                  <span class="text-xs font-mono text-indigo-700">Dedicated Seam</span>
+                </div>
+                <div class="space-y-3">
+                  <div class="p-3 bg-white border border-slate-300 rounded text-center shadow-xs">
+                    <div class="text-xs font-mono uppercase text-slate-500">EpisodeEngine</div>
+                    <div class="text-xs font-mono text-slate-700 mt-1">Runs episode → returns raw EpisodeSummary</div>
+                  </div>
+                  <div class="flex justify-center">
+                    <div class="w-full border-t-2 border-dashed border-indigo-400 my-1 relative">
+                      <span class="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-white px-2 text-[10px] font-mono text-indigo-600">SEAM</span>
+                    </div>
+                  </div>
+                  <div class="p-3.5 deep rounded-lg text-white shadow-md text-xs font-mono">
+                    <div class="uppercase tracking-wider text-indigo-300 font-semibold mb-1">Evaluation &amp; Branch Subsystem</div>
+                    <div class="text-slate-300 text-[11px]">
+                      <div>• PolicyComparator: metric diffs &amp; reward policies (ADR-0005)</div>
+                      <div>• CounterfactualBranchRunner: process pools (ADR-0009)</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="text-xs text-stone-400 text-center italic">Evaluation logic testable with summary fixtures without running kernel</div>
+            </div>
+          </div>
+
+          <!-- Problem & Solution -->
+          <div class="space-y-3 pt-2">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Problem:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Simulation execution is entangled with experiment evaluation, reward scoring, metric delta diffing, and worker process pooling in <code class="font-mono text-xs">application.py</code>.
+              </p>
+            </div>
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Solution:</span>
+              <p class="text-slate-600 mt-0.5 text-sm">
+                Move raw metric aggregation, reward policy scoring, hard constraint checks, and counterfactual branch worker execution into a dedicated Evaluation module.
+              </p>
+            </div>
+          </div>
+
+          <!-- Wins -->
+          <div class="pt-2 border-t border-stone-100">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-700">Wins:</span>
+            <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-xs font-medium text-slate-700">
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Locality: scoring separated from run</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Leverage: clean separation of run/score</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Simulation kernel stays purely operational</li>
+              <li class="p-2 bg-stone-50 rounded border border-stone-200">Reward policies tested with fixtures</li>
+            </ul>
+          </div>
+        </article>
+
+      </section>
+
+      <!-- Top Recommendation Section -->
+      <section id="top-recommendation" class="pt-6">
+        <div class="rounded-2xl border-2 border-slate-900 bg-slate-900 text-white p-8 md:p-10 shadow-xl space-y-4">
+          <div class="flex items-center gap-3">
+            <span class="px-3 py-1 text-xs font-bold rounded-full bg-emerald-400 text-slate-950 uppercase tracking-wide">Top Recommendation</span>
+            <span class="text-xs font-mono text-slate-400">Highest Depth Leverage</span>
+          </div>
+          <h3 class="text-3xl font-bold tracking-tight text-white">
+            <a href="#candidate-1" class="hover:text-emerald-400 underline decoration-slate-600 underline-offset-4 transition-colors">
+              Candidate 01: Deepen the Logistics & Transport Dispatch module
+            </a>
+          </h3>
+          <p class="text-slate-300 text-base max-w-3xl leading-relaxed">
+            <code class="font-mono text-emerald-300 bg-slate-800 px-1.5 py-0.5 rounded text-sm">BaselineDispatchPolicy</code> is the clearest example of shallowness in the codebase: its interface leaks internal route occupancies, topology distance functions, and downstream node acceptance lambdas across the seam, while <code class="font-mono text-emerald-300 bg-slate-800 px-1.5 py-0.5 rounded text-sm">EpisodeEngine</code> retains all actual state management. Deepening Logistics collapses over 350 lines of scattered fleet and reservation logic into one cohesive module with an interface that tests can exercise without writing callback fixtures.
+          </p>
+          <div class="pt-4 flex items-center gap-4">
+            <a href="#candidate-1" class="inline-flex items-center gap-2 text-sm font-semibold text-emerald-400 hover:text-emerald-300 transition-colors">
+              <span>View Candidate Details</span>
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+            </a>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </body>
+</html>

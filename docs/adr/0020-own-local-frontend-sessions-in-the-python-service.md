@@ -1,0 +1,3 @@
+# Own local frontend sessions in the Python service
+
+Use a loopback-bound FastAPI service to own the local frontend's single active Episode, with a simulation worker serializing engine mutations and a React/TypeScript browser UI using React Flow. Expose application-level commands for consistent pauses, snapshots, complete Decision Batch validation/submission and Checkpoints rather than coupling HTTP handlers to private engine methods; this lets Episodes survive browser disconnects and keeps simulator semantics authoritative, at the cost of a service/worker lifecycle and an additional browser build instead of a browser-owned session or static artifact viewer.

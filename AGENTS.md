@@ -10,4 +10,8 @@ Use the default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent
 
 ### Domain docs
 
-This is a single-context repository using root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+This is a single-context repository using root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
+### Code Execution
+
+To execute code use uv.

@@ -1,0 +1,36 @@
+services:
+  industrialsim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${INDUSTRIALSIM_UID:-1000}
+        APP_GID: ${INDUSTRIALSIM_GID:-1000}
+    init: true
+    ports:
+      - "127.0.0.1:${INDUSTRIALSIM_PORT:-8765}:8765"
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    shm_size: 8gb
+    volumes:
+      - type: bind
+        source: ${INDUSTRIALSIM_PROJECT:-./examples}
+        target: /project
+        bind:
+          create_host_path: false
+    command:
+      - industrialsim-ui
+      - /project
+      - --model
+      - ${INDUSTRIALSIM_MODEL:-reference_automotive_plant.yaml}
+      - --host
+      - 0.0.0.0
+      - --skip-build
+      - --no-browser
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/project', timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

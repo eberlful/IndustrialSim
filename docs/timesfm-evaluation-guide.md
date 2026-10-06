@@ -63,7 +63,7 @@ Die von IndustrialSim erzeugte Parquet-Telemetrie ([`METRICS_TELEMETRY_SCHEMA`](
    - `vehicles_busy` / `vehicles_idle`: Flottenauslastung der Logistik.
 
 3. **Past-Future Covariates ($Z_{1:T+H}$)**:
-   - Geplante Einsteuerungen aus dem [Production Plan](file:///workspaces/IndustrialSim/CONTEXT.md#production) (Varianten, Mengen je Zeitschritt).
+   - Geplante Einsteuerungen aus dem [Production Plan](file:///workspaces/IndustrialSim/GLOSSARY.md#production) (Varianten, Mengen je Zeitschritt).
    - Schichtkalender der Worker (geplante Arbeitszeiten und Pausen).
    - Geplante Instandhaltungsabschaltungen (`PlannedDisruptionConfig`).
 

@@ -62,6 +62,14 @@ _Avoid_: Station, Equipment
 The condition of a Machine, including a normalized health value and any explicitly modeled physical state variables that influence its behavior.
 _Avoid_: Wear, Condition score
 
+**Sensor Reading**:
+A time-stamped, potentially noisy or incomplete observation of a Machine or Operation. It may reflect a Health State without revealing that state exactly.
+_Avoid_: Health State, Ground truth
+
+**Process State**:
+Latent attributes carried by a Production Unit from earlier Operations that can affect later processing or quality without necessarily being a defect.
+_Avoid_: Quality State, Quality Finding
+
 **Quality State**:
 The latent condition of a Production Unit, including defects that may not yet have been detected.
 _Avoid_: Inspection result, Quality score
@@ -97,6 +105,10 @@ _Avoid_: Request queue, Decision group
 **Decision Provider**:
 A transport-independent participant that answers a Decision Request with a proposed action.
 _Avoid_: Agent, LLM
+
+**Industrial World Model**:
+A learned model of how observable states of connected Machines, Stations, and Buffers evolve under production context and interventions across Plant configurations.
+_Avoid_: Simulator, Decision Provider
 
 **Reward Policy**:
 An experiment-specific rule that derives an optional scalar reward from raw simulation metrics without redefining hard constraints.

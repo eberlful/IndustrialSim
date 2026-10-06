@@ -144,6 +144,19 @@ def create_parser() -> argparse.ArgumentParser:
         help="Optional path to directory where benchmark report should be written",
     )
 
+    world = subparsers.add_parser("world-model", help="Industrial World Model study EXP-0005")
+    study_commands = world.add_subparsers(dest="study_command", required=True)
+    for name in ("preflight", "generate", "train", "evaluate", "run", "control"):
+        command = study_commands.add_parser(name)
+        command.add_argument("--output-dir", default=f"runs/world-model-{name}")
+        command.add_argument("--study-config")
+        command.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+        command.add_argument("--smoke", action="store_true")
+        command.add_argument("--timesfm-checkpoint")
+        if name in ("train", "evaluate", "control"):
+            command.add_argument("--dataset", required=True)
+        if name in ("evaluate", "control"):
+            command.add_argument("--models", required=True)
     return parser
 
 
@@ -160,6 +173,16 @@ def _execute_cli_action(action: Any) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.command == "world-model":
+        from industrialsim.world_model.commands import execute
+        try:
+            study_result = execute(args)
+            print(json.dumps(study_result.to_dict(), indent=2))
+            return 0 if study_result.data.get("status") in ("complete", "ready", "smoke_complete", "forecast_complete") else 2
+        except Exception as exc:
+            print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
+            return 1
 
     if args.command == "validate":
         result = validate_config(args.config_path)
@@ -217,4 +240,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

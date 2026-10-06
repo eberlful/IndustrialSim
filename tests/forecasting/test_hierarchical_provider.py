@@ -5,7 +5,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from industrialsim.application import EpisodeEngine
-from industrialsim.config import SimulationConfig
+from industrialsim.config import BufferThresholdTriggerConfig, SimulationConfig
 from industrialsim.decisions import (
     BufferObservation,
     BufferOccupantSummary,
@@ -178,11 +178,19 @@ def test_hierarchical_provider_decisions() -> None:
     assert maint_act.trigger_maintenance is True
 
 
-def test_hierarchical_provider_simulation_run() -> None:
+@pytest.mark.parametrize('buffer_only', [True, False])
+def test_hierarchical_provider_simulation_run(buffer_only: bool) -> None:
     yaml = YAML(typ="safe")
     with open("examples/hierarchical_forecasting_plant.yaml") as f:
         data = yaml.load(f)
     cfg = SimulationConfig.model_validate(data)
+
+    # Buffer control is a valid complete policy. The original strategic example
+    # can leave busy Station requests unanswered; its incomplete fallback must
+    # now abort rather than silently continue without those decisions.
+    if buffer_only:
+        cfg = cfg.model_copy(update={'decision_triggers': [trigger for trigger in cfg.decision_triggers
+            if isinstance(trigger, BufferThresholdTriggerConfig)]})
 
     adapter = TimesFM3Adapter()
     plan_entries = [p.model_dump() for p in cfg.production_plan]
@@ -195,9 +203,15 @@ def test_hierarchical_provider_simulation_run() -> None:
     summary = engine.run()
 
     assert not summary.is_deadlocked
-    assert not summary.is_aborted
-    assert summary.raw_metrics["good_output"] == 45
     assert len(summary.decision_batches) > 0
+    if buffer_only:
+        assert not summary.is_aborted
+        assert summary.raw_metrics['good_output'] == 45
+        assert summary.decision_diagnostics == []
+    else:
+        assert summary.is_aborted
+        assert any(d['code'] == 'INVALID_FALLBACK_BATCH' for d in summary.decision_diagnostics)
+        assert any(d['code'] == 'MISSING_ACTION' for d in summary.decision_diagnostics)
 
 
 def test_exponential_smoothing_forecaster() -> None:
@@ -226,4 +240,3 @@ def test_exponential_smoothing_forecaster() -> None:
     assert q_mat.shape == (128, len(forecaster.quantiles))
     for t in range(128):
         assert q_mat[t, 0] <= q_mat[t, 1] <= q_mat[t, 2] <= q_mat[t, 3] <= q_mat[t, 4]
-

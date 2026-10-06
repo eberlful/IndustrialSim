@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from math import isfinite
 from threading import Condition, Event, RLock
 from time import monotonic
 from typing import Any
@@ -44,16 +45,50 @@ class EpisodeWorker:
             episode = deepcopy(published)
             if episode and episode['state'] in ACTIVE_EPISODE_STATES:
                 episode['wall_clock_seconds'] = monotonic() - self._started_at
-            return {'episode': episode}
+            return {'episode': episode, 'capabilities': self._capabilities()}
 
-    def start(self, source: str | Path | dict[str, Any] | SimulationConfig, mode: str = 'baseline') -> dict[str, Any]:
+    def _can(self, command: str, episode_id: str | None = None, batch_id: str | None = None) -> bool:
+        """One policy for published capabilities and actual command admission."""
+        episode = self._episode
+        if self._stop.is_set() or self._restoring or self._checkpoint is not None or self._submission is not None:
+            return False
+        if command in {'start', 'restore'}:
+            return not episode or episode['state'] not in ACTIVE_EPISODE_STATES
+        if episode is None or (episode_id is not None and episode['id'] != episode_id):
+            return False
+        state = episode['state']
+        if command == 'pause':
+            return state in {'running', 'seeking_batch', 'pausing', 'paused'}
+        if command == 'continue':
+            return state == 'paused' or (state == 'awaiting_decisions' and episode['mode'] == 'baseline')
+        if command == 'next_batch':
+            return state in {'running', 'paused'}
+        if command == 'checkpoint':
+            return state in {'paused', 'awaiting_decisions'}
+        if command == 'submit_batch':
+            pending = episode.get('decision_batch')
+            if state != 'awaiting_decisions' or pending is None:
+                return False
+            return batch_id is None or pending['batch']['batch_id'] == batch_id
+        return False
+
+    def _capabilities(self) -> dict[str, bool]:
+        return {command: self._can(command) for command in (
+            'start', 'pause', 'continue', 'next_batch', 'submit_batch', 'checkpoint', 'restore')}
+
+    def _complete(self, future: Future[dict[str, Any]], result: dict[str, Any]) -> None:
+        """Owner completes accepted commands once, including failure/shutdown."""
+        if not future.done():
+            future.set_result({**self.snapshot(include_history=False), **result})
+
+    def start(self, source: str | Path | dict[str, Any] | SimulationConfig, mode: str = 'baseline', step_delay_seconds: float = 0) -> dict[str, Any]:
         with self._lock:
+            if not isfinite(step_delay_seconds) or not 0 <= step_delay_seconds <= 2:
+                return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Step delay must be between 0 and 2 seconds']}
             if mode not in {'baseline', 'manual'}:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Choose Baseline or manual decisions']}
-            if self._stop.is_set() or self._restoring:
-                return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Episode worker is closed']}
-            if self._episode and self._episode['state'] in ACTIVE_EPISODE_STATES:
-                return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['An Episode is already active']}
+            if not self._can('start'):
+                return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['An Episode is already active or the worker is closed']}
             validation = validate_config(source)
             if not validation.is_valid or validation.config is None:
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': validation.errors}
@@ -65,6 +100,7 @@ class EpisodeWorker:
             self._events = []
             self._episode = {
                 'id': episode_id, 'state': 'running', 'provider': 'Manual' if mode == 'manual' else 'Baseline', 'mode': mode,
+                'step_delay_seconds': step_delay_seconds,
                 'seed': str(config.seed), 'result_path': f'runs/{episode_id}',
                 'simulated_time_ns': str(config.episode.start_time_ns),
                 'events_processed': 0, 'summary': None, 'diagnostics': [],
@@ -81,9 +117,7 @@ class EpisodeWorker:
     def create_checkpoint(self, episode_id: str) -> dict[str, Any]:
         """Request an explicit durable capture while the owner holds a pause."""
         with self._condition:
-            if (self._stop.is_set() or not self._episode or self._episode['id'] != episode_id
-                    or self._episode['state'] not in {'paused', 'awaiting_decisions'}
-                    or self._submission is not None or self._checkpoint is not None):
+            if not self._can('checkpoint', episode_id):
                 return {**self.snapshot(include_history=False), 'accepted': False,
                         'diagnostics': ['Pause the Episode or wait for a Decision Batch before creating a Checkpoint']}
             future: Future[dict[str, Any]] = Future()
@@ -94,15 +128,16 @@ class EpisodeWorker:
     def restore_checkpoint(self, path: str) -> dict[str, Any]:
         """Restore only on explicit selection, into a fresh paused local Episode."""
         with self._lock:
-            if (self._stop.is_set() or self._restoring or (self._episode and self._episode['state'] in ACTIVE_EPISODE_STATES)):
+            if not self._can('restore'):
                 return {**self.snapshot(include_history=False), 'accepted': False,
                         'diagnostics': ['An Episode is already active or the worker is closed']}
             self._restoring = True
         try:
-            return self._executor.submit(self._restore, path).result()
+            result = self._executor.submit(self._restore, path).result()
         finally:
             with self._lock:
                 self._restoring = False
+        return {**result, **self.snapshot(include_history=False)}
 
     def _restore(self, path: str) -> dict[str, Any]:
         session: EpisodeSession | None = None
@@ -122,6 +157,7 @@ class EpisodeWorker:
                 self._episode = {
                     'id': episode_id, 'state': 'awaiting_decisions' if session.awaiting_decision_batch else 'paused',
                     'provider': 'Manual' if metadata['mode'] == 'manual' else 'Baseline', 'mode': metadata['mode'],
+                    'step_delay_seconds': 0,
                     'seed': str(checkpoint.root_seed), 'result_path': f'runs/{episode_id}',
                     'configuration': session.configuration(), 'restored_from': metadata, 'last_checkpoint': None,
                     'summary': None, 'diagnostics': [],
@@ -139,35 +175,33 @@ class EpisodeWorker:
             if session is not None:
                 session.close()
 
-    def _control(self, episode_id: str, allowed: set[str], state: str) -> dict[str, Any]:
+    def _control(self, command: str, episode_id: str) -> dict[str, Any]:
         with self._condition:
-            if (self._stop.is_set() or self._checkpoint is not None or not self._episode or self._episode['id'] != episode_id
-                    or self._episode['state'] not in allowed):
+            if not self._can(command, episode_id):
                 return {**self.snapshot(include_history=False), 'accepted': False, 'diagnostics': ['Episode control is not available in this state']}
+            assert self._episode is not None
+            state = {'pause': 'pausing', 'continue': 'running', 'next_batch': 'seeking_batch'}[command]
+            if command == 'continue' and self._episode['state'] == 'awaiting_decisions':
+                state = 'resolving'
             if not (state == 'pausing' and self._episode['state'] == 'paused'):
                 self._episode['state'] = state
             self._condition.notify_all()
             return {**self.snapshot(include_history=False), 'accepted': True, 'diagnostics': []}
 
     def pause(self, episode_id: str) -> dict[str, Any]:
-        """Request a pause; the worker acknowledges it at a settled boundary."""
-        return self._control(episode_id, {'running', 'seeking_batch', 'pausing', 'paused'}, 'pausing')
+        """Request a pause acknowledged by the owner at a settled point."""
+        return self._control('pause', episode_id)
 
     def continue_episode(self, episode_id: str) -> dict[str, Any]:
-        with self._lock:
-            if self._episode and self._episode['state'] == 'awaiting_decisions' and self._episode['mode'] == 'baseline' and self._submission is None:
-                return self._control(episode_id, {'awaiting_decisions'}, 'resolving')
-            return self._control(episode_id, {'paused'}, 'running')
+        return self._control('continue', episode_id)
 
     def next_decision_batch(self, episode_id: str) -> dict[str, Any]:
-        return self._control(episode_id, {'running', 'paused'}, 'seeking_batch')
+        return self._control('next_batch', episode_id)
 
     def submit_decision_batch(self, episode_id: str, batch_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
         """Queue a proposal for validation/application by the session owner."""
         with self._condition:
-            if (self._stop.is_set() or self._checkpoint is not None or not self._episode or self._episode['id'] != episode_id
-                    or self._episode['state'] != 'awaiting_decisions' or self._submission is not None
-                    or self._episode['decision_batch']['batch']['batch_id'] != batch_id):
+            if not self._can('submit_batch', episode_id, batch_id):
                 return {**self.snapshot(include_history=False), 'accepted': False,
                         'diagnostics': ['This Episode/Decision Batch is no longer awaiting this submission']}
             future: Future[dict[str, Any]] = Future()
@@ -220,43 +254,47 @@ class EpisodeWorker:
                         or bool(self._episode and self._episode['state'] not in {'paused', 'awaiting_decisions'}))
                     if self._stop.is_set():
                         break
-                    if self._checkpoint is not None:
-                        future = self._checkpoint
-                        try:
-                            metadata = self._saved.save(session.create_checkpoint(), episode_id=self._episode['id'],
-                                result_path=self._episode['result_path'], mode=self._episode['mode'])
-                            self._publish(session, last_checkpoint=metadata)
-                            future.set_result({**self.snapshot(include_history=False), 'accepted': True,
-                                               'checkpoint': metadata, 'diagnostics': []})
-                        except Exception as exc:
-                            future.set_result({**self.snapshot(include_history=False), 'accepted': False,
-                                               'diagnostics': [f'Checkpoint could not be saved: {exc}']})
-                        finally:
-                            self._checkpoint = None
-                        continue
+                    checkpoint_future = self._checkpoint
                     state = self._episode['state']
                     if self._submission is not None:
                         submission = self._submission
                     seek_batch = self._episode['mode'] == 'manual' or state == 'seeking_batch'
+                if checkpoint_future is not None:
+                    try:
+                        metadata = self._saved.save(session.create_checkpoint(), episode_id=self._episode['id'],
+                            result_path=self._episode['result_path'], mode=self._episode['mode'])
+                        self._publish(session, last_checkpoint=metadata)
+                        result = {'accepted': True, 'checkpoint': metadata, 'diagnostics': []}
+                    except Exception as exc:
+                        result = {'accepted': False, 'diagnostics': [f'Checkpoint could not be saved: {exc}']}
+                    with self._condition:
+                        self._checkpoint = None
+                        self._complete(checkpoint_future, result)
+                    continue
                 if submission is not None:
                     batch_id, actions, future = submission
                     result = session.submit_decision_batch(batch_id, actions)
                     self._publish(session, state='paused' if result['accepted'] else 'awaiting_decisions')
                     with self._condition:
                         self._submission = None
-                        future.set_result({**self.snapshot(include_history=False), **result})
+                        self._complete(future, result)
                     continue
                 if state == 'resolving':
                     session.resolve_decision_batch()
                     self._publish(session, state='running')
                     continue
-                session.advance(pause_at_decision_batch=seek_batch, max_events=1000)
+                delay = self._episode['step_delay_seconds']
+                session.advance(pause_at_decision_batch=seek_batch, max_events=1 if delay else 1000)
                 if session.awaiting_decision_batch:
                     self._publish(session, state='awaiting_decisions')
                     published_at = monotonic()
-                elif monotonic() - published_at >= .1:
+                elif delay or monotonic() - published_at >= .1:
                     self._publish(session)
                     published_at = monotonic()
+                if delay and not session.finished:
+                    with self._condition:
+                        self._condition.wait_for(lambda: self._stop.is_set() or bool(
+                            self._episode and self._episode['state'] != state), timeout=delay)
             if self._stop.is_set():
                 self._publish(session, state='interrupted', diagnostics=['Service stopped before Episode finalization'])
             else:
@@ -270,14 +308,13 @@ class EpisodeWorker:
         finally:
             with self._condition:
                 if self._checkpoint is not None:
-                    self._checkpoint.set_result({**self.snapshot(include_history=False), 'accepted': False,
-                                                'diagnostics': ['Worker stopped before Checkpoint creation']})
+                    future = self._checkpoint
                     self._checkpoint = None
+                    self._complete(future, {'accepted': False, 'diagnostics': ['Worker stopped before Checkpoint creation']})
                 if self._submission is not None:
                     _, _, future = self._submission
                     self._submission = None
-                    future.set_result({**self.snapshot(include_history=False), 'accepted': False,
-                                       'diagnostics': ['Episode worker stopped before submission completed']})
+                    self._complete(future, {'accepted': False, 'diagnostics': ['Episode worker stopped before submission completed']})
             if session is not None:
                 session.close()
 

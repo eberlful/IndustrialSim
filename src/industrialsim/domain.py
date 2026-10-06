@@ -95,6 +95,7 @@ class ProductionUnit:
     state: ProductionUnitState = ProductionUnitState.CREATED
     location: str = "unreleased"
     history: list[HistoryRecord] = field(default_factory=list)
+    process_state: dict[str, float] = field(default_factory=dict)
 
     @property
     def is_defective(self) -> bool:
@@ -144,6 +145,7 @@ class ProductionUnit:
             "state": str(self.state),
             "location": self.location,
             "history": [h.to_dict() for h in self.history],
+            "process_state": dict(self.process_state),
         }
         if self.due_date_ns is not None:
             result["due_date_ns"] = self.due_date_ns
@@ -168,6 +170,7 @@ class ProductionUnit:
             state=ProductionUnitState(data["state"]),
             location=data["location"],
             history=history,
+            process_state=dict(data.get("process_state", {})),
         )
 
     def to_summary_dict(self) -> dict[str, Any]:
@@ -532,6 +535,8 @@ class Operation:
     restores_quality: bool = False
     rework_success_probability: float = 1.0
     inspection: dict[str, Any] | None = None
+    process_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
+    process_defect_weights: dict[str, float] = field(default_factory=dict)
 
 
 class TimingPolicy:

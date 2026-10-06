@@ -19,7 +19,7 @@ Status: resolved
 
 Implemented the complete reference automotive plant configuration, policy comparison API, and comprehensive acceptance test suite:
 1. **Reference Plant Model (`examples/reference_automotive_plant.yaml`)**:
-   - Areas complying with `CONTEXT.md`: `area-body-construction`, `area-paint-application`, `area-final-assembly`.
+   - Areas complying with `GLOSSARY.md`: `area-body-construction`, `area-paint-application`, `area-final-assembly`.
    - Stations covering parallel body construction (`st-body-1`, `st-body-2`), paint pretreatment (`st-paint-pretreat`), spray booth (`st-paint-booth`), drying (`st-paint-drying`), sequential assembly (`st-assembly-1`, `st-assembly-2`), inspection (`st-inspect`), and rework (`st-rework`).
    - Shared vehicles (`agv-1`, `agv-2`) and bounded buffers across transfer points.
    - Machine degradation, stochastic failure, condition-threshold maintenance, planned disruptions, and shifts/breaks for workers with maintenance qualifications competing for resources.

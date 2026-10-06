@@ -107,7 +107,7 @@ Definiert den zeitlichen Rahmen einer Episode:
 ---
 
 ### 3.3 `plant`: Organisations- und Standortstruktur
-Beschreibt die statische Fabrikorganisation (vgl. [CONTEXT.md](file:///workspaces/IndustrialSim/CONTEXT.md)):
+Beschreibt die statische Fabrikorganisation (vgl. [GLOSSARY.md](file:///workspaces/IndustrialSim/GLOSSARY.md)):
 - `id`: Eindeutige Kennung des Plants.
 - `name`: Lesbarer Name.
 - `areas`: Liste von Bereichen (z. B. Rohbau, Lackiererei, Endmontage).

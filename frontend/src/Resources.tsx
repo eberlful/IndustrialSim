@@ -1,18 +1,20 @@
-import { useState } from 'react';
+import { useDraftField, useDraftForm, DiscardForm } from './PlantDraftContext';
 import { integerOrText, type ParameterEdit } from './parameterEditing';
 import type { Model, Operation, Resource } from './types';
 
-type EditorProps = { model: Model; busy: boolean; edit: (command: ParameterEdit) => Promise<void> };
+type EditorProps = { model: Model; busy: boolean; edit: (command: ParameterEdit) => Promise<boolean> };
 
 export function resourceDefinitions(model: Model, kind: 'machine' | 'worker'): Resource[] {
   return (model.configuration[kind === 'machine' ? 'machines' : 'workers'] as Resource[] | undefined) ?? [];
 }
 
 export function ResourceProperties({ resource, kind, model, busy, edit }: EditorProps & { resource: Resource; kind: 'machine' | 'worker' }) {
-  const [name, setName] = useState(resource.name ?? '');
-  const [capacity, setCapacity] = useState(String(resource.capacity === undefined ? 1 : resource.capacity ?? ''));
-  const [workerKind, setWorkerKind] = useState(resource.kind ?? 'individual');
-  const [qualifications, setQualifications] = useState(resource.qualifications?.join('\n') ?? '');
+  const formId = `${kind}:${resource.id}:properties`;
+  const form = useDraftForm(formId);
+  const [name, setName] = useDraftField(formId, 'name', resource.name ?? '');
+  const [capacity, setCapacity] = useDraftField(formId, 'capacity', String(resource.capacity === undefined ? 1 : resource.capacity ?? ''));
+  const [workerKind, setWorkerKind] = useDraftField(formId, 'workerKind', resource.kind ?? 'individual');
+  const [qualifications, setQualifications] = useDraftField(formId, 'qualifications', resource.qualifications?.join('\n') ?? '');
   const collection = kind === 'machine' ? 'machines' : 'workers';
   const prefix = `${collection}.${resourceDefinitions(model, kind).findIndex(item => item.id === resource.id)}`;
   const errors = model.diagnostics.filter(error => error.includes(resource.id) || error.startsWith(prefix + '.') || error.startsWith(prefix + ':'));
@@ -28,7 +30,7 @@ export function ResourceProperties({ resource, kind, model, busy, edit }: Editor
         if (workerKind !== (resource.kind ?? 'individual')) changes.kind = workerKind;
         if (qualifications !== (resource.qualifications?.join('\n') ?? '')) changes.qualifications = qualifications.split('\n').filter(Boolean);
       }
-      void edit({ kind, element_id: resource.id, changes });
+      void form.apply(() => edit({ kind, element_id: resource.id, changes }));
     }}>
       <label>Resource name<input value={name} disabled={busy} onChange={event => setName(event.target.value)}/></label>
       <label>Resource capacity<input value={capacity} disabled={busy} onChange={event => setCapacity(event.target.value)}/></label>
@@ -37,15 +39,17 @@ export function ResourceProperties({ resource, kind, model, busy, edit }: Editor
         <label>Worker qualifications<textarea value={qualifications} disabled={busy} onChange={event => setQualifications(event.target.value)}/><small>One qualification per line; commas are part of the name.</small></label>
         <p className="hint">Individuals have capacity 1. Pools may have a larger capacity.</p>
       </>}
-      <button disabled={busy}>Apply resource</button>
+      <button disabled={busy}>Apply resource</button><DiscardForm id={formId}/>
     </form>
     <details><summary>All resource properties</summary><pre>{JSON.stringify(resource, null, 2)}</pre></details>
   </>;
 }
 
 export function OperationResources({ operation, nodeId, model, busy, edit }: EditorProps & { operation: Operation; nodeId: string }) {
-  const [machines, setMachines] = useState(operation.required_machines ?? []);
-  const [workers, setWorkers] = useState((operation.required_workers ?? []).map(requirement => ({
+  const formId = `node:${nodeId}:requirements:${operation.id}`;
+  const form = useDraftForm(formId);
+  const [machines, setMachines] = useDraftField(formId, 'machines', operation.required_machines ?? []);
+  const [workers, setWorkers] = useDraftField(formId, 'workers', (operation.required_workers ?? []).map(requirement => ({
     worker_id: requirement.worker_id ?? '', qualification: requirement.qualification ?? '', count: String(requirement.count === undefined ? 1 : requirement.count ?? ''),
   })));
   const machineDefinitions = resourceDefinitions(model, 'machine');
@@ -61,7 +65,7 @@ export function OperationResources({ operation, nodeId, model, busy, edit }: Edi
     if (JSON.stringify(machines) !== JSON.stringify(operation.required_machines ?? [])) changes.required_machines = machines;
     const original = (operation.required_workers ?? []).map(requirement => ({ worker_id: requirement.worker_id ?? null, qualification: requirement.qualification ?? null, count: requirement.count === undefined ? 1 : requirement.count }));
     if (JSON.stringify(requirements) !== JSON.stringify(original)) changes.required_workers = requirements;
-    void edit({ kind: 'node', element_id: nodeId, operation_id: operation.id, changes });
+    void form.apply(() => edit({ kind: 'node', element_id: nodeId, operation_id: operation.id, changes }));
   }}>
     <h4>Resource requirements · {operation.id}</h4>
     <label>Required Machines<select multiple value={machines} disabled={busy} onChange={event => setMachines(Array.from(event.target.selectedOptions, option => option.value))}>
@@ -82,6 +86,6 @@ export function OperationResources({ operation, nodeId, model, busy, edit }: Edi
     </fieldset>)}
     <p className="hint">Each requirement needs an assigned Worker, a qualification, or both.</p>
     <button type="button" disabled={busy} onClick={() => setWorkers(previous => [...previous, { worker_id: '', qualification: '', count: '1' }])}>Add Worker requirement</button>
-    <button disabled={busy}>Apply requirements</button>
+    <button disabled={busy}>Apply requirements</button><DiscardForm id={formId}/>
   </form>;
 }

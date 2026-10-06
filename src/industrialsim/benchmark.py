@@ -56,7 +56,7 @@ def collect_hardware_metadata() -> dict[str, Any]:
         "cpu_count": cpu_count,
         "total_memory_bytes": total_memory_bytes,
         "documented_reference_hardware": {
-            "baseline_description": "Standard modern multicore CPU (x86_64/ARM64, >= 2.4 GHz, 8+ cores), 16+ GB RAM, CPython 3.14",
+            "baseline_description": "Standard modern multicore CPU (x86_64/ARM64, >= 2.4 GHz, 8+ cores), 16+ GB RAM, CPython 3.12",
             "target_scheduler_events": 5_000_000,
             "target_scheduler_max_seconds": 60.0,
             "target_plant_min_resources": 100,
@@ -540,7 +540,7 @@ def run_benchmark(
     return report
 
 
-# Domain aliases (CONTEXT.md specifies "Dispatch Policy: Avoid: Scheduler, Router";
+# Domain aliases (GLOSSARY.md specifies "Dispatch Policy: Avoid: Scheduler, Router";
 # the discrete-event stepping engine is the EventKernel, while Issue 16 refers to it as "Scheduler benchmark").
 KernelBenchmarkResult = SchedulerBenchmarkResult
 run_kernel_benchmark = run_scheduler_benchmark

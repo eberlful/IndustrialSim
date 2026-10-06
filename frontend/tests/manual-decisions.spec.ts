@@ -17,6 +17,7 @@ test('manual batch preserves rejected fields and applies one complete corrected 
   await page.getByRole('button', { name: 'Validate and import' }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
   await page.getByLabel('Decision mode', { exact: true }).selectOption('manual');
+  await page.getByLabel('Playback speed', { exact: true }).selectOption('0');
   await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
   await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Awaiting decisions');
   const episode = (await (await context.request.get('/api/episode')).json()).episode;

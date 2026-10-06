@@ -1,0 +1,27 @@
+# [EXP-0005] Industrial World Model: vorab festgelegtes Studienprotokoll
+
+> **Status:** Vorab festgelegtes Protokoll; gemeinsam bestätigt  
+> **Datum:** 2026-09-23  
+> **Geltung:** synthetische, nicht kalibrierte IndustrialSim-Anlagen; keine Aussage über reale Anlagen
+
+## Forschungsfrage und Primärtest
+
+Kann ein hierarchisches, aktionskonditioniertes Industrial World Model mit Orthogonal Predictive Factorization (OPF) zukünftige Zustände unter unbekannten Eingriffskombinationen besser vorhersagen als ein kapazitätsgleiches Standard-JEPA? Der vorab festgelegte Primärwert ist der Fehler eines 10-Schritt-Rollouts auf diesen zurückgehaltenen Kombinationen. Maschinen-/Prozesssignale und Materialflussgrößen werden anhand des Trainingssplits je Kanal normalisiert, innerhalb ihrer Gruppe gemittelt und als zwei Gruppen gleich gewichtet; als Fehlermetrik dient MAE. Eine Überlegenheit wird nur berichtet, wenn das gepaarte 95-%-Konfidenzintervall der Episodendifferenz einen Vorteil zeigt. Ein vollständiger, reproduzierbarer Vergleich bleibt auch bei ausbleibendem Vorteil das Studienziel.
+
+## Simulations- und Datenvertrag
+
+- Der Automobil-Forschungsfall verbindet Schweißen, Lackieren, Montage und Qualität über Production Units und den Material Flow Graph. Neue Sensor Readings entstehen aus expliziten synthetischen, kausal gekoppelten Mechanismen. Ein latenter Process State der Production Unit trägt frühere Operationseinflüsse weiter; Nacharbeit ändert nur dafür deklarierte Attribute. Quality State und Fehlerursache bleiben verborgen.
+- Ein eigener versionierter Beobachtungsadapter stellt allen Vergleichsmodellen dieselben Sensor Readings, Quality Findings, Aktionen und bekannten Production-Plan-Informationen bereit. Health State, Process State, Quality State und injizierte Ursachen liegen nur in getrennten Labels; der bestehende Decision-Request-Vertrag bleibt kompatibel ([ADR-0016](../docs/adr/0016-separate-world-model-observations-from-simulator-truth.md), [ADR-0017](../docs/adr/0017-carry-process-effects-separately-from-quality.md)). Rollouts dürfen den bekannten Production Plan und eine für alle Modelle identische angenommene Folgepolitik verwenden; tatsächlich erst später realisierte Telemetrie ist keine Zukunftskovariate.
+- Mehrere gültige Erkundungspolitiken und gezielte Checkpoint-Eingriffe erzeugen Trainingsdaten. Ganze Episoden und Seeds bleiben zwischen Training, Validierung und Test getrennt. Unbekannte Parameter, unbekannte Parallelpfade/Maschinenzahlen und unbekannte Eingriffskombinationen werden in getrennten Teststrata ausgewiesen. Kurze Forschungsepisoden tragen das Training; ein mehrtägiger Langzeittest prüft Rollout-Stabilität.
+
+## Modell und Anwendungen
+
+- Maschinenspezifische Encoder lernen zunächst lokale Transitionen und werden anschließend mit einem gemeinsamen Graphmodell feintrainiert. Standard-JEPA und OPF teilen Daten, Encoderbudget und Trainingsprotokoll; OPF faktorisiert den latenten Zielzustand. Drei Trainingsseeds und ein fester Validierungsentscheid bestimmen die eingefrorenen Testmodelle.
+- Sekundäre Auswertungen umfassen Langzeitvorhersage, Fehlerausbreitung aus Checkpoint-Eingriffen, Qualitätsvorhersage und Ursachenrangfolge sowie geschlossene Produktionssteuerung. Der Qualitäts-Readout lernt aus späteren Quality Findings und wird gegen verborgene Qualität evaluiert. Die Ursachenrangfolge nutzt die erste Vorhersageabweichung; injizierte Ursachen dienen ausschließlich der Bewertung.
+- Der Controller wählt aus einem versionierten endlichen Kandidatenkatalog gemeinsam gültige Aktionen für alle acht vorhandenen Typen und bewertet sie mit der konfigurierten Reward Policy. Jeder Typ muss im Benchmark vorkommen und separat auf Wirkung geprüft werden. Maschinenaktionen werden nur bei Leerlauf wirksam; andere Aktionen eines gemischten Batches können sofort laufen ([ADR-0018](../docs/adr/0018-plan-bounded-valid-decision-batches.md)). Modell und Planner lernen während des Tests nicht weiter. Rohkennzahlen und Fallbacks werden zusätzlich zum Reward berichtet.
+
+## Vergleiche, Budget und Artefakte
+
+- Vergleiche: Persistenz und einfache überwachte Prognose, kapazitätsgleiches Standard-JEPA, OPF und ein **neu** mit offiziellen Gewichten ausgeführtes TimesFM 3 ausschließlich als lecksichere Forecast-Baseline. Die historischen EXP-0001 bis EXP-0004 verwendeten einen NumPy-Surrogatadapter und sind kein Vergleich mit vortrainiertem TimesFM 3. Heuristische Steuerung und gelernte Provider erhalten dieselbe Studienbeobachtung; ein Health-State-Oracle darf nur separat ausgewiesen werden.
+- Gesamtbudget: 16 GB VRAM und höchstens etwa acht GPU-Stunden einschließlich echter TimesFM-Inferenz. Die drei Trainingsseeds und vergleichbare Trainingsbudgets haben Vorrang; bei Überschreitung werden Modellbreite und Batchgröße für alle trainierten Varianten symmetrisch gesenkt. Simulation, Datenerzeugung und ein kleiner Integrationstest laufen auf CPU.
+- Große Datensätze und Gewichte liegen unter dem git-ignorierten `runs/`; Konfiguration, Codeversionen, Seeds, Split-IDs, Backend, Gewichts- und Datenhashes sowie Kennzahlen werden im Repositorium dokumentiert. Die [TimesFM-3-Gewichte](https://huggingface.co/google/timesfm-3.0-pytorch) werden gemäß der [Lizenzangabe des Herausgebers](https://github.com/google-research/timesfm#license-notice-for-pretrained-weights) nur für den nichtkommerziellen Forschungsbenchmark verwendet.

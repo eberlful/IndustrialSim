@@ -89,7 +89,6 @@ from industrialsim.decisions import (
     StrategicObservation,
     VehicleSummaryObservation,
     WorkerReassignmentAction,
-    validate_decision_batch_response,
     manual_action_types,
     decision_action_schemas,
     validate_manual_decision_response,
@@ -620,7 +619,13 @@ def _parse_yaml_source(source: str | Path | dict[str, Any]) -> dict[str, Any]:
 
     if isinstance(source, str):
         path = Path(source)
-        if path.is_file():
+        # Inline YAML is not a filesystem path. Python 3.12 can raise OSError
+        # for an overlong name where 3.14's Path.is_file() simply returned False.
+        try:
+            is_file = "\n" not in source and "\r" not in source and path.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
             content = path.read_text(encoding="utf-8")
             parsed = _yaml.load(content)
         else:
@@ -958,6 +963,8 @@ def _create_station_instance(n: Any) -> Station:
             defect_name=op.defect_name,
             target_quality_state=op.target_quality_state,
             restores_quality=op.restores_quality,
+            process_effects={key: value.model_dump() for key, value in op.process_effects.items()},
+            process_defect_weights=dict(op.process_defect_weights),
             rework_success_probability=op.rework_success_probability,
             inspection=(
                 op.inspection.model_dump()
@@ -1028,6 +1035,7 @@ class EpisodeEngine:
             if p_id is not None and p_ver is not None:
                 self.plugin_metadata[str(p_id)] = str(p_ver)
         self.decision_provider = decision_provider
+        self._held_decision_batch: DecisionBatch | None = None
         self.episode_id = f"ep-{self.cfg.seed}"
         self.decision_coordinator = DecisionBatchCoordinator(episode_id=self.episode_id)
         self.audit_logger = audit_logger or AuditLogger()
@@ -1799,30 +1807,40 @@ class EpisodeEngine:
                 return self._build_buffer_observation(target_id, time_ns)
             return self._build_strategic_observation(target_id, time_ns)
 
+    def pending_decision_batch(self) -> DecisionBatch | None:
+        """Read one stable batch without consuming requests or recording effects."""
+        if self._held_decision_batch is None and self.decision_coordinator.has_pending():
+            self._held_decision_batch = self.decision_coordinator.preview_batch(
+                self.kernel.current_time_ns,
+                lambda request: self._build_observation_for_request(request, self.kernel.current_time_ns),
+            )
+        return deepcopy(self._held_decision_batch)
+
+    def submit_decision_batch(self, batch_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        """Validate a manual proposal with the same rules as every provider."""
+        batch = self.pending_decision_batch()
+        if batch is None or batch.batch_id != batch_id:
+            return {'accepted': False, 'diagnostics': [{'code': 'STALE_BATCH', 'message': 'This Decision Batch is no longer awaiting actions'}]}
+        try:
+            response = DecisionBatchResponse.model_validate({
+                'batch_id': batch_id, 'actions': actions,
+                'provenance': {'episode_id': batch.episode_id, 'branch_id': batch.branch_id,
+                               'batch_id': batch_id, 'provider_id': 'manual'},
+            })
+        except ValidationError as exc:
+            return {'accepted': False, 'diagnostics': [{'code': 'INVALID_ACTION',
+                    'message': f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"}
+                    for error in exc.errors()]}
+        valid, diagnostics = self._validate_decision_response(batch, response)
+        if not valid:
+            return {'accepted': False, 'diagnostics': [d.model_dump(mode='json') for d in diagnostics]}
+        self._commit_decision_batch(batch, response, [])
+        return {'accepted': True, 'diagnostics': []}
+
     def _process_decision_batch(self) -> None:
-        batch = self.decision_coordinator.form_batch(
-            time_ns=self.kernel.current_time_ns,
-            observation_builder=lambda req: self._build_observation_for_request(req, self.kernel.current_time_ns),
-        )
+        batch = self.pending_decision_batch()
         if batch is None:
             return
-
-        for req in batch.requests:
-            self.audit_logger.record(
-                event_type="decision_request",
-                simulated_time_ns=self.kernel.current_time_ns,
-                episode_id=batch.episode_id,
-                branch_id=batch.branch_id,
-                batch_id=batch.batch_id,
-                entity_ids=[req.target_id],
-                details={
-                    "request_id": req.request_id,
-                    "request_type": req.request_type,
-                    "target_id": req.target_id,
-                    "trigger_id": req.trigger_id,
-                    "action_schema": req.action_schema,
-                },
-            )
 
         response: DecisionBatchResponse | None = None
         diagnostics: list[DecisionDiagnosticRecord] = []
@@ -1831,7 +1849,7 @@ class EpisodeEngine:
             try:
                 response = self.decision_provider.decide(batch)
                 if response is not None:
-                    is_valid, validation_diags = validate_decision_batch_response(batch, response)
+                    is_valid, validation_diags = self._validate_decision_response(batch, response)
                     diagnostics.extend(validation_diags)
                 else:
                     diagnostics.append(
@@ -1856,6 +1874,31 @@ class EpisodeEngine:
                     message="No decision provider configured",
                     batch_id=batch.batch_id,
                 )
+            )
+
+        self._commit_decision_batch(batch, response, diagnostics)
+
+    def _commit_decision_batch(
+        self, batch: DecisionBatch, response: DecisionBatchResponse | None,
+        diagnostics: list[DecisionDiagnosticRecord],
+    ) -> None:
+        self.decision_coordinator.consume_batch(batch)
+        self._held_decision_batch = None
+        for req in batch.requests:
+            self.audit_logger.record(
+                event_type="decision_request",
+                simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=batch.episode_id,
+                branch_id=batch.branch_id,
+                batch_id=batch.batch_id,
+                entity_ids=[req.target_id],
+                details={
+                    "request_id": req.request_id,
+                    "request_type": req.request_type,
+                    "target_id": req.target_id,
+                    "trigger_id": req.trigger_id,
+                    "action_schema": req.action_schema,
+                },
             )
 
         if response is not None:
@@ -1912,6 +1955,53 @@ class EpisodeEngine:
                 "events_processed": self.kernel.events_processed,
             },
         )
+
+    def _validate_decision_response(
+        self, batch: DecisionBatch, response: DecisionBatchResponse
+    ) -> tuple[bool, list[DecisionDiagnosticRecord]]:
+        _, diagnostics = validate_manual_decision_response(batch, response)
+        state_errors = []
+        reserved_occupancy = dict(self.reserved_route_occupancy)
+        for action in response.actions:
+            if isinstance(action, DispatchAction):
+                order = self.transport_orders.get(action.target_id)
+                route = self.routes_by_id.get(action.route_id)
+                vehicle = self.vehicles.get(action.vehicle_id) if action.vehicle_id else None
+                if order is None or route is None:
+                    state_errors.append('Dispatch must address an existing Transport Order and Route')
+                    continue
+                choice = self.dispatch_policy.select_dispatch(DispatchContext(
+                    order=order, candidate_routes=[route], available_vehicles=[vehicle] if vehicle else [],
+                    active_route_occupancy=self.active_route_occupancy,
+                    reserved_route_occupancy=reserved_occupancy,
+                    node_distance_fn=self._compute_node_distance, can_accept_fn=self._can_accept,
+                    unconstrained=not self.vehicles,
+                ))
+                if choice is None:
+                    state_errors.append(f"Vehicle '{action.vehicle_id}' cannot dispatch Route '{action.route_id}': check capabilities, pool, pickup reachability and shared Route capacity")
+                else:
+                    reserved_occupancy[route.id] = reserved_occupancy.get(route.id, 0) + 1
+            elif isinstance(action, MachineModeAction):
+                machine = self.machines.get(action.target_id)
+                if machine is None or (action.mode != machine.operating_mode and (machine.active_allocations or machine.is_in_maintenance)):
+                    state_errors.append(f"Machine '{action.target_id}' must be idle to change mode")
+            elif isinstance(action, MaintenanceAction) and action.trigger_maintenance:
+                machine = self.machines.get(action.target_id)
+                if machine is None or machine.active_allocations or machine.is_in_maintenance or machine.is_failed or not machine.maintenance_policy:
+                    state_errors.append(f"Machine '{action.target_id}' cannot start maintenance in this state or has no maintenance policy")
+            elif isinstance(action, WorkerReassignmentAction):
+                worker = self.workers.get(action.target_id)
+                if worker is None or worker.active_allocations:
+                    state_errors.append(f"Worker '{action.target_id}' must be idle to reassign")
+                if action.assigned_station_id is not None and action.assigned_station_id not in self.stations:
+                    state_errors.append(f"Unknown Station '{action.assigned_station_id}'")
+            elif isinstance(action, (ReconfigurationAction, QualityControlAction)):
+                station = self.stations.get(action.target_id)
+                if station is None or station.is_busy or station.is_reconfiguring:
+                    state_errors.append(f"Station '{action.target_id}' must be at a safe idle boundary")
+        diagnostics.extend(DecisionDiagnosticRecord(code='INVALID_RESOURCE_STATE', message=message,
+            batch_id=batch.batch_id) for message in state_errors)
+        return not diagnostics, diagnostics
 
     def _apply_actions_list(
         self, batch: DecisionBatch, actions: Sequence[DecisionAction]
@@ -2135,11 +2225,30 @@ class EpisodeEngine:
             return
 
         if fallback_policy_name in ("fifo", "baseline"):
-            fallback_policy = BaselineFallbackPolicy()
+            fallback_policy = getattr(self, "study_fallback_policy", None) or BaselineFallbackPolicy()
         else:
             raise ValueError(f"Unsupported fallback policy: '{fallback_policy_name}'")
 
         fallback_actions = fallback_policy.generate_fallback_actions(batch)
+        fallback_response = DecisionBatchResponse(
+            batch_id=batch.batch_id, actions=list(fallback_actions),
+            provenance=DecisionProvenance(episode_id=batch.episode_id, branch_id=batch.branch_id,
+                batch_id=batch.batch_id, provider_id=f'fallback-{fallback_policy_name}'),
+        )
+        valid, fallback_diagnostics = self._validate_decision_response(batch, fallback_response)
+        if not valid:
+            failure = DecisionDiagnosticRecord(code='INVALID_FALLBACK_BATCH', batch_id=batch.batch_id,
+                message='Fallback Decision Batch rejected: ' + '; '.join(d.message for d in fallback_diagnostics))
+            self.decision_diagnostics.extend(d.model_dump() for d in [failure, *fallback_diagnostics])
+            self.is_aborted = True
+            self.abort_reason = failure.message
+            self.audit_logger.record(event_type='failure', simulated_time_ns=self.kernel.current_time_ns,
+                episode_id=batch.episode_id, branch_id=batch.branch_id, batch_id=batch.batch_id,
+                details={'failure_type': 'decision_abort', 'abort_reason': self.abort_reason,
+                         'diagnostics': [d.model_dump(mode='json') for d in [failure, *fallback_diagnostics]]})
+            self.decision_batches.append({'batch_id': batch.batch_id, 'time_ns': batch.time_ns,
+                'status': 'aborted', 'diagnostics': [d.model_dump() for d in [*diagnostics, failure, *fallback_diagnostics]]})
+            return
         self.audit_logger.record(
             event_type="fallback",
             simulated_time_ns=self.kernel.current_time_ns,
@@ -2725,9 +2834,12 @@ class EpisodeEngine:
 
         return True, allocated_machines, allocated_workers
 
-    def _compute_effective_operation_duration(self, op: Operation, time_ns: int) -> int:
+    def _compute_effective_operation_duration(self, op: Operation, time_ns: int, station_id: str | None = None) -> int:
+        multiplier = 1.0
+        if station_id is not None:
+            multiplier = float(self.stations[station_id].configuration.get("cycle_time_multiplier", 1.0))
         if not op.required_machines:
-            return op.duration_ns
+            return max(1, int(round(op.duration_ns * multiplier)))
         max_duration = 0
         for m_id in op.required_machines:
             mach = self.machines.get(m_id)
@@ -2742,7 +2854,7 @@ class EpisodeEngine:
                 eff_dur = max(1, int(round(op.duration_ns * dur_mult)))
                 if eff_dur > max_duration:
                     max_duration = eff_dur
-        return max_duration if max_duration > 0 else op.duration_ns
+        return max(1, int(round((max_duration if max_duration > 0 else op.duration_ns) * multiplier)))
 
     def _compute_effective_defect_probability(self, op: Operation, time_ns: int) -> float:
         effective_prob = op.defect_probability
@@ -2834,12 +2946,12 @@ class EpisodeEngine:
                     rem_dur = waiter.get("remaining_duration_ns", op.duration_ns)
                     st.record_resume()
                 elif waiter.get("is_restarting"):
-                    rem_dur = self._compute_effective_operation_duration(op, time_ns)
+                    rem_dur = self._compute_effective_operation_duration(op, time_ns, station_id)
                     st.record_restart()
                 else:
                     rem_dur = waiter.get("remaining_duration_ns")
                     if rem_dur is None:
-                        rem_dur = self._compute_effective_operation_duration(op, time_ns)
+                        rem_dur = self._compute_effective_operation_duration(op, time_ns, station_id)
                 token = self._acquire_resources(
                     station_id=station_id,
                     unit_id=unit_id,
@@ -3357,7 +3469,7 @@ class EpisodeEngine:
             return
 
         can_acq, mach_ids, worker_allocs = self._can_acquire_resources(op, node_id, k.current_time_ns)
-        eff_dur = self._compute_effective_operation_duration(op, k.current_time_ns)
+        eff_dur = self._compute_effective_operation_duration(op, k.current_time_ns, node_id)
         if can_acq:
             token = self._acquire_resources(
                 station_id=node_id,
@@ -3480,8 +3592,28 @@ class EpisodeEngine:
         unit_id = unit.id
         was_in_rework = unit.is_in_rework
 
+        # Declared transformations read the same prior state; quality restoration
+        # deliberately does not reset undeclared carried process attributes.
+        previous_process = dict(unit.process_state)
+        process_machines = [self.machines[mid] for mid in current_op.required_machines]
+        mean_health = (sum(m.health for m in process_machines) / len(process_machines)
+                       if process_machines else 1.0)
+        for name, effect in current_op.process_effects.items():
+            value = float(effect.get("bias", 0.0))
+            value += sum(float(weight) * previous_process.get(key, 0.0)
+                         for key, weight in effect.get("inputs", {}).items())
+            value += float(effect.get("health_weight", 0.0)) * (1.0 - mean_health)
+            if process_machines:
+                value += sum(float(effect.get("mode_weights", {}).get(m.operating_mode, 0.0))
+                             for m in process_machines) / len(process_machines)
+            unit.process_state[name] = min(float(effect.get("maximum", 1.0)),
+                                          max(float(effect.get("minimum", 0.0)), value))
+
         # 1. Defect generation (addressed by unit and operation for counterfactual consistency)
         eff_defect_prob = self._compute_effective_defect_probability(current_op, k.current_time_ns)
+        eff_defect_prob = min(1.0, max(0.0, eff_defect_prob + sum(
+            weight * unit.process_state.get(name, 0.0)
+            for name, weight in current_op.process_defect_weights.items())))
         if eff_defect_prob > 0.0:
             defect_roll = self.random_stream.draw_float("quality", f"{unit.id}:{current_op.id}", "defect")
             if defect_roll < eff_defect_prob:
@@ -3511,10 +3643,16 @@ class EpisodeEngine:
                 unit.rework_operation_id = None
 
         # 3. Inspection
-        if current_op.inspection:
+        sampling_rate = float((current_op.inspection or {}).get("sampling_rate", 1.0))
+        sampled = sampling_rate >= 1.0 or self.random_stream.draw_float(
+            "inspection_sampling", f"{unit.id}:{current_op.id}", "sample") < sampling_rate
+        if current_op.inspection and sampled:
             insp = current_op.inspection
             sensitivity = float(insp.get("sensitivity", 1.0))
             fp_rate = float(insp.get("false_positive_rate", 0.0))
+            threshold = float(insp.get("release_threshold", 0.5))
+            sensitivity = min(1.0, max(0.0, sensitivity + 0.5 - threshold))
+            fp_rate = min(1.0, max(0.0, fp_rate + 0.1 * (0.5 - threshold)))
             disp_on_defect = insp.get("disposition_on_defect", "scrap")
             max_reworks = int(insp.get("max_reworks", 1))
 
@@ -3603,7 +3741,7 @@ class EpisodeEngine:
                 details={"station_id": station_id, "operation_id": next_op.id},
             )
             can_acq, mach_ids, worker_allocs = self._can_acquire_resources(next_op, station_id, k.current_time_ns)
-            eff_dur = self._compute_effective_operation_duration(next_op, k.current_time_ns)
+            eff_dur = self._compute_effective_operation_duration(next_op, k.current_time_ns, station_id)
             if can_acq:
                 token = self._acquire_resources(
                     station_id=station_id,
@@ -4326,15 +4464,12 @@ class EpisodeEngine:
         )
 
     def form_branch_batch(self, branch_id: str) -> DecisionBatch:
-        batch = self.decision_coordinator.form_batch(
-            time_ns=self.kernel.current_time_ns,
-            observation_builder=lambda req: self._build_observation_for_request(
-                req, self.kernel.current_time_ns
-            ),
-        )
+        if self.decision_coordinator.branch_id != branch_id:
+            raise ValueError('Configure the branch before forming its Decision Batch')
+        batch = self.pending_decision_batch()
         if batch is None:
-            raise ValueError("Failed to form Decision Batch from checkpoint pending requests.")
-        return batch.model_copy(update={"branch_id": branch_id})
+            raise ValueError('Failed to form Decision Batch from checkpoint pending requests.')
+        return batch
 
     def attach_branch_writer(self, writer: RunArtifactWriter) -> None:
         writer.plugin_metadata.update(self.plugin_metadata)
@@ -4521,7 +4656,8 @@ class EpisodeEngine:
                 if pause_at_ns is not None and self.kernel.current_time_ns < pause_at_ns:
                     self.kernel.advance_to(pause_at_ns)
                 elif (
-                    self.cfg.episode.end_condition.type == "max_time"
+                    pause_at_ns is None
+                    and self.cfg.episode.end_condition.type == "max_time"
                     and self.cfg.episode.end_condition.max_time_ns is not None
                     and self.kernel.current_time_ns < self.cfg.episode.end_condition.max_time_ns
                 ):
@@ -4772,7 +4908,6 @@ class EpisodeSession:
         self._writer: RunArtifactWriter | None = None
         self._closed = False
         self._finalized = False
-        self._pending_batch: DecisionBatch | None = None
         if output_dir is not None:
             # Exclusive reservation protects completed AND incomplete artifacts.
             Path(output_dir).mkdir(parents=True, exist_ok=False)
@@ -4808,14 +4943,7 @@ class EpisodeSession:
         session._writer = None
         session._closed = False
         session._finalized = False
-        session._pending_batch = None
         session._summary = engine.to_summary(update_metrics=False)
-        if engine.decision_coordinator.has_pending():
-            coordinator = deepcopy(engine.decision_coordinator)
-            session._pending_batch = coordinator.form_batch(
-                time_ns=engine.kernel.current_time_ns,
-                observation_builder=lambda request: engine._build_observation_for_request(request, engine.kernel.current_time_ns),
-            )
         if session.finished:
             session.close()
             raise ValueError('Choose a Checkpoint from an unfinished Episode')
@@ -4865,6 +4993,23 @@ class EpisodeSession:
         """
         engine = self._engine
         now = self._summary.simulated_time_ns
+        arrivals = {
+            event['payload'].get('order_id'): event['time_ns']
+            for event in engine.kernel.snapshot()['queue']
+            if event['event_type'] == 'ARRIVAL_AT_NODE'
+        }
+        transports = {
+            order.id: {
+                'id': order.id, 'unit_id': order.unit_id,
+                'route_id': order.assigned_route_id,
+                'source_node_id': order.source_node_id, 'target_node_id': order.target_node_id,
+                'pickup_time_ns': str(order.pickup_time_ns),
+                'arrival_time_ns': str(arrivals[order.id]),
+            }
+            for order in engine.transport_orders.values()
+            if order.state == TransportOrderState.IN_TRANSIT
+            and order.pickup_time_ns is not None and order.id in arrivals
+        }
         stations = {}
         for station in engine.stations.values():
             unit_ids = list(dict.fromkeys([
@@ -4893,7 +5038,7 @@ class EpisodeSession:
                 } for resource in collection.values()
             }
         return {
-            'simulated_time_ns': str(now), 'stations': stations,
+            'simulated_time_ns': str(now), 'stations': stations, 'transports': transports,
             'graph': (engine.cfg.material_flow.model_dump(mode='json') if engine.cfg.material_flow else {
                 'nodes': [{**s.model_dump(mode='json'), 'kind': 'station',
                            'input_ports': [], 'output_ports': []} for s in engine.cfg.stations],
@@ -4942,91 +5087,24 @@ class EpisodeSession:
                 'action_types': {request.request_id: manual_action_types(request) for request in batch.requests},
                 'suggested_actions': [action.model_dump(mode='json') for action in suggestions.actions]}
 
+    @property
+    def _pending_batch(self) -> DecisionBatch | None:
+        return self._engine.pending_decision_batch()
+
     def submit_decision_batch(self, batch_id: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
-        """Validate the entire proposal before committing any effects or audit records.
-
-        Form rejection is distinct from an actual provider failure and never
-        invokes fallback. The engine retains its normal provider/audit path.
-        """
-        batch = self._pending_batch
-        if self._closed or self._finalized or batch is None or batch.batch_id != batch_id:
+        """Rejected proposals retain the held batch without audit or fallback."""
+        if self._closed or self._finalized or self._pending_batch is None:
             return {'accepted': False, 'diagnostics': [{'code': 'STALE_BATCH', 'message': 'This Decision Batch is no longer awaiting actions'}]}
-        try:
-            response = DecisionBatchResponse.model_validate({
-                'batch_id': batch_id, 'actions': actions,
-                'provenance': {'episode_id': batch.episode_id, 'branch_id': batch.branch_id,
-                               'batch_id': batch_id, 'provider_id': 'manual'},
-            })
-        except ValidationError as exc:
-            return {'accepted': False, 'diagnostics': [{'code': 'INVALID_ACTION',
-                    'message': f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"}
-                    for error in exc.errors()]}
-        valid, diagnostics = validate_manual_decision_response(batch, response)
-        if not valid:
-            return {'accepted': False, 'diagnostics': [diagnostic.model_dump(mode='json') for diagnostic in diagnostics]}
-        engine = self._engine
-        state_errors = []
-        reserved_occupancy = dict(engine.reserved_route_occupancy)
-        for action in response.actions:
-            if isinstance(action, DispatchAction):
-                order = engine.transport_orders.get(action.target_id)
-                route = engine.routes_by_id.get(action.route_id)
-                vehicle = engine.vehicles.get(action.vehicle_id) if action.vehicle_id else None
-                if order is None or route is None:
-                    state_errors.append('Dispatch must address an existing Transport Order and Route')
-                    continue
-                choice = engine.dispatch_policy.select_dispatch(DispatchContext(
-                    order=order, candidate_routes=[route], available_vehicles=[vehicle] if vehicle else [],
-                    active_route_occupancy=engine.active_route_occupancy,
-                    reserved_route_occupancy=reserved_occupancy,
-                    node_distance_fn=engine._compute_node_distance, can_accept_fn=engine._can_accept,
-                    unconstrained=not engine.vehicles,
-                ))
-                if choice is None:
-                    state_errors.append(f"Vehicle '{action.vehicle_id}' cannot dispatch Route '{action.route_id}': check capabilities, pool, pickup reachability and shared Route capacity")
-                else:
-                    reserved_occupancy[route.id] = reserved_occupancy.get(route.id, 0) + 1
-            elif isinstance(action, MachineModeAction):
-                machine = engine.machines.get(action.target_id)
-                if machine is None or (action.mode != machine.operating_mode and (machine.active_allocations or machine.is_in_maintenance)):
-                    state_errors.append(f"Machine '{action.target_id}' must be idle to change mode")
-            elif isinstance(action, MaintenanceAction) and action.trigger_maintenance:
-                machine = engine.machines.get(action.target_id)
-                if machine is None or machine.active_allocations or machine.is_in_maintenance or machine.is_failed or not machine.maintenance_policy:
-                    state_errors.append(f"Machine '{action.target_id}' cannot start maintenance in this state or has no maintenance policy")
-            elif isinstance(action, WorkerReassignmentAction):
-                worker = engine.workers.get(action.target_id)
-                if worker is None or worker.active_allocations:
-                    state_errors.append(f"Worker '{action.target_id}' must be idle to reassign")
-                if action.assigned_station_id is not None and action.assigned_station_id not in engine.stations:
-                    state_errors.append(f"Unknown Station '{action.assigned_station_id}'")
-            elif isinstance(action, (ReconfigurationAction, QualityControlAction)):
-                station = engine.stations.get(action.target_id)
-                if station is None or station.is_busy or station.is_reconfiguring:
-                    state_errors.append(f"Station '{action.target_id}' must be at a safe idle boundary")
-        if state_errors:
-            return {'accepted': False, 'diagnostics': [{'code': 'INVALID_RESOURCE_STATE', 'message': error} for error in state_errors]}
-
-        class SubmittedDecisionProvider(DecisionProvider):
-            def decide(self, intended_batch: DecisionBatch) -> DecisionBatchResponse:
-                if intended_batch != batch:
-                    raise ValueError('Decision Batch changed before application')
-                return response
-
-        provider = engine.decision_provider
-        try:
-            engine.decision_provider = SubmittedDecisionProvider()
-            self.resolve_decision_batch()
-        finally:
-            engine.decision_provider = provider
-        return {'accepted': True, 'diagnostics': []}
+        result = self._engine.submit_decision_batch(batch_id, actions)
+        if result['accepted']:
+            self._summary = self._engine.to_summary(update_metrics=False)
+        return result
 
     def resolve_decision_batch(self) -> EpisodeSummary:
         """Answer the held batch with the configured provider and failure policy."""
         if self._closed or self._finalized or self._pending_batch is None:
             raise ValueError('No Decision Batch is awaiting a provider')
         self._engine._process_decision_batch()
-        self._pending_batch = None
         self._summary = self._engine.to_summary(update_metrics=False)
         return self.snapshot()
 
@@ -5041,12 +5119,6 @@ class EpisodeSession:
         if until_time_ns is not None and until_time_ns < self._summary.simulated_time_ns:
             raise ValueError('Cannot advance backwards in simulation time')
         self._summary = self._engine.advance(until_time_ns, pause_at_decision_batch, max_events)
-        if pause_at_decision_batch and self._engine.decision_coordinator.has_pending():
-            coordinator = deepcopy(self._engine.decision_coordinator)
-            self._pending_batch = coordinator.form_batch(
-                time_ns=self._engine.kernel.current_time_ns,
-                observation_builder=lambda request: self._engine._build_observation_for_request(request, self._engine.kernel.current_time_ns),
-            )
         return self.snapshot()
 
     def finalize(self) -> EpisodeSummary:
@@ -5571,64 +5643,8 @@ def _execute_single_branch_worker(task: BranchWorkerTask) -> CounterfactualBranc
             actions=actions,
         )
 
-        is_valid, diagnostics = validate_decision_batch_response(batch, response)
-
-        for req in batch.requests:
-            engine.audit_logger.record(
-                event_type="decision_request",
-                simulated_time_ns=engine.kernel.current_time_ns,
-                episode_id=batch.episode_id,
-                branch_id=branch_id,
-                batch_id=batch.batch_id,
-                entity_ids=[req.target_id],
-                details={
-                    "request_id": req.request_id,
-                    "request_type": req.request_type,
-                    "target_id": req.target_id,
-                    "trigger_id": req.trigger_id,
-                    "action_schema": req.action_schema,
-                },
-            )
-
-        for act in actions:
-            t_id = (
-                getattr(act, "buffer_id", None)
-                or getattr(act, "target_id", None)
-                or getattr(act, "machine_id", None)
-                or getattr(act, "node_id", None)
-                or getattr(act, "unit_id", None)
-            )
-            entity_ids = [t_id] if t_id else []
-            engine.audit_logger.record(
-                event_type="decision_action",
-                simulated_time_ns=engine.kernel.current_time_ns,
-                episode_id=batch.episode_id,
-                branch_id=branch_id,
-                batch_id=batch.batch_id,
-                entity_ids=entity_ids,
-                provenance=provenance.model_dump(mode="json"),
-                details={
-                    "action_type": act.action_type,
-                    "action": act.model_dump(mode="json"),
-                },
-            )
-
-        engine.audit_logger.record(
-            event_type="validation_outcome",
-            simulated_time_ns=engine.kernel.current_time_ns,
-            episode_id=batch.episode_id,
-            branch_id=branch_id,
-            batch_id=batch.batch_id,
-            details={
-                "is_valid": is_valid,
-                "diagnostics": [d.model_dump(mode="json") for d in diagnostics],
-            },
-        )
-
-        if is_valid:
-            engine._apply_decision_actions(batch, response)
-        else:
-            engine._handle_decision_failure(batch, diagnostics)
+        _, diagnostics = engine._validate_decision_response(batch, response)
+        engine._commit_decision_batch(batch, response, diagnostics)
 
         summary = engine.run()
 
@@ -5951,8 +5967,3 @@ def compare_policies(
             (out_p / ".incomplete").unlink()
 
     return comp_result
-
-
-
-
-

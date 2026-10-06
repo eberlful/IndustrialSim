@@ -90,6 +90,8 @@ stations: [{id: station, operations: [{id: op, duration: 1s}]}]
   await plan.getByRole('button', { name: 'Apply Production Plan' }).click();
   await expect(setup.getByLabel('Seed', { exact: true })).toHaveValue('8');
   await expect(page.getByRole('button', { name: 'Download YAML' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+  await setup.getByRole('button', { name: 'Discard form changes', exact: true }).click();
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   await expect(setup.getByLabel('Seed', { exact: true })).toHaveValue('7');
   await page.getByRole('button', { name: 'Redo', exact: true }).click();

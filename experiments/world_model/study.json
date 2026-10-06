@@ -1,0 +1,10 @@
+{
+  "reference_config": "examples/reference_automotive_plant.yaml",
+  "duration_ns": 7200000000000,
+  "interval_ns": 30000000000,
+  "context": 32,
+  "horizon": 10,
+  "seed": 5000,
+  "noise_scale": 0.02,
+  "missing_probability": 0.02
+}

@@ -6,7 +6,7 @@ Dieses Dokument beschreibt die interne Systemarchitektur, Entwurfsentscheidungen
 
 ## 1. Übersicht & Leitprinzipien
 
-IndustrialSim ist eine deterministische, reproduzierbare diskrete Ereignissimulationsumgebung für die Automobilproduktion auf Basis von CPython 3.14. Sie dient dem exakten, wissenschaftlichen Vergleich von Produktionssteuerungsheuristiken und externen Decision Providern (wie Reinforcement Learning oder LLM-basierten Steuerungen).
+IndustrialSim ist eine deterministische, reproduzierbare diskrete Ereignissimulationsumgebung für die Automobilproduktion auf Basis von CPython 3.12. Sie dient dem exakten, wissenschaftlichen Vergleich von Produktionssteuerungsheuristiken und externen Decision Providern (wie Reinforcement Learning oder LLM-basierten Steuerungen).
 
 ### Kernanforderungen & architektonische Invarianten
 
@@ -101,7 +101,7 @@ IndustrialSim nutzt das **Philox-4x32**-PRNG-Verfahren (gemäß Counter-Based Ps
 
 ## 5. Das Domänenmodell (`industrialsim.domain`)
 
-Die Domänenschicht bildet die Fertigungswelt unter strikter Beachtung des [Domänenglossars](file:///workspaces/IndustrialSim/CONTEXT.md) ab.
+Die Domänenschicht bildet die Fertigungswelt unter strikter Beachtung des [Domänenglossars](file:///workspaces/IndustrialSim/GLOSSARY.md) ab.
 
 ### 5.1 Organisations- und Raumstruktur
 - **Plant**: Die oberste Instanz des modellierten Werks.
@@ -145,6 +145,15 @@ IndustrialSim ist speziell für den Vergleich von Steuerungsstrategien ausgelegt
 - **Atomare Validierung**: Aktionen werden gemeinsam gegen harte physikalische Randbedingungen validiert. Ungültige Aktionen oder Timeouts aktivieren sofort die konfigurierte deterministische `Fallback Policy`.
 - **Hysterese & Re-Arming**: Trigger verhindern kaskadierende Endlosschleifen an Zustandsschwellen durch explizite Entprellungsregeln.
 
+Das Engine-Modul besitzt den angehaltenen Decision Batch. Lesen bildet ihn einmal,
+verbraucht aber keine Requests und erzeugt keine Audit-Effekte. Manuelle Eingaben,
+konfigurierte Decision Providers und Counterfactual Branches teilen die Validierung
+und den Commit-Pfad. Offene Requests und Batch-Zähler bleiben im vorhandenen
+Checkpoint-Format; daraus wird der angehaltene Batch nach Restore rekonstruiert.
+Abgelehnte manuelle Formulare bleiben ohne Fallback korrigierbar. Auch Aktionen
+einer Fallback Policy werden validiert; ein ungültiger Fallback beendet die Episode
+mit `INVALID_FALLBACK_BATCH`, ohne seine Effekte anzuwenden.
+
 ---
 
 ## 9. Checkpoints & Counterfactual Branching (`industrialsim.checkpoint`)
@@ -167,3 +176,43 @@ IndustrialSim ist speziell für den Vergleich von Steuerungsstrategien ausgelegt
 ## 11. Erweiterbarkeit durch Plugins (`industrialsim.plugins`)
 
 Über standardisierte Python Entry Points (`[project.entry-points."industrialsim.plugins"]`) können neue Stationstypen oder detaillierte Subgraphen (z. B. `MicroSubgraphPlugin`) registriert werden, ohne den Simulationskern zu modifizieren (vgl. [ADR-0004](file:///workspaces/IndustrialSim/docs/adr/0004-compose-macro-and-micro-production-models.md), [ADR-0012](file:///workspaces/IndustrialSim/docs/adr/0012-use-strict-declarative-configuration-and-trusted-plugins.md)).
+
+## 12. Lokale Episode-Steuerung und Plant-Entwürfe
+
+`EpisodeWorker` bündelt Befehlszulässigkeit, Zustandsübergänge und den Abschluss
+wartender Befehle. Engine-Mutationen bleiben serialisiert. Checkpoint-I/O hält
+die Snapshot-Sperre nicht fest; währenddessen sind konkurrierende Befehle gesperrt.
+Jede Worker-Antwort enthält neben `episode` ein additives `capabilities`-Objekt:
+
+```json
+{
+  "start": true,
+  "pause": false,
+  "continue": false,
+  "next_batch": false,
+  "submit_batch": false,
+  "checkpoint": false,
+  "restore": true
+}
+```
+
+Die Werte stammen aus derselben Prüfung wie die tatsächliche Befehlsannahme und
+sind auch ohne Episode vorhanden. Sie sind eine aktuelle Momentaufnahme, keine
+Reservierung: Episode- und Batch-Identitäten werden bei Übermittlung erneut geprüft.
+Der Browser ergänzt lokale Voraussetzungen wie gültige Plant-Eingaben und einen
+ausgewählten Checkpoint.
+
+Das frontendinterne `PlantDraft`-Modul besitzt den akzeptierten Entwurf,
+YAML-Eingaben, Diagnosen, Speicherergebnisse und offene Formulare. Die Formular-Seam
+verwendet stabile Schlüssel nach Element und Formularart, bei Operations zusätzlich
+nach Operation-ID. Elementwechsel erhalten offene Werte; Übernehmen oder Verwerfen
+betrifft nur das ausgewählte Formular. Ein zentraler Verwerfen-Befehl entfernt alle
+offenen Formulareingaben. Diese Zwischenspeicherung gilt für die aktuelle Browser-
+Sitzung; dauerhafte Entwürfe werden weiterhin ausdrücklich gespeichert.
+
+Offene Formulare sperren YAML-Wechsel, Speichern, Export, Episode-Start,
+Modellwechsel, Import, Reload und Undo/Redo. Anfragen zur Projektmutation werden
+serialisiert; verspätete initiale Leseantworten ersetzen keinen neueren Entwurf.
+Der HTTP-Transport und der kontrollierte Testtransport sind Adapter derselben Seam.
+Python bleibt für fachliche Validierung maßgeblich; aktive Episodes behalten ihre
+eingefrorene Konfiguration.

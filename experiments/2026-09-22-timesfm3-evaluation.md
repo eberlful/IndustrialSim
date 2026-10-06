@@ -1,5 +1,7 @@
 # [EXP-0001] Evaluierung von TimesFM 3 für multivariates Forecasting und vorausschauende Steuerung
 
+> **Methodischer Nachtrag (2026-09-23):** Alle in diesem Bericht als „TimesFM 3“ bezeichneten Ergebniszeilen wurden mit dem Standardmodus von `TimesFM3Adapter` (`use_torch=False`) erzeugt. Dieser Modus nutzt eine handgeschriebene NumPy-Heuristik und lädt keine Google-Modellgewichte. Die Zahlen belegen daher keine Leistung oder Zero-Shot-Fähigkeit des vortrainierten TimesFM 3. Soweit `run_offline_benchmark` verwendet wurde, enthielten dessen `future_covariates` zudem erst später realisierte Telemetrie; diese Offline-Fehler sind keine lecksicheren Live-Prognosen.
+
 > **Status**: Abgeschlossen  
 > **Datum**: 2026-09-22  
 > **Autor**: Markus Eberl / Antigravity Agent  

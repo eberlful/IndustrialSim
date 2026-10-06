@@ -16,6 +16,7 @@ test('switching views preserves provider input and exposes only contracted entit
   await page.getByRole('button', { name: 'Validate and import' }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
   await page.getByLabel('Decision mode', { exact: true }).selectOption('manual');
+  await page.getByLabel('Playback speed', { exact: true }).selectOption('0');
   await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
   await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Awaiting decisions');
   const before = (await (await context.request.get('/api/episode')).json()).episode;
@@ -64,6 +65,7 @@ decision_triggers:
   await page.getByRole('button', { name: 'Validate and import' }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
   await page.getByLabel('Decision mode', { exact: true }).selectOption('manual');
+  await page.getByLabel('Playback speed', { exact: true }).selectOption('0');
   await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
   await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Awaiting decisions');
   await page.getByLabel('Live Production Unit', { exact: true }).selectOption('unit');

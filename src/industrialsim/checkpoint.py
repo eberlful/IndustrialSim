@@ -127,6 +127,7 @@ class ProductionUnitSnapshot:
     rework_operation_id: str | None = None
     defects: list[str] = field(default_factory=list)
     findings: list[dict[str, Any]] = field(default_factory=list)
+    process_state: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -143,6 +144,7 @@ class ProductionUnitSnapshot:
             "rework_operation_id": self.rework_operation_id,
             "defects": list(self.defects),
             "findings": list(self.findings),
+            "process_state": dict(self.process_state),
         }
         if self.due_date_ns is not None:
             result["due_date_ns"] = self.due_date_ns
@@ -171,6 +173,7 @@ class ProductionUnitSnapshot:
             rework_operation_id=data.get("rework_operation_id"),
             defects=list(data.get("defects", [])),
             findings=list(data.get("findings", [])),
+            process_state=dict(data.get("process_state", {})),
         )
 
 

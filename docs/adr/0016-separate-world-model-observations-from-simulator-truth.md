@@ -1,0 +1,3 @@
+# Separate world-model observations from simulator truth
+
+The existing version 1 Decision Request can expose a Machine's exact Health State, while the Industrial World Model study evaluates inference from Sensor Readings and Quality Findings. Use a separate, versioned study observation adapter for training and every compared Decision Provider, with hidden Health and Quality States available only as evaluation labels; keep the existing Decision Request contract compatible. This preserves fair comparisons and prevents a training export from accidentally turning simulator truth into model input, at the cost of maintaining an additional observation schema.

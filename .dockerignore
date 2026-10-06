@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/dist
+**/runs
+.scratch
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.aws
+.codex
+.env
+.env.*
+**/*.pem
+**/*.key

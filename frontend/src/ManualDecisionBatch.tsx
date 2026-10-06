@@ -16,7 +16,7 @@ function proposalFor(pending: PendingDecisionBatch, targetId: string, actionType
   return { actionType, values };
 }
 
-export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; onSubmit: (actions: Record<string, unknown>[]) => Promise<EpisodeResponse | undefined> }) {
+export function ManualDecisionBatch({ episode, onSubmit, disabled = false }: { episode: Episode; disabled?: boolean; onSubmit: (actions: Record<string, unknown>[]) => Promise<EpisodeResponse | undefined> }) {
   const pending = episode.decision_batch!;
   const requests = pending.batch.requests.filter((request, index, all) =>
     all.findIndex(other => other.target_id === request.target_id) === index);
@@ -72,7 +72,7 @@ export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; o
     {requests.map((request, index) => {
       const proposal = proposals[index];
       const schema = pending.action_schemas[proposal.actionType];
-      return <fieldset key={request.request_id} disabled={submitting}>
+      return <fieldset key={request.request_id} disabled={submitting || disabled}>
         <legend>{request.request_id} · {request.target_id}</legend>
         {pending.batch.requests.filter(related => related.target_id === request.target_id).map(related =>
           <details key={related.request_id}><summary>{related.request_id} · Decision Request and shared-boundary observation</summary><pre>{JSON.stringify(related, null, 2)}</pre></details>)}
@@ -94,6 +94,6 @@ export function ManualDecisionBatch({ episode, onSubmit }: { episode: Episode; o
       </fieldset>;
     })}
     {errors.length > 0 && <ul role="alert">{errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
-    <button disabled={submitting || proposals.some(proposal => !pending.action_schemas[proposal.actionType])} onClick={() => void submit()}>Submit complete Decision Batch</button>
+    <button disabled={submitting || disabled || proposals.some(proposal => !pending.action_schemas[proposal.actionType])} onClick={() => void submit()}>Submit complete Decision Batch</button>
   </section>;
 }

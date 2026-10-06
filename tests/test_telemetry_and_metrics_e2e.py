@@ -369,10 +369,12 @@ stations:
 decision_triggers:
   - id: "trig-safe"
     trigger_type: "safe_point"
-    target_id: "st-1"
+    target_id: "m-safe"
     times_ns: [0, 2000000000, 4000000000]
     on_failure: "fallback"
     fallback_policy: "baseline"
+machines:
+  - id: "m-safe"
 """
 
 
@@ -567,7 +569,6 @@ stations:
     assert "HARD_CONSTRAINT_VIOLATION: max_downtime limit exceeded" in (summary.abort_reason or "")
     assert summary.hard_constraints["satisfied"] is False
     assert any(v.get("code") == "MAX_DOWNTIME_EXCEEDED" for v in summary.hard_constraints["violations"])
-
 
 
 

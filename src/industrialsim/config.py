@@ -405,6 +405,26 @@ class InspectionConfig(StrictBaseModel):
         return self
 
 
+class ProcessEffectConfig(StrictBaseModel):
+    """Bounded synthetic affine effect; reads the prior carried process state."""
+
+    bias: float = 0.0
+    inputs: dict[str, float] = Field(default_factory=dict)
+    health_weight: float = 0.0
+    mode_weights: dict[str, float] = Field(default_factory=dict)
+    minimum: float = 0.0
+    maximum: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> ProcessEffectConfig:
+        import math
+        values = [self.bias, self.health_weight, self.minimum, self.maximum,
+                  *self.inputs.values(), *self.mode_weights.values()]
+        if not all(math.isfinite(value) for value in values) or self.minimum > self.maximum:
+            raise ValueError("Process effects require finite coefficients and ordered bounds")
+        return self
+
+
 class OperationConfig(StrictBaseModel):
     id: str
     duration: int | str
@@ -418,6 +438,16 @@ class OperationConfig(StrictBaseModel):
     restores_quality: bool = False
     rework_success_probability: float = 1.0
     inspection: InspectionConfig | None = None
+    process_effects: dict[str, ProcessEffectConfig] = Field(default_factory=dict)
+    process_defect_weights: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("process_defect_weights")
+    @classmethod
+    def validate_process_defect_weights(cls, values: dict[str, float]) -> dict[str, float]:
+        import math
+        if not all(math.isfinite(value) for value in values.values()):
+            raise ValueError("Process defect weights must be finite")
+        return values
 
     @model_validator(mode="after")
     def compute_duration_ns(self) -> OperationConfig:
@@ -1101,4 +1131,3 @@ class SimulationConfig(StrictBaseModel):
                     raise ValueError(str(e)) from e
 
         return self
-

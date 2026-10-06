@@ -263,6 +263,8 @@ class DecisionRequest(BaseModel):
     is_safe_point: bool = False
     observation: Any
     action_schema: str = "buffer_reorder"
+    candidate_catalog_version: str | None = None
+    candidate_catalog: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("observation", mode="before")
     @classmethod
@@ -937,15 +939,14 @@ class DecisionBatchCoordinator:
     def has_pending(self) -> bool:
         return len(self.pending_requests) > 0
 
-    def form_batch(
+    def preview_batch(
         self,
         time_ns: int,
         observation_builder: Callable[[Any], Any] | None = None,
     ) -> DecisionBatch | None:
         if not self.pending_requests:
             return None
-        self.batch_counter += 1
-        batch_id = f"batch-{self.batch_counter:04d}"
+        batch_id = f"batch-{self.batch_counter + 1:04d}"
         requests = []
         for req in self.pending_requests:
             if observation_builder is not None:
@@ -962,7 +963,20 @@ class DecisionBatchCoordinator:
             time_ns=time_ns,
             requests=requests,
         )
+        return batch
+
+    def consume_batch(self, batch: DecisionBatch) -> None:
+        """Consume the previously previewed batch exactly once."""
+        if (not self.pending_requests or batch.batch_id != f"batch-{self.batch_counter + 1:04d}"
+                or [r.request_id for r in batch.requests] != [r.request_id for r in self.pending_requests]):
+            raise ValueError('Decision Batch changed before application')
+        self.batch_counter += 1
         self.pending_requests.clear()
+
+    def form_batch(self, time_ns: int, observation_builder: Callable[[Any], Any] | None = None) -> DecisionBatch | None:
+        batch = self.preview_batch(time_ns, observation_builder)
+        if batch is not None:
+            self.consume_batch(batch)
         return batch
 
     def to_snapshot(self) -> dict[str, Any]:
@@ -980,7 +994,6 @@ class DecisionBatchCoordinator:
         self.pending_requests = [
             DecisionRequest.model_validate(item) for item in state.get("pending_requests", [])
         ]
-
 
 
 

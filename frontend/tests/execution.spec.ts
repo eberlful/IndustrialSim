@@ -12,6 +12,7 @@ test('start Baseline, reject a second start, close the browser page and reconnec
   await page.getByRole('button', { name: 'Validate and import' }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
   const started = page.waitForResponse(response => response.url().endsWith('/api/episode/start'));
+  await page.getByLabel('Playback speed', { exact: true }).selectOption('0');
   await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
   const episode = (await (await started).json()).episode;
   const duplicate = await context.request.post('/api/episode/start');
@@ -27,6 +28,9 @@ test('start Baseline, reject a second start, close the browser page and reconnec
   await expect(reconnected.getByRole('heading', { name: 'Outcome: completed', exact: true })).toBeVisible({ timeout: 30000 });
   await expect(reconnected.getByText(`Result directory: ${episode.result_path}`, { exact: true })).toBeVisible();
   await expect(reconnected.getByLabel('Episode outcome')).toContainText('Result hash:');
+  const utilization = reconnected.getByLabel('Episode outcome').locator('div').filter({ has: reconnected.getByText('resource utilization', { exact: true }) }).locator('dd');
+  await expect(utilization).toHaveText(JSON.stringify({ machines: {}, workers: {}, vehicles: {} }));
+  await reconnected.getByLabel('Episode outcome').screenshot({ path: test.info().outputPath('episode-outcome.png') });
   // Applied invalid drafts block start in the UI and at the authoritative HTTP gate.
   await reconnected.getByRole('form', { name: 'Episode setup' }).getByLabel('Seed', { exact: true }).fill('invalid');
   await reconnected.getByRole('button', { name: 'Apply Episode setup' }).click();
@@ -66,6 +70,7 @@ test('observe occupancy, inspect a Production Unit, pause and continue the same 
   await page.getByLabel('YAML content', { exact: true }).fill(model.replace('duration: 1s', 'duration: 1s, required_machines: [machine], required_workers: [{worker_id: worker}]') + '\nmachines: [{id: machine}]\nworkers: [{id: worker}]\n');
   await page.getByRole('button', { name: 'Validate and import' }).click();
   await expect(page.getByRole('status')).toHaveText('✓ Model valid');
+  await page.getByLabel('Playback speed', { exact: true }).selectOption('0');
   await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Pause Episode', exact: true })).toBeEnabled();
   await expect(page.locator('.react-flow__node').filter({ hasText: 'station' }).first()).toContainText('Occupancy: 1');
@@ -108,4 +113,19 @@ test('observe occupancy, inspect a Production Unit, pause and continue the same 
   await expect(page.getByRole('heading', { name: 'Outcome: completed', exact: true })).toBeVisible({ timeout: 30000 });
   expect((await (await context.request.get('/api/episode')).json()).episode.id).toBe(paused.id);
   await context.request.post('/api/project/yaml', { data: { yaml: draft.yaml } });
+});
+
+
+test('default playback exposes steps and supports pause and continue', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('YAML content', { exact: true }).fill(model.replace('quantity: 2000', 'quantity: 3'));
+  await page.getByRole('button', { name: 'Validate and import' }).click();
+  await expect(page.getByLabel('Playback speed', { exact: true })).toHaveValue('1');
+  await page.getByRole('button', { name: 'Start Episode', exact: true }).click();
+  await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Running');
+  await expect(page.getByLabel('Playback speed', { exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Pause Episode', exact: true }).click();
+  await expect(page.getByLabel('Episode status', { exact: true })).toContainText('Paused');
+  await page.getByRole('button', { name: 'Continue Episode', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Outcome: completed', exact: true })).toBeVisible({ timeout: 20000 });
 });

@@ -5,9 +5,27 @@
     "context": ".."
   },
   "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "vscode"
+    },
     "ghcr.io/devcontainers/features/node:2": {
       "version": "lts"
     }
   },
+  "runArgs": [
+    "--device=/dev/kfd",
+    "--device=/dev/dri",
+    "--shm-size=8g"
+  ],
+  "containerEnv": {
+    "UV_NO_GROUP": "ml-cpu",
+    "UV_PYTHON": "/usr/bin/python3.12"
+  },
+  "remoteEnv": {
+    "VIRTUAL_ENV": "${containerWorkspaceFolder}/.venv",
+    "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
+  },
+  "postCreateCommand": "bash .devcontainer/setup-rocm.sh",
+  "containerUser": "root",
   "remoteUser": "vscode"
 }

@@ -1,14 +1,15 @@
 import { useEffect } from 'react';
 import { ReactFlow, Background, Controls, Handle, Position, BaseEdge, EdgeLabelRenderer, MarkerType, useNodesState,
   type Node, type NodeProps, type Edge, type EdgeProps } from '@xyflow/react';
-import type { FlowNode, Layout, Model, Route, Observation, LiveNode } from './types';
+import type { FlowNode, Layout, Model, Route, Observation, LiveNode, Episode } from './types';
 import '@xyflow/react/dist/style.css';
 import { resourcesAtNode } from './episodeResources';
+import { TransportMarker, useDisplayTransports, useReducedMotion, type DisplayTransport } from './TransportAnimation';
 
-type PlantNode = Node<{ model: FlowNode; live?: LiveNode; resources?: string }, 'plant'>;
+type PlantNode = Node<{ model: FlowNode; live?: LiveNode; resources?: string; running?: boolean }, 'plant'>;
 function MaterialNode({ data }: NodeProps<PlantNode>) {
   const node = data.model;
-  return <article className={`material-node ${node.kind}`}>
+  return <article className={`material-node ${node.kind}${data.live?.blocked ? ' is-blocked' : data.running && data.live?.busy ? ' is-processing' : ''}`}>
     <small>{node.kind === 'station' ? 'Station' : node.kind === 'buffer' ? 'Buffer' : node.kind}</small>
     <strong>{node.id}</strong>
     {data.live && <span className="occupancy">Occupancy: {data.live.occupancy ?? 'Unavailable'}{data.live.capacity != null ? ` / ${data.live.capacity}` : ''}
@@ -26,7 +27,7 @@ function MaterialNode({ data }: NodeProps<PlantNode>) {
   </article>;
 }
 
-type MaterialEdge = Edge<{ route: Route; lane: number; select: () => void }, 'route'>;
+type MaterialEdge = Edge<{ route: Route; lane: number; select: () => void; transports: DisplayTransport[]; running: boolean; reduced: boolean; complete: (id: string) => void }, 'route'>;
 function MaterialRoute({ sourceX, sourceY, targetX, targetY, data, markerEnd, selected }: EdgeProps<MaterialEdge>) {
   // Separate every parallel route and give backward/self routes a visible arc.
   const lane = data?.lane ?? 0;
@@ -36,7 +37,8 @@ function MaterialRoute({ sourceX, sourceY, targetX, targetY, data, markerEnd, se
   const middleY = (sourceY + targetY) / 2 - bend;
   const path = `M ${sourceX},${sourceY} Q ${sourceX + 100},${middleY} ${middleX},${middleY} Q ${targetX - 100},${middleY} ${targetX},${targetY}`;
   return <><BaseEdge path={path} markerEnd={markerEnd}
-    style={{ stroke: selected ? '#174bc0' : '#677a92', strokeWidth: selected ? 3 : 1.6 }}/><EdgeLabelRenderer>
+    style={{ stroke: selected ? '#174bc0' : '#677a92', strokeWidth: selected ? 3 : 1.6 }}/>{data?.transports.map(transport => <TransportMarker key={transport.id} transport={transport} path={path}
+      running={data.running} reduced={data.reduced} onComplete={data.complete}/>)}<EdgeLabelRenderer>
     <button className="route-label nodrag nopan" style={{ transform: `translate(-50%, -50%) translate(${middleX}px, ${middleY}px)` }}
       onClick={data?.select}>{data?.route.id}</button>
   </EdgeLabelRenderer></>;
@@ -70,8 +72,13 @@ export function arrangedPositions(model: Model, grouping: Layout['grouping']) {
 }
 const edgeTypes = { route: MaterialRoute };
 
-export function Graph({ model, onSelect, onMove, busy, observation }: { observation?: Observation | null; model: Model; onSelect: (value: FlowNode | Route) => void;
+export function Graph({ model, onSelect, onMove, busy, observation, episodeState, observationView }: { episodeState?: Episode['state']; observationView?: 'truth' | 'available'; observation?: Observation | null; model: Model; onSelect: (value: FlowNode | Route) => void;
   onMove: (positions: Layout['positions']) => void; busy: boolean }) {
+  const reduced = useReducedMotion();
+  const running = !!episodeState && ['running', 'seeking_batch', 'resolving'].includes(episodeState);
+  const enabled = !!observation && observationView === 'truth' && !!episodeState
+    && !['finished', 'failed', 'interrupted'].includes(episodeState);
+  const { transports, complete } = useDisplayTransports(observation, enabled, running);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   useEffect(() => {
     const initial = arrangedPositions(model, model.layout.grouping);
@@ -99,9 +106,9 @@ export function Graph({ model, onSelect, onMove, busy, observation }: { observat
       const live = observation?.stations[node.id] ?? observation?.buffers[node.id];
       const resources = resourcesAtNode(observation, node.id).map(({ resource }) =>
         `${resource.id}: ${resource.failed ? 'failed' : resource.in_maintenance ? 'maintenance' : `${resource.available_capacity ?? 'Unavailable'}/${resource.capacity ?? 'Unavailable'} available`}`).join(' · ');
-      return { ...node, data: { ...node.data, live, resources } };
+      return { ...node, data: { ...node.data, live, resources, running: running && !reduced } };
     }));
-  }, [observation, model, setNodes]);
+  }, [observation, model, setNodes, running, reduced]);
   const lanes = new Map<string, number>();
   const edges: MaterialEdge[] = model.graph.routes.filter(route => {
     const source = model.graph.nodes.find(node => node.id === route.source_node_id);
@@ -114,7 +121,7 @@ export function Graph({ model, onSelect, onMove, busy, observation }: { observat
     lanes.set(pair, lane + 1);
     return { id: route.id, type: 'route', source: route.source_node_id, target: route.target_node_id,
       sourceHandle: `output:${route.source_port_id}`, targetHandle: `input:${route.target_port_id}`,
-      markerEnd: { type: MarkerType.ArrowClosed }, data: { route, lane, select: () => onSelect(route) } };
+      markerEnd: { type: MarkerType.ArrowClosed }, data: { route, lane, select: () => onSelect(route), transports: transports.filter(transport => transport.route_id === route.id), running, reduced, complete } };
   });
   return <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
     onNodesChange={onNodesChange} onNodeClick={(_, node) => { if (node.type === 'plant') onSelect(node.data.model as FlowNode); }}

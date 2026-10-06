@@ -83,3 +83,13 @@ aside pre { overflow: auto; max-height: 350px; font-size: 12px; }
 .manual-decisions label { display: flex; gap: 12px; margin: 10px 0; }
 .manual-decisions textarea { height: 80px; max-width: 600px; }
 .manual-decisions pre { overflow: auto; max-height: 300px; font-size: 12px; }
+
+.material-node.is-processing { animation: station-processing 1.4s ease-in-out infinite; }
+.material-node.is-blocked { outline: 2px solid #b7791f; background: #fff8ed; }
+@keyframes station-processing {
+  0%, 100% { box-shadow: 0 0 0 0 #174bc020; }
+  50% { box-shadow: 0 0 0 7px #174bc040; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .material-node.is-processing { animation: none; }
+}

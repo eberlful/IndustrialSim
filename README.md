@@ -1,6 +1,6 @@
 # IndustrialSim
 
-**IndustrialSim** ist eine deterministische, reproduzierbare diskrete Ereignissimulationsumgebung für die Automobilproduktion auf Basis von CPython 3.14. Sie wurde speziell für den wissenschaftlichen und operativen Vergleich von Produktionssteuerungsheuristiken und externen Entscheidungsagenten (KI/RL/LLMs) unter exakt identischen stochastischen Bedingungen entwickelt.
+**IndustrialSim** ist eine deterministische, reproduzierbare diskrete Ereignissimulationsumgebung für die Automobilproduktion auf Basis von CPython 3.12. Sie wurde speziell für den wissenschaftlichen und operativen Vergleich von Produktionssteuerungsheuristiken und externen Entscheidungsagenten (KI/RL/LLMs) unter exakt identischen stochastischen Bedingungen entwickelt.
 
 Ein Plant gliedert sich organisatorisch in Areas und Halls, während der tatsächliche Materialfluss unabhängig davon als gerichteter Multigraph mit typisierten Ports modelliert wird. Production Units durchlaufen Rohbau, Lackiererei und Endmontage und begegnen begrenzten Buffers, Maschinenzuständen, Workern, Transporten, Qualitätsprüfungen, Nacharbeit und Ausfällen.
 
@@ -22,7 +22,7 @@ Ein Plant gliedert sich organisatorisch in Areas und Halls, während der tatsäc
 
 ## Systemvoraussetzungen & Installation
 
-IndustrialSim setzt zwingend **CPython 3.14** voraus (Minor-Version-Constraint).
+IndustrialSim setzt zwingend **CPython 3.12** voraus (Minor-Version-Constraint).
 
 ### Installation mit `uv` (empfohlen)
 
@@ -31,9 +31,17 @@ IndustrialSim setzt zwingend **CPython 3.14** voraus (Minor-Version-Constraint).
 git clone https://github.com/eberlful/IndustrialSim.git
 cd IndustrialSim
 
-# Virtuelle Umgebung mit CPython 3.14 erstellen und Abhängigkeiten installieren
+# Virtuelle Umgebung mit CPython 3.12 erstellen und Abhängigkeiten installieren
 uv sync
 ```
+
+`uv sync` installiert auch den CPU-Build von PyTorch für Modelltests und den
+World-Model-Vorabtest. Für GPU-Training siehe [ML-Einrichtung](ml/README.md).
+Der Devcontainer ist für AMD-GPUs mit ROCm eingerichtet. In VS Code
+**Dev Containers: Rebuild and Reopen in Container** ausführen; anschließend
+`uv run industrialsim world-model preflight --output-dir runs/amd-preflight`
+starten. Im GPU-Container beim manuellen Synchronisieren `uv sync --inexact`
+verwenden. Details stehen in der [AMD-Devcontainer-Anleitung](ml/README.md#amd-gpu-devcontainer).
 
 ---
 
@@ -167,11 +175,62 @@ uv run industrialsim benchmark --target all
 - ⚙️ **[Konfigurationshandbuch](file:///workspaces/IndustrialSim/docs/configuration.md)**: Vollständige YAML-Spezifikation für Plants, Material Flow, Maschinen, Worker, Puffer und Trigger.
 - 🤖 **[Decision Provider & Agenten-Integration](file:///workspaces/IndustrialSim/docs/decision-providers.md)**: Schnittstellen für KI-Agenten, Decision Batches, Aktionen, Fallbacks und Counterfactual Branching.
 - 💻 **[CLI-Referenz](file:///workspaces/IndustrialSim/docs/cli-reference.md)**: Detaillierte Befehls-, Parameter- und Artefaktreferenz.
-- 📖 **[Domänenglossar (`CONTEXT.md`)](file:///workspaces/IndustrialSim/CONTEXT.md)**: Verbindliche Begriffsdefinitionen der Domäne.
+- 📖 **[Domänenglossar (`GLOSSARY.md`)](file:///workspaces/IndustrialSim/GLOSSARY.md)**: Verbindliche Begriffsdefinitionen der Domäne.
 - 📈 **[Evaluierung von TimesFM 3 & Zeitreihen-Modellen](file:///workspaces/IndustrialSim/docs/timesfm-evaluation-guide.md)**: Leitfaden zum Testen multivariater Zeitreihen-Foundation-Modelle mit Telemetrie und Counterfactual Branching.
 - 🔬 **[Experimente & Modellergebnisse (`experiments/`)](file:///workspaces/IndustrialSim/experiments/README.md)**: Strukturierte Berichte durchgeführter Benchmarks und Vorlage für neue Experimente.
 - 🏛️ **[Architekturentscheidungen (`docs/adr/`)](file:///workspaces/IndustrialSim/docs/adr/)**: Die 15 verbindlichen Architecture Decision Records des Projekts.
+
 ## Local Plant browser
+
+### Docker Compose with AMD GPU/ML
+
+On a Linux host with Docker Compose and a supported AMD GPU, start the complete
+web application and ROCm/PyTorch environment:
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+Open **http://localhost:8765**. The host must already provide the AMD kernel
+driver, `/dev/kfd` and `/dev/dri`. The image uses ROCm 7.2.1 and Python 3.12,
+builds the frontend during image creation, and runs the application as an
+unprivileged user with access to the host GPU groups. No training starts
+automatically; TimesFM and its model weights are not included.
+
+By default, `./examples` is mounted as the writable project and
+`reference_automotive_plant.yaml` is opened. Saved models, layouts, drafts,
+results and checkpoints stay in that directory, including its `runs/`
+subdirectory. Active Episodes and unsaved session state do not survive a
+container restart. Only the host loopback interface exposes the web port.
+
+Set these optional variables in a root `.env` file before building/starting:
+
+```dotenv
+INDUSTRIALSIM_PROJECT=./examples
+INDUSTRIALSIM_MODEL=reference_automotive_plant.yaml
+INDUSTRIALSIM_PORT=8765
+INDUSTRIALSIM_UID=1000
+INDUSTRIALSIM_GID=1000
+```
+
+The project directory and selected model must exist. Match UID/GID to `id -u`
+and `id -g` on the host so saved files belong to your user; rebuild after changing
+them. Run CLI commands as the same application user:
+
+```bash
+docker compose exec --user industrialsim industrialsim industrialsim world-model preflight --output-dir runs/amd-preflight
+docker compose exec --user industrialsim industrialsim industrialsim world-model generate --study-config /app/experiments/world_model/smoke.json --output-dir runs/smoke-data
+docker compose exec --user industrialsim industrialsim industrialsim world-model train --dataset runs/smoke-data --output-dir runs/smoke-models --device cuda --smoke
+docker compose logs -f industrialsim
+docker compose down
+```
+
+Use a fresh output directory for each ML run. Invoke the installed CLI directly
+inside the container; an exact `uv sync` would remove the separately installed
+ROCm wheels. For study requirements and further commands see [ML setup](ml/README.md).
+
+### Source checkout
 
 From a source checkout with Node.js 20.19+ (or 22.12+) and npm installed, run:
 

@@ -2,6 +2,8 @@
 
 Dieses Verzeichnis dient der wissenschaftlichen und operativen Dokumentation aller mit **IndustrialSim** durchgeführten Modellvergleiche, Heuristikevaluationen und Reinforcement-Learning-Experimente.
 
+> **Hinweis zu EXP-0001 bis EXP-0004:** Die dort als „TimesFM 3“ bezeichneten Resultate stammen aus dem NumPy-Standardmodus des lokalen Adapters, nicht aus vortrainierten Google-Gewichten. Siehe die methodischen Nachträge in den Berichten.
+
 ---
 
 ## Struktur des Verzeichnisses
@@ -23,6 +25,7 @@ experiments/
 | **EXP-0002** | 2026-09-22 | Kausales Counterfactual Branching unter Engpass- und Termin-Stress | TimesFM 3 Predictive Control vs. FIFO-Baseline | Abgeschlossen | [2026-09-22-timesfm3-stress-evaluation.md](file:///workspaces/IndustrialSim/experiments/2026-09-22-timesfm3-stress-evaluation.md) |
 | **EXP-0003** | 2026-09-22 | Hierarchisches Multi-Level Forecasting & Kausale Entscheidungssteuerung | TimesFM 3 Hierarchisch vs. Moving Average vs. Baseline | Abgeschlossen | [2026-09-22-hierarchical-forecasting-evaluation.md](file:///workspaces/IndustrialSim/experiments/2026-09-22-hierarchical-forecasting-evaluation.md) |
 | **EXP-0004** | 2026-09-22 | Großer Multi-Horizont & Multi-Seed Forecasting- und Entscheidungs-Benchmark | TimesFM 3 vs. Exponential Smoothing & Baselines ($H \in \{8..128\}$, 140 Units) | Abgeschlossen | [2026-09-22-large-scale-forecasting-benchmark.md](file:///workspaces/IndustrialSim/experiments/2026-09-22-large-scale-forecasting-benchmark.md) |
+| **EXP-0005** | 2026-09-23 | Industrial World Model: Studienprotokoll | Standard-JEPA vs. OPF; lecksichere Baselines | Bestätigt | [2026-09-23-industrial-world-model-protocol.md](2026-09-23-industrial-world-model-protocol.md) |
 
 ---
 

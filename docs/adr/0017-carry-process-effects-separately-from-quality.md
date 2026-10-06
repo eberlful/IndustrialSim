@@ -1,0 +1,3 @@
+# Carry process effects separately from quality
+
+An upstream Operation can change a Production Unit in ways that affect later Operations before any defect is established or observed. Represent these carried effects as a latent Process State distinct from the Production Unit's Quality State and from Quality Findings, and preserve it across Checkpoints. This lets the material-flow graph carry causal process history while keeping the established boundary between hidden defects and observed inspections. A Rework Operation changes only the Process State attributes its declared transformation can affect; clearing a Quality State does not automatically reset accumulated process effects.

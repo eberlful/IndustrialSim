@@ -119,3 +119,23 @@ def test_pause_continue_preserve_episode_and_lossless_pages_under_reads(tmp_path
         compact = worker.snapshot(include_history=False)['episode']['summary']
         assert 'production_units' not in compact
         assert compact['raw_metrics'] == outcome['summary']['raw_metrics']
+
+
+def test_paced_episode_remains_observable_and_pause_is_responsive(tmp_path: Path) -> None:
+    model = MODEL.replace('quantity: 2000', 'quantity: 3')
+    with EpisodeWorker(tmp_path) as worker:
+        started = worker.start(model, step_delay_seconds=1)['episode']
+        time.sleep(.15)
+        observed = worker.snapshot()['episode']
+        assert observed['state'] == 'running'
+        assert observed['observation'] is not None
+        assert observed['events_processed'] > 0
+        before_pause = time.monotonic()
+        assert worker.pause(started['id'])['accepted']
+        paused = wait_for_state(worker, 'paused')
+        assert time.monotonic() - before_pause < .5
+        time.sleep(.1)
+        assert worker.snapshot()['episode']['events_processed'] == paused['events_processed']
+        assert worker.continue_episode(started['id'])['accepted']
+        outcome = wait_for_outcome(worker)
+        assert outcome['summary'] == run_episode(model, decision_provider=BaselineDecisionProvider()).to_dict()

@@ -61,6 +61,15 @@ class AuditLogger:
     def records(self) -> list[AuditRecord]:
         return list(self._records)
 
+    @property
+    def record_count(self) -> int:
+        return len(self._records)
+
+    def records_since(self, index: int) -> list[AuditRecord]:
+        if not 0 <= index <= len(self._records):
+            raise ValueError("Audit cursor outside recorded range")
+        return self._records[index:]
+
     def page(self, cursor: int = 0, limit: int = 100) -> dict[str, Any]:
         """Read a bounded page without copying the entire audit history."""
         end = event_page_end(len(self._records), cursor, limit)
@@ -487,4 +496,3 @@ def inspect(source: Any) -> Any:
         if (p.parent / "manifest.json").exists():
             return inspect_run(p.parent)
         raise
-

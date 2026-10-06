@@ -83,19 +83,32 @@ Alle Aktionen sind streng typisierte Pydantic-Modelle mit `extra = "forbid"`:
 
 ## 4. Validierung & Konfliktauflösung
 
-Vor der Ausführung wird die Antwort des Decision Providers (`DecisionBatchResponse`) durch `validate_decision_batch_response` einer statischen und dynamischen Prüfung unterzogen:
+Vor der Ausführung prüft das Engine-Modul die Antwort (`DecisionBatchResponse`)
+gemeinsam gegen Vertragsregeln und aktuellen Ressourcenzustand. Dieselben Regeln
+gelten für manuelle Eingaben, automatische Decision Providers, Counterfactual
+Branches und Fallback-Aktionen. `validate_decision_batch_response` allein prüft
+lediglich den grundlegenden Vertrag und ersetzt keine Engine-Validierung.
 
 1. **Konfliktprüfung**: Es darf nicht mehr als eine Aktion für dasselbe Ziel (`target_id`) im selben Batch vorgeschlagen werden.
 2. **Keine konkurrierenden Ressourcenansprüche**: Zwei parallele Dispatch-Aktionen dürfen nicht gleichzeitig dasselbe Fahrzeug anfordern.
 3. **Puffer-Konsistenz**: Ein `BufferReorderAction` muss exakt die Einheiten enthalten, die sich zum Entscheidungszeitpunkt im Puffer befinden (keine Phantomeinheiten, keine Duplikate, keine fehlenden Einheiten).
 4. **Zulässigkeit von Routen & Modi**: Gewählte Routen müssen offen und kompatibel sein; Maschinenmodi müssen existieren.
 5. **Safe-Point-Einschränkung**: Strategische Aktionen (z. B. Personalumverteilung) werden an operativen Triggerpunkten abgelehnt.
+6. **Aktionswahl und vollständiger Batch**: Jede Anfrage benötigt eine passende Aktion; Routing und Dispatch derselben Production Unit müssen dieselbe Route wählen.
+7. **Aktueller Ressourcenzustand**: Moduswechsel, Wartung und strategische Aktionen beachten Idle-Zustände. Dispatch prüft Fahrzeugfähigkeiten, Pool, Abhol-Erreichbarkeit sowie gemeinsam reservierte Routenkapazität.
+
+Validierung verändert den Produktionszustand nicht. Erst nach vollständiger
+Annahme werden direkte Effekte angewendet und anschließend Ressourcen zugeteilt.
+Ungültige manuelle Eingaben lassen den Batch angehalten und korrigierbar; sie
+erzeugen keine Audit- oder Fallback-Effekte. Ungültige Provider-Antworten folgen
+der konfigurierten Fallback-/Abort-Regel. Diese strengeren Prüfungen können frühere
+Provider-Antworten ablehnen, deren Effekte bislang stillschweigend entfielen.
 
 ---
 
 ## 5. Fallback Policies (Deterministische Ausfallsicherung)
 
-Schlägt die Validierung fehl, antwortet der Decision Provider nicht innerhalb eines Wall-Clock-Timeouts oder wirft er eine Exception, greift sofort eine konfigurierte **Fallback Policy** (vgl. [CONTEXT.md](file:///workspaces/IndustrialSim/CONTEXT.md)):
+Schlägt die Validierung fehl, antwortet der Decision Provider nicht innerhalb eines Wall-Clock-Timeouts oder wirft er eine Exception, greift sofort eine konfigurierte **Fallback Policy** (vgl. [GLOSSARY.md](file:///workspaces/IndustrialSim/GLOSSARY.md)):
 - **`BaselineFallbackPolicy`**:
   - Puffer: FIFO-Reihenfolge mit Due-Date als Tie-Breaker.
   - Routing: Nächste freie kompatible Station mit kürzester Transitzeit.
@@ -104,6 +117,20 @@ Schlägt die Validierung fehl, antwortet der Decision Provider nicht innerhalb e
 - **`FifoBufferFallbackPolicy`**: Stellt sicher, dass Puffer strikt nach Eingangszeit abgearbeitet werden.
 
 Das Auslösen eines Fallbacks wird verlustfrei im `audit.jsonl` protokolliert, sodass fehlerhaftes Agentenverhalten transparent bleibt.
+
+Auch ein Fallback muss den vollständigen Batch und alle Ressourcenprüfungen
+bestehen. Scheitert er, werden seine Aktionen nicht angewendet: Die Episode
+bricht mit `INVALID_FALLBACK_BATCH` ab und protokolliert einen Failure-Eintrag
+sowie die Validierungsdiagnosen. Es gibt keine rekursive Fallback-Schleife.
+Die Baseline-Fallback-Auswahl wurde nicht um einen neuen Planer erweitert;
+konkurrierende oder unvollständige Baseline-Aktionen können daher zum expliziten
+Abbruch führen.
+
+Das bestehende Beispiel `hierarchical_forecasting_plant.yaml` kann strategische
+Requests für gerade beschäftigte Stations erzeugen, die der Forecasting-Provider
+unbeantwortet lässt. Der ebenfalls unvollständige Baseline-Fallback wird jetzt
+explizit abgelehnt. Eine gültige Konfiguration mit ausschließlich Buffer-Triggern
+wird separat getestet und produziert weiterhin alle 45 geplanten Production Units.
 
 ---
 
